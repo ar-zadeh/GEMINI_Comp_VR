@@ -1,0 +1,24 @@
+@"
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+# VR / build artifacts
+build/
+dist/
+*.log
+OpenEye/VREye/
+OpenEye/agent_logs/
+OpenEye/sam3__
+# OS
+.DS_Store
+Thumbs.db
+"@ | Out-File .gitignore -Encoding utf8
+OpenEye/checkpoints/
+*.pt
+*.pth
+*.onnx

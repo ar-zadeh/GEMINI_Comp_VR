@@ -6,153 +6,179 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 import numpy as np
+from PIL import Image
 
 # Configure logging
 logger = logging.getLogger("VRAgent.Tracker")
 
-# Constants
-SAM2_CHECKPOINT_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt"
-SAM2_CONFIG = "sam2_hiera_tiny.yaml"
-CHECKPOINT_NAME = "sam2_hiera_tiny.pt"
-CHECKPOINT_DIR = Path("checkpoints")
 
 class ObjectTracker:
     def __init__(self, log_dir: Path):
         self.log_dir = log_dir / "tracking"
         self.log_dir.mkdir(exist_ok=True, parents=True)
         self.available = False
-        self.predictor = None
-        self.inference_state = None
+        self.processor = None
+        self.model = None
         
         # Check imports
         try:
             import torch
-            from sam2.build_sam import build_sam2_video_predictor
-            self.available = True
+            import sam3
+            from sam3 import build_sam3_image_model
+            from sam3.model.box_ops import box_xywh_to_cxcywh
+            from sam3.model.sam3_image_processor import Sam3Processor
+            from sam3.visualization_utils import normalize_bbox
+            
             self.torch = torch
-            self.build_sam2_video_predictor = build_sam2_video_predictor
+            self.sam3 = sam3
+            self.build_sam3_image_model = build_sam3_image_model
+            self.box_xywh_to_cxcywh = box_xywh_to_cxcywh
+            self.Sam3Processor = Sam3Processor
+            self.normalize_bbox = normalize_bbox
+            self.available = True
         except ImportError as e:
-            logger.warning(f"SAM 2 or Torch not available: {e}")
+            logger.warning(f"SAM 3 or Torch not available: {e}")
             self.available = False
             return
 
-        # Prepare Checkpoint
-        self._prepare_checkpoint()
-        
         # Initialize Model
         if self.available:
             try:
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                if device == "cpu":
-                    logger.warning("CUDA not available. SAM 2 will be slow.")
+                # Configure CUDA settings
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
                 
-                checkpoint_path = CHECKPOINT_DIR / CHECKPOINT_NAME
-                self.predictor = build_sam2_video_predictor(SAM2_CONFIG, str(checkpoint_path), device=device)
-                logger.info("SAM 2 Model initialized.")
+                # Get BPE path from sam3 assets
+                sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
+                bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
+                
+                # Build model and processor
+                self.model = build_sam3_image_model(bpe_path=bpe_path)
+                self.processor = Sam3Processor(self.model, confidence_threshold=0.5)
+                logger.info("SAM 3 Model initialized.")
             except Exception as e:
-                logger.error(f"Failed to init SAM 2: {e}")
-                self.available = False
-
-    def _prepare_checkpoint(self):
-        CHECKPOINT_DIR.mkdir(exist_ok=True)
-        ckpt_path = CHECKPOINT_DIR / CHECKPOINT_NAME
-        if not ckpt_path.exists():
-            logger.info(f"Downloading SAM 2 checkpoint to {ckpt_path}...")
-            try:
-                # Use curl to download
-                subprocess.run(["curl", "-o", str(ckpt_path), SAM2_CHECKPOINT_URL], check=True)
-            except Exception as e:
-                logger.error(f"Failed to download checkpoint: {e}")
+                logger.error(f"Failed to init SAM 3: {e}")
                 self.available = False
 
     def track(self, video_path: str, initial_box: List[float], label: str) -> str:
         """
         Track an object in a video given an initial bounding box.
-        video_path: Path to the video file (mp4 or directory of frames?) 
-                    SAM 2 usually takes a directory of JPEGs.
+        video_path: Path to the video file (mp4 or directory of frames).
+                    Expects a directory of JPEGs.
         initial_box: [ymin, xmin, ymax, xmax] normalized.
         
         Returns: Path to the output video with tracking visualization.
         """
-        if not self.available or not self.predictor:
-            return "Error: SAM 2 not available."
+        if not self.available or not self.processor:
+            return "Error: SAM 3 not available."
 
         try:
-            # 1. Process Video -> Frames Directory (SAM 2 expects this)
-            # Assuming video_path is a directory of frames or we need to extract them.
-            # For this agent, existing capture_video usually returns a list of base64 frames.
-            # We will assume calling code saves them to a dir.
+            import cv2
             
             video_dir = Path(video_path)
             if not video_dir.is_dir():
                 return f"Error: {video_path} is not a directory of frames."
             
-            # 2. Init State
-            self.inference_state = self.predictor.init_state(video_path=str(video_dir))
-            
-            # 3. Add Prompt to Frame 0
-            # Denormalize box
-            # We need image dimensions. Read first frame.
-            import cv2
-            first_frame_path = sorted(list(video_dir.glob("*.jpg")))[0]
-            img = cv2.imread(str(first_frame_path))
-            h, w = img.shape[:2]
-            
-            ymin, xmin, ymax, xmax = initial_box
-            box_xyxy = np.array([xmin * w, ymin * h, xmax * w, ymax * h], dtype=np.float32)
-            
-            _, out_obj_ids, out_mask_logits = self.predictor.add_new_points_or_box(
-                inference_state=self.inference_state,
-                frame_idx=0,
-                obj_id=1,
-                box=box_xyxy,
-            )
-            
-            # 4. Propagate
-            video_segments = {}  # video_segments contains the per-frame segmentation results
-            for out_frame_idx, out_obj_ids, out_mask_logits in self.predictor.propagate_in_video(self.inference_state):
-                video_segments[out_frame_idx] = {
-                    out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
-                    for i, out_obj_id in enumerate(out_obj_ids)
-                }
-            
-            # 5. Visualize and Save
-            # We will create a new video file
-            output_path = self.log_dir / f"tracked_{label.replace(' ', '_')}.mp4"
-            
             frame_files = sorted(list(video_dir.glob("*.jpg")))
+            if not frame_files:
+                return f"Error: No JPEG frames found in {video_path}"
             
-            # Setup VideoWriter
+            # Read first frame to get dimensions
+            first_frame = cv2.imread(str(frame_files[0]))
+            h, w = first_frame.shape[:2]
+            
+            # Convert initial_box from [ymin, xmin, ymax, xmax] normalized to [x, y, w, h] pixels
+            ymin, xmin, ymax, xmax = initial_box
+            box_x = xmin * w
+            box_y = ymin * h
+            box_w = (xmax - xmin) * w
+            box_h = (ymax - ymin) * h
+            
+            # Setup output video
+            output_path = self.log_dir / f"tracked_{label.replace(' ', '_')}.mp4"
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(str(output_path), fourcc, 10, (w, h)) # Assuming 10 fps
+            out = cv2.VideoWriter(str(output_path), fourcc, 10, (w, h))
             
+            # Process each frame with SAM3
             for i, frame_file in enumerate(frame_files):
                 frame = cv2.imread(str(frame_file))
+                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 
-                if i in video_segments and 1 in video_segments[i]:
-                    mask = video_segments[i][1][0] # shape [H, W]
-                    
-                    # Draw mask overlay
-                    # Create red overlay
-                    overlay = frame.copy()
-                    overlay[mask] = [0, 0, 255] # BGR
-                    
-                    cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
-                    
-                    # Draw bounding box around mask (optional)
-                    # rows = np.any(mask, axis=1)
-                    # cols = np.any(mask, axis=0)
-                    # if rows.any() and cols.any():
-                    #     rmin, rmax = np.where(rows)[0][[0, -1]]
-                    #     cmin, cmax = np.where(cols)[0][[0, -1]]
-                    #     cv2.rectangle(frame, (cmin, rmin), (cmax, rmax), (0, 255, 0), 2)
+                # Set image for SAM3
+                inference_state = self.processor.set_image(pil_image)
                 
-                cv2.putText(frame, f"Tracking: {label}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                # Prepare box for SAM3: convert to normalized cxcywh format
+                box_input_xywh = self.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
+                box_input_cxcywh = self.box_xywh_to_cxcywh(box_input_xywh)
+                norm_box_cxcywh = self.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
+                
+                # Add geometric prompt (box)
+                self.processor.reset_all_prompts(inference_state)
+                inference_state = self.processor.add_geometric_prompt(
+                    state=inference_state,
+                    box=norm_box_cxcywh,
+                    label=True
+                )
+                
+                # Get mask from inference state if available
+                try:
+                    # Retrieve masks (boolean tensor: [N, 1, H, W])
+                    if "masks" in inference_state and inference_state["masks"] is not None:
+                        # masks is [N, 1, H, W], we want [H, W]
+                        # Assuming batch size 1
+                        mask_tensor = inference_state["masks"]
+                        mask = mask_tensor.detach().cpu().numpy() > 0.5
+                        
+                        # Handle dimensions
+                        if mask.ndim == 4: # N, 1, H, W
+                            mask = mask[0, 0]
+                        elif mask.ndim == 3: # 1, H, W or H, W, ?
+                            mask = mask[0]
+                        
+                        # Draw mask overlay
+                        # Create colored mask (Green or Red)
+                        overlay = frame.copy()
+                        # Color: BGR
+                        color = [0, 255, 0] # Green
+                        
+                        # Apply color to masked area
+                        overlay[mask] = color
+                        
+                        # Blend with original
+                        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+                        
+                        # Update bounding box for next frame based on mask
+                        rows = np.any(mask, axis=1)
+                        cols = np.any(mask, axis=0)
+                        if rows.any() and cols.any():
+                            rmin, rmax = np.where(rows)[0][[0, -1]]
+                            cmin, cmax = np.where(cols)[0][[0, -1]]
+                            # Update box for next frame
+                            box_x = cmin
+                            box_y = rmin
+                            box_w = cmax - cmin
+                            box_h = rmax - rmin
+                            # Draw bounding box
+                            cv2.rectangle(frame, (cmin, rmin), (cmax, rmax), (0, 255, 0), 2)
+                    else:
+                        # If no mask, just draw the current box
+                        cv2.rectangle(frame, 
+                                    (int(box_x), int(box_y)), 
+                                    (int(box_x + box_w), int(box_y + box_h)), 
+                                    (0, 255, 0), 2)
+                except Exception as mask_error:
+                    logger.warning(f"Could not extract mask for frame {i}: {mask_error}")
+                    # Draw current box as fallback
+                    cv2.rectangle(frame, 
+                                (int(box_x), int(box_y)), 
+                                (int(box_x + box_w), int(box_y + box_h)), 
+                                (0, 255, 0), 2)
+                
+                cv2.putText(frame, f"Tracking: {label}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 out.write(frame)
-                
-            out.release()
-            self.predictor.reset_state(self.inference_state)
             
+            out.release()
             return str(output_path)
             
         except Exception as e:
@@ -160,3 +186,152 @@ class ObjectTracker:
             import traceback
             traceback.print_exc()
             return f"Tracking failed: {e}"
+
+    def track_multi_objects(self, video_path: str, initial_data: Dict[str, List[float]]) -> Dict[str, Any]:
+        """
+        Track multiple objects in a video.
+        video_path: Directory of frames.
+        initial_data: Dict mapping 'label' -> [ymin, xmin, ymax, xmax] (normalized)
+
+        Returns:
+            Dict containing:
+            - 'video_path': Path to visualization video
+            - 'telemetry': List of Dicts (one per frame) with centroids:
+               [{'label1': [cx, cy], 'label2': [cx, cy]}, ...]
+        """
+        if not self.available or not self.processor:
+            return {"error": "SAM 3 not available."}
+
+        try:
+            import cv2
+            
+            video_dir = Path(video_path)
+            frame_files = sorted(list(video_dir.glob("*.jpg")))
+            if not frame_files:
+                return {"error": "No frames found"}
+            
+            first_frame = cv2.imread(str(frame_files[0]))
+            h, w = first_frame.shape[:2]
+            
+            # Setup output video
+            timestamp = 0 # timestamp logic if needed
+            output_path = self.log_dir / f"tracked_multi.mp4"
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = cv2.VideoWriter(str(output_path), fourcc, 10, (w, h))
+
+            # Initialize states for each object
+            # For simplicity, we'll re-run inference for each object per frame 
+            # (Independent tracking) as SAM3 multi-object API is more complex to setup here.
+            # We maintain current boxes for each object.
+            
+            # Convert normalized boxes to pixel [x, y, w, h]
+            current_boxes = {}
+            for label, box in initial_data.items():
+                ymin, xmin, ymax, xmax = box
+                current_boxes[label] = [
+                    xmin * w, ymin * h, 
+                    (xmax - xmin) * w, (ymax - ymin) * h
+                ]
+            
+            telemetry_data = [] # List of frame data
+            
+            colors = {
+                0: (0, 255, 0),   # Green
+                1: (0, 0, 255),   # Red
+                2: (255, 0, 0),   # Blue
+                3: (0, 255, 255)  # Yellow
+            }
+
+            for i, frame_file in enumerate(frame_files):
+                # Use PIL to read the file first to fix truncation/corruption, then feed to OpenCV
+                pil_image_raw = Image.open(frame_file)
+                pil_image = pil_image_raw.convert("RGB") # Ensure RGB for SAM
+                frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR) # Convert to BGR for OpenCV viz
+
+                # We need to set image ONCE per frame
+                inference_state = self.processor.set_image(pil_image)
+                
+                frame_telemetry = {}
+                
+                # For visualization blending
+                vis_frame = frame.copy()
+                
+                for idx, (label, box_rect) in enumerate(current_boxes.items()):
+                    box_x, box_y, box_w, box_h = box_rect
+                    
+                    # Prepare box
+                    box_input_xywh = self.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
+                    box_input_cxcywh = self.box_xywh_to_cxcywh(box_input_xywh)
+                    norm_box_cxcywh = self.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
+                    
+                    # Run Inference
+                    self.processor.reset_all_prompts(inference_state)
+                    inference_state = self.processor.add_geometric_prompt(
+                        state=inference_state,
+                        box=norm_box_cxcywh,
+                        label=True
+                    )
+                    
+                    # Extract result
+                    cx, cy = 0.0, 0.0
+                    mask_found = False
+                    
+                    if "masks" in inference_state and inference_state["masks"] is not None:
+                        mask_tensor = inference_state["masks"]
+                        mask = mask_tensor.detach().cpu().numpy() > 0.5
+                        if mask.ndim == 4: mask = mask[0, 0]
+                        elif mask.ndim == 3: mask = mask[0]
+                        
+                        # Update box
+                        rows = np.any(mask, axis=1)
+                        cols = np.any(mask, axis=0)
+                        
+                        if rows.any() and cols.any():
+                            rmin, rmax = np.where(rows)[0][[0, -1]]
+                            cmin, cmax = np.where(cols)[0][[0, -1]]
+                            
+                            # Calcluate Centroid
+                            M = cv2.moments(mask.astype(np.uint8))
+                            if M["m00"] != 0:
+                                cx = M["m10"] / M["m00"]
+                                cy = M["m01"] / M["m00"]
+                            else:
+                                cx = (cmin + cmax) / 2
+                                cy = (rmin + rmax) / 2
+                            
+                            # Update next box
+                            current_boxes[label] = [cmin, rmin, cmax - cmin, rmax - rmin]
+                            frame_telemetry[label] = [cx / w, cy / h] # Normalized
+                            mask_found = True
+                            
+                            # Viz Mask
+                            color = colors.get(idx % 4, (255, 255, 255))
+                            vis_frame[mask] = color # Simple overlay
+                            
+                            # Viz Box & Label
+                            cv2.rectangle(vis_frame, (cmin, rmin), (cmax, rmax), color, 2)
+                            cv2.circle(vis_frame, (int(cx), int(cy)), 5, (255, 255, 255), -1)
+                            cv2.putText(vis_frame, label, (cmin, rmin-10), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+                    if not mask_found:
+                         # Fallback to center of previous box
+                         frame_telemetry[label] = [(box_x + box_w/2)/w, (box_y + box_h/2)/h]
+
+                # Blend
+                cv2.addWeighted(vis_frame, 0.5, frame, 0.5, 0, frame)
+                out.write(frame)
+                telemetry_data.append(frame_telemetry)
+
+            out.release()
+            
+            return {
+                "video_path": str(output_path),
+                "telemetry": telemetry_data
+            }
+
+        except Exception as e:
+            logger.error(f"Multi-track error: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"error": str(e)}

@@ -42,6 +42,70 @@ click_state = {
     "original_image": None
 }
 
+def reset_image_state(image_input):
+    """
+    Resets the state when a new image is uploaded/cleared.
+    """
+    global click_state, processor, inference_state
+    print("Resetting state due to image upload/clear.")
+    click_state["points"] = []
+    click_state["original_image"] = image_input
+    
+    if image_input is not None:
+        try:
+            pil_image = Image.fromarray(image_input)
+            inference_state = processor.set_image(pil_image)
+        except Exception as e:
+            print(f"Error initializing SAM3: {e}")
+            
+    return "Image state reset. Click Top-Left corner."
+
+def run_segmentation(current_image):
+    """
+    Overlays the segmentation mask from inference_state onto the current image.
+    """
+    global inference_state
+    if inference_state is None or "masks" not in inference_state:
+        return current_image, "No segmentation available. Please trace a box first."
+
+    # Retrieve masks (boolean tensor: [N, 1, H, W])
+    masks = inference_state["masks"]
+    
+    if masks is None or masks.numel() == 0:
+        return current_image, "No masks generated."
+    
+    # Convert to numpy (assuming single batch, single frame)
+    masks_np = masks.detach().cpu().numpy()
+    
+    # Prepare base image
+    if current_image is None:
+        return None, "No image to display."
+        
+    pil_image = Image.fromarray(current_image).convert("RGBA")
+    overlay = Image.new('RGBA', pil_image.size, (0, 0, 0, 0))
+    
+    # Apply each mask
+    for i in range(masks_np.shape[0]):
+        mask = masks_np[i, 0] # (H, W)
+        
+        # Color: Green with alpha
+        color = (30, 255, 30, 100) 
+        
+        # Create mask image
+        mask_uint8 = (mask > 0).astype(np.uint8) * 255
+        mask_pil = Image.fromarray(mask_uint8, mode='L')
+        
+        # Create a solid color layer
+        color_layer = Image.new('RGBA', pil_image.size, color)
+        
+        # Paste color layer into overlay using the mask
+        overlay.paste(color_layer, (0, 0), mask_pil)
+        
+    # Composite overlay onto original image
+    result = Image.alpha_composite(pil_image, overlay)
+    
+    return np.array(result.convert("RGB")), "Segmentation overlay applied."
+
 def process_interaction(image_input, evt: gr.SelectData):
     """
     Handles user clicks.
@@ -57,11 +121,12 @@ def process_interaction(image_input, evt: gr.SelectData):
     is_new_image = False
     if click_state["original_image"] is None:
         is_new_image = True
-    elif not np.array_equal(click_state["original_image"], image_input):
+    elif len(click_state["points"]) == 0 and not np.array_equal(click_state["original_image"], image_input):
+        # Only treat as new image if we aren't tracking points
         is_new_image = True
 
     if is_new_image:
-        print("New image detected. Resetting state.")
+        print("New image detected (auto). Resetting state.")
         click_state["points"] = []
         click_state["original_image"] = image_input
         # Initialize SAM3 state for the new image
@@ -131,10 +196,21 @@ if __name__ == "__main__":
         
         with gr.Row():
             input_img = gr.Image(label="Input Image", type="numpy")
+        with gr.Row():
+            segment_btn = gr.Button("Segment Object", variant="primary")
         
         status_text = gr.Textbox(label="Status", value="Upload an image, then click Top-Left corner.")
         
         # Bind the click event
         input_img.select(process_interaction, inputs=[input_img], outputs=[input_img, status_text])
+        
+        # Bind button event
+        segment_btn.click(run_segmentation, inputs=[input_img], outputs=[input_img, status_text])
+
+        # Bind reset events
+        
+        # Bind reset events
+        input_img.upload(reset_image_state, inputs=[input_img], outputs=[status_text])
+        input_img.clear(reset_image_state, inputs=[input_img], outputs=[status_text])
 
     demo.launch(share=True, debug=True)

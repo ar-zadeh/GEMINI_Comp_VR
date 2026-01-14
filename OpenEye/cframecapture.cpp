@@ -426,7 +426,7 @@ bool CFrameCapture::EncodeJpeg(const std::vector<uint8_t>& rgbData, int width, i
 
     jpge::params params;
     params.m_quality = quality;
-    params.m_subsampling = jpge::H2V2; // 4:2:0 subsampling
+    params.m_subsampling = jpge::H1V1; // 4:4:4 subsampling - no chroma loss for best quality
 
     int actualSize = bufSize;
     if (!jpge::compress_image_to_jpeg_file_in_memory(

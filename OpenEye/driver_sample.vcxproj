@@ -76,6 +76,7 @@
     <LinkIncremental>true</LinkIncremental>
     <OutDir>$(SolutionDir)\bin\drivers\sample\bin\win64\</OutDir>
     <TargetName>driver_null</TargetName>
+    <IncludePath>F:\GEMINI_Comp_VR\headers;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <LinkIncremental>false</LinkIncremental>

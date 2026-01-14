@@ -57,7 +57,7 @@ private:
     void VideoCaptureThread(float durationSeconds, int fps, CaptureCallback callback);
     bool CaptureScreenRegion(std::vector<uint8_t>& outRgbData, int& outWidth, int& outHeight);
     bool CaptureWindow(HWND hwnd, std::vector<uint8_t>& outRgbData, int& outWidth, int& outHeight);
-    bool EncodeJpeg(const std::vector<uint8_t>& rgbData, int width, int height, std::vector<uint8_t>& outJpeg, int quality = 80);
+    bool EncodeJpeg(const std::vector<uint8_t>& rgbData, int width, int height, std::vector<uint8_t>& outJpeg, int quality = 100);
 
     int m_windowX;
     int m_windowY;

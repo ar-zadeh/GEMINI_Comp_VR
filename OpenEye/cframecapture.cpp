@@ -444,7 +444,7 @@ bool CFrameCapture::EncodeJpeg(const std::vector<uint8_t>& rgbData, int width, i
 
     jpge::params params;
     params.m_quality = quality;
-    params.m_subsampling = jpge::H2V2; // 4:2:0 subsampling
+    params.m_subsampling = jpge::H1V1; // 4:4:4 subsampling (best quality)
 
     int actualSize = bufSize;
     if (!jpge::compress_image_to_jpeg_file_in_memory(
@@ -467,6 +467,8 @@ bool CFrameCapture::CaptureFrame(FrameData& outFrame)
     {
         return false;
     }
+
+    DriverLog("CFrameCapture: Captured frame %dx%d\n", width, height);
 
     if (!EncodeJpeg(rgbData, width, height, outFrame.jpegData))
     {

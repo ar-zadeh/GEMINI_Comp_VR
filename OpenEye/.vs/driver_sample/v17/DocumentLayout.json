@@ -1,37 +1,12 @@
 {
   "Version": 1,
   "WorkspaceRootPath": "F:\\GEMINI_Comp_VR\\OpenEye\\",
-  "Documents": [
-    {
-      "AbsoluteMoniker": "D:0:0:{A47C788B-1BDA-4057-87A9-FC35ED711B44}|driver_sample.vcxproj|F:\\GEMINI_Comp_VR\\OpenEye\\cframecapture.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
-      "RelativeMoniker": "D:0:0:{A47C788B-1BDA-4057-87A9-FC35ED711B44}|driver_sample.vcxproj|solutionrelative:cframecapture.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
-    }
-  ],
+  "Documents": [],
   "DocumentGroupContainers": [
     {
       "Orientation": 0,
       "VerticalTabListWidth": 256,
-      "DocumentGroups": [
-        {
-          "DockedWidth": 200,
-          "SelectedChildIndex": 0,
-          "Children": [
-            {
-              "$type": "Document",
-              "DocumentIndex": 0,
-              "Title": "cframecapture.cpp",
-              "DocumentMoniker": "F:\\GEMINI_Comp_VR\\OpenEye\\cframecapture.cpp",
-              "RelativeDocumentMoniker": "cframecapture.cpp",
-              "ToolTip": "F:\\GEMINI_Comp_VR\\OpenEye\\cframecapture.cpp",
-              "RelativeToolTip": "cframecapture.cpp",
-              "ViewState": "AgIAAIwBAAAAAAAAAIAwwKwBAAAlAAAAAAAAAA==",
-              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
-              "WhenOpened": "2026-01-14T20:13:41.026Z",
-              "EditorCaption": ""
-            }
-          ]
-        }
-      ]
+      "DocumentGroups": []
     }
   ]
 }

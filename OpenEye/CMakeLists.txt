@@ -37,6 +37,7 @@ target_link_libraries(${TARGET_NAME}
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
     target_link_libraries(${TARGET_NAME} ws2_32)
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
 endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "Windows")

@@ -19,6 +19,9 @@ from PIL import Image, ImageDraw, ImageFont, ImageFile
 import io
 import shutil
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Allow loading truncated images (fixes issues with simple MJPEG streams)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -617,8 +620,8 @@ if __name__ == "__main__":
                 continue
             elif cmd == 'status':
                 agent.print_status()
-                continue
                 
+                continue
             agent.run(user_input)
         except KeyboardInterrupt:
             break

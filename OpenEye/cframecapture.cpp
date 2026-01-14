@@ -3,8 +3,9 @@
 #include <chrono>
 #include <cstring>
 
-// Simple JPEG encoder (minimal implementation)
-#include "jpge.h"
+// STB Image Write for high-quality JPEG encoding
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "stb_image_write.h"
 
 CFrameCapture* g_pFrameCapture = nullptr;
 
@@ -435,26 +436,26 @@ bool CFrameCapture::CaptureScreenRegion(std::vector<uint8_t>& outRgbData, int& o
 #endif
 }
 
+// Callback for stbi_write_jpg_to_func
+void WriteToVector(void* context, void* data, int size)
+{
+    std::vector<uint8_t>* pOut = static_cast<std::vector<uint8_t>*>(context);
+    const uint8_t* pData = static_cast<const uint8_t*>(data);
+    pOut->insert(pOut->end(), pData, pData + size);
+}
+
 bool CFrameCapture::EncodeJpeg(const std::vector<uint8_t>& rgbData, int width, int height, 
                                std::vector<uint8_t>& outJpeg, int quality)
 {
-    // Use jpge for JPEG encoding
-    int bufSize = width * height * 3 + 1024; // Generous buffer
-    outJpeg.resize(bufSize);
+    outJpeg.clear();
+    outJpeg.reserve(width * height); // Estimate size
 
-    jpge::params params;
-    params.m_quality = quality;
-    params.m_subsampling = jpge::H1V1; // 4:4:4 subsampling (best quality)
-
-    int actualSize = bufSize;
-    if (!jpge::compress_image_to_jpeg_file_in_memory(
-            outJpeg.data(), actualSize, width, height, 3, rgbData.data(), params))
+    if (stbi_write_jpg_to_func(WriteToVector, &outJpeg, width, height, 3, rgbData.data(), quality) == 0)
     {
         DriverLog("CFrameCapture: JPEG encoding failed\n");
         return false;
     }
 
-    outJpeg.resize(actualSize);
     return true;
 }
 

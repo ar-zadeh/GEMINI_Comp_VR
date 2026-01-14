@@ -54,7 +54,7 @@ except ImportError:
 # --- CONFIG ---
 GEMINI_MODEL = "gemini-3-flash-preview"  # User requested "Flash 3.0" (mapping to latest 2.0 Flash Exp)
 LOG_DIR = Path("agent_logs")
-SHOW_VISION_PREVIEW = True
+SHOW_VISION_PREVIEW = False
 
 # ============================================================================
 # UTILS
@@ -100,62 +100,97 @@ class VisualGrounder:
         self.model_name = model_name
         self.log_dir = log_dir / "grounding"
         self.log_dir.mkdir(exist_ok=True, parents=True)
-        
-    def ground_object(self, image_data: bytes, object_description: str) -> List[Dict]:
+
+    def ground_multiple_objects(self, image_data: bytes, object_names: List[str]) -> Dict[str, List[float]]:
         logger = get_logger()
-        logger.info(f"Grounding: '{object_description}'")
+        objects_str = ", ".join(object_names)
+        logger.info(f"Grounding Multiple: '{objects_str}'")
         
         prompt = f"""
-        Find this object: {object_description}
+        Find the following objects in the image: {objects_str}.
         
         You MUST return the answer in the following JSON format:
         {{
-            "thinking": "Reasoning about where the object is in the image...",
-            "coordinates": [ymin, xmin, ymax, xmax]
+            "thinking": "Reasoning about the scene...",
+            "detections": [
+                {{
+                    "label": "exact_object_name_from_list",
+                    "coordinates": [ymin, xmin, ymax, xmax]
+                }}
+            ]
         }}
         
-        ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
-        If multiple instances are found, return the most prominent one.
+        1. ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
+        2. Only return objects you are confident you see.
         """
         
         try:
+            # 1. robust image loading (fixes Corrupt JPEG errors)
+            try:
+                pil_img = Image.open(io.BytesIO(image_data))
+                # Convert to RGB to ensure compatibility
+                pil_img = pil_img.convert("RGB")
+                # Save to a clean buffer
+                out_buffer = io.BytesIO()
+                pil_img.save(out_buffer, format="JPEG")
+                clean_image_data = out_buffer.getvalue()
+            except Exception as e:
+                logger.warning(f"Image cleaning failed, using raw bytes: {e}")
+                clean_image_data = image_data
+
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=[
                     types.Content(role="user", parts=[
                         types.Part(text=prompt),
-                        types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_data))
+                        types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=clean_image_data))
                     ])
                 ],
                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
             )
             
-            # Parse result
+            # 2. Robust JSON Parsing (Strips Markdown)
             text = response.candidates[0].content.parts[0].text
-            data = json.loads(text)
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("\n", 1)[0]
+            if text.startswith("json"):
+                text = text[4:]
             
-            # Log thinking
-            if "thinking" in data:
-                logger.info(f"[Grounding Thought] {data['thinking']}")
-                print(f"Grounding Thought: {data['thinking']}")
+            data = json.loads(text.strip())
             
-            # Extract coordinates (handle single list)
-            coords = data.get("coordinates", [])
-            boxes = []
-            if coords and len(coords) == 4 and isinstance(coords[0], (int, float)):
-                # Found single box
-                boxes.append({"box_2d": coords, "label": object_description})
-                # User request: Print and Log coordinates
-                coord_msg = f"Found Coordinates: {coords}"
-                print(coord_msg)
-                logger.info(coord_msg)
-            
-            # Draw and save
-            self._draw_and_save(image_data, boxes, object_description)
-            return boxes
+            results = {}
+            valid_boxes_for_draw = []
+
+            for det in data.get("detections", []):
+                label = det.get("label")
+                coords = det.get("coordinates")
+                
+                if label and coords and len(coords) == 4:
+                    # Handle 0-1000 scale correction
+                    if any(c > 1.0 for c in coords):
+                        coords = [c / 1000.0 for c in coords]
+                    
+                    results[label] = coords
+                    valid_boxes_for_draw.append({"label": label, "box_2d": coords})
+
+            if valid_boxes_for_draw:
+                self._draw_and_save(clean_image_data, valid_boxes_for_draw, f"multi_{len(results)}_objs")
+            else:
+                logger.warning(f"Gemini returned no detections. Raw text: {text[:100]}...")
+                
+            return results
+
         except Exception as e:
-            logger.error(f"Grounding failed: {e}")
-            return []
+            logger.error(f"Multi-Grounding failed: {e}")
+            return {}
+
+    def ground_object(self, image_data: bytes, object_description: str) -> List[Dict]:
+        # Update single grounding to use the same robust cleaning/parsing logic if you wish
+        # For now, we can just wrap the new multi-grounder for simplicity:
+        res_dict = self.ground_multiple_objects(image_data, [object_description])
+        if object_description in res_dict:
+            return [{"box_2d": res_dict[object_description], "label": object_description}]
+        return []
 
     def _draw_and_save(self, image_data: bytes, boxes: List[Dict], description: str):
         logger = get_logger()
@@ -166,27 +201,26 @@ class VisualGrounder:
             try:
                 nparr = np.frombuffer(image_data, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if img is None: return 
+                
                 h, w = img.shape[:2]
-                for box in boxes:
-                    # ymin, xmin, ymax, xmax
+                colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (0, 255, 255)]
+
+                for i, box in enumerate(boxes):
                     y1, x1, y2, x2 = box['box_2d']
+                    label = box.get('label', description)
+                    color = colors[i % len(colors)]
+                    
                     p1 = (int(x1*w), int(y1*h))
                     p2 = (int(x2*w), int(y2*h))
-                    cv2.rectangle(img, p1, p2, (0,0,0), 3)
-                    cv2.putText(img, description, (p1[0], max(20, p1[1]-10)), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    cv2.rectangle(img, p1, p2, color, 2)
+                    cv2.putText(img, label, (p1[0], max(20, p1[1]-10)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
                 cv2.imwrite(str(filename), img)
-                if SHOW_VISION_PREVIEW:
-                    cv2.imshow("Grounding", img)
-                    cv2.waitKey(2000)
                 logger.info(f"Saved grounding to {filename}")
-                return
             except Exception as e:
                 logger.error(f"CV2 draw failed: {e}")
-
-        # Fallback to PIL (omitted for brevity, assume CV2 for now or easy add back)
-
 # ============================================================================
 # EXECUTOR
 # ============================================================================
@@ -273,7 +307,72 @@ def _get_tools(executor, grounder, tracker):
             results.append(f"Found at Center(x={cx:.2f}, y={cy:.2f})")
             
         return "; ".join(results)
-    
+    def track_multiple_items(object_names: List[str]):
+        """
+        Track multiple objects simultaneously in a video.
+        Example input: ["red cup", "keyboard", "blue pen"]
+        """
+        _log_action("track_multiple_items", objects=object_names)
+        
+        if not _tracker or not _tracker.available:
+            return "Error: Object Tracking (SAM 3) is not available."
+
+        # 1. Capture Video
+        print(f"Capturing video to track: {object_names}...")
+        res_str = _executor.call("capture_video", duration=3.0)
+        
+        # Parse video response
+        try:
+            res = json.loads(res_str)
+            frames = res.get("frames", [])
+            if not frames: return "Error: No frames captured."
+        except:
+            return "Error parsing video data."
+
+        # Save Frames
+        timestamp = datetime.now().strftime("%H%M%S")
+        temp_dir = LOG_DIR / "tracking" / f"multi_{timestamp}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        saved_frames = []
+        for i, b64 in enumerate(frames):
+            path = temp_dir / f"frame_{i:04d}.jpg"
+            img_data = base64.b64decode(b64)
+            # Robust Save
+            try:
+                with Image.open(io.BytesIO(img_data)) as img:
+                    img.save(path)
+            except:
+                with open(path, "wb") as f: f.write(img_data)
+            saved_frames.append(path)
+
+        # Grounding
+        print("Locating objects in first frame...")
+        with open(saved_frames[0], "rb") as f:
+            first_frame_data = f.read()
+
+        # Call the new multi-grounder
+        # Returns Dict: {'cup': [y,x,y,x], 'keyboard': [y,x,y,x]}
+        initial_data = _grounder.ground_multiple_objects(first_frame_data, object_names)
+        if not initial_data:
+            print(f"FAILED: Grounding found 0 objects. Expected: {object_names}")
+            # This return string tells the agent to try fallback
+            return f"Could not locate any of the requested objects: {object_names}"
+            
+        print(f"Found {len(initial_data)} objects: {list(initial_data.keys())}")
+
+        # Tracking
+        print("Running SAM 3 Multi-Tracking...")
+        result = _tracker.track_multi_objects(str(temp_dir), initial_data)
+        
+        if "error" in result:
+            return f"Tracking failed: {result['error']}"
+            
+        video_path = result.get("video_path")
+        print(f"\n[SUCCESS] Multi-Tracking Video: {video_path}\n")
+        get_logger().info(f"Multi-Tracking Video: {video_path}")
+        
+        return f"Tracking Complete. Video saved to {video_path}"
     def finish_task(summary: str):
         """Call this when the user's request is fully completed."""
         _log_action("finish_task", summary=summary)
@@ -397,8 +496,12 @@ def _get_tools(executor, grounder, tracker):
         """
         return track_object(object_description)
 
-    return [start_bridge, move_relative, teleport, rotate_device, inspect_surroundings, locate_object, capture_video, track_object, create_tracking_video, finish_task, get_connection_status]
-
+    return [
+        start_bridge, move_relative, teleport, rotate_device, 
+        inspect_surroundings, locate_object, capture_video, 
+        track_object, track_multiple_items, # <--- Added here
+        create_tracking_video, finish_task, get_connection_status
+    ]
 # ============================================================================
 # AGENT
 # ============================================================================
@@ -427,18 +530,14 @@ class GeminiAgent:
         You control a headset and controllers.
         
         RULES:
-        1. Always locate objects before interacting with them if you don't know where they are.
-        2. Use `locate_object` to find things. It gives you 2D image coordinates (0.0-1.0).
-        3. TRANSLATE 2D coordinates to 3D moves:
+        1. Always locate objects before interacting with them.
+        2. Use `locate_object` for single items.
+        3. Use `track_multiple_items` if the user asks to track specifically multiple things (e.g., "Track the cup and the bottle").
+        4. TRANSLATE 2D coordinates to 3D moves:
            - Object is Left (x < 0.5) -> Move Left (dx < 0).
            - Object is Right (x > 0.5) -> Move Right (dx > 0).
-           - Object is High (y < 0.5) -> Move Up (dy > 0).
-        4. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
-        5. When done, call `finish_task`.
-        6. Coordinate System:
-          X: Left(-)/Right(+)
-          Y: Down(-)/Up(+)
-          Z: Forward(-)/Back(+)
+        5. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
+        6. When done, call `finish_task`.
         """
         
         self.chat = self.client.chats.create(

@@ -70,10 +70,25 @@ def run_segmentation(current_image):
 
     # Retrieve masks (boolean tensor: [N, 1, H, W])
     masks = inference_state["masks"]
+    scores = inference_state.get("scores")
     
     if masks is None or masks.numel() == 0:
         return current_image, "No masks generated."
     
+    # Filter for the best mask if scores are available
+    if scores is not None and len(scores) > 0:
+        print(scores)
+        best_idx = torch.argmax(scores).item()
+        # Select the second best mask
+        score_temp = scores.clone().detach()
+        score_temp = score_temp.tolist()
+        score_temp.pop(best_idx)
+        best_idx_2 = torch.argmax(torch.tensor(score_temp)).item()
+        
+        
+        masks = torch.cat([masks[best_idx:best_idx+1], masks[best_idx_2:best_idx_2+1]])
+        print(f"Selecting best mask with score: {scores[best_idx].item():.4f}")
+
     # Convert to numpy (assuming single batch, single frame)
     masks_np = masks.detach().cpu().numpy()
     

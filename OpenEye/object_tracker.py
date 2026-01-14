@@ -186,7 +186,112 @@ class ObjectTracker:
             import traceback
             traceback.print_exc()
             return f"Tracking failed: {e}"
+    def ground_multiple_objects(self, image_data: bytes, object_names: List[str]) -> Dict[str, List[float]]:
+        """
+        Grounds multiple objects in a single pass.
+        Returns: Dict { "label": [ymin, xmin, ymax, xmax] }
+        """
+        logger = get_logger()
+        objects_str = ", ".join(object_names)
+        logger.info(f"Grounding Multiple: '{objects_str}'")
+        
+        prompt = f"""
+        Find the following objects in the image: {objects_str}.
+        
+        You MUST return the answer in the following JSON format:
+        {{
+            "thinking": "Reasoning about the scene...",
+            "detections": [
+                {{
+                    "label": "exact_object_name_from_list",
+                    "coordinates": [ymin, xmin, ymax, xmax]
+                }}
+            ]
+        }}
+        
+        1. ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
+        2. Only return objects you are confident you see.
+        3. If an object appears multiple times, pick the most prominent one.
+        """
+        
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[
+                    types.Content(role="user", parts=[
+                        types.Part(text=prompt),
+                        types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_data))
+                    ])
+                ],
+                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+            )
+            
+            # Parse result
+            text = response.candidates[0].content.parts[0].text
+            data = json.loads(text)
+            
+            if "thinking" in data:
+                logger.info(f"[Grounding Thought] {data['thinking']}")
+            
+            results = {}
+            valid_boxes_for_draw = []
 
+            for det in data.get("detections", []):
+                label = det.get("label")
+                coords = det.get("coordinates")
+                
+                # Sanity check
+                if label and coords and len(coords) == 4:
+                    # Handle 0-1000 scale if Gemini hallucinates that format
+                    if any(c > 1.0 for c in coords):
+                        coords = [c / 1000.0 for c in coords]
+                    
+                    results[label] = coords
+                    valid_boxes_for_draw.append({"label": label, "box_2d": coords})
+
+            # Draw and save visualization
+            if valid_boxes_for_draw:
+                self._draw_and_save(image_data, valid_boxes_for_draw, f"multi_{len(results)}_objs")
+                
+            return results
+
+        except Exception as e:
+            logger.error(f"Multi-Grounding failed: {e}")
+            traceback.print_exc()
+            return {}
+
+    def _draw_and_save(self, image_data: bytes, boxes: List[Dict], description: str):
+        # ... (Keep your existing _draw_and_save method exactly as it is) ...
+        # Ensure it handles the list of boxes correctly (which your previous code did).
+        logger = get_logger()
+        timestamp = datetime.now().strftime("%H%M%S")
+        filename = self.log_dir / f"ground_{timestamp}_{description}.jpg"
+        
+        if CV2_AVAILABLE:
+            try:
+                nparr = np.frombuffer(image_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                h, w = img.shape[:2]
+                
+                colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (0, 255, 255)]
+
+                for i, box in enumerate(boxes):
+                    y1, x1, y2, x2 = box['box_2d']
+                    label = box.get('label', description)
+                    
+                    p1 = (int(x1*w), int(y1*h))
+                    p2 = (int(x2*w), int(y2*h))
+                    
+                    color = colors[i % len(colors)]
+                    
+                    cv2.rectangle(img, p1, p2, color, 3)
+                    cv2.putText(img, label, (p1[0], max(20, p1[1]-10)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                
+                cv2.imwrite(str(filename), img)
+                logger.info(f"Saved grounding to {filename}")
+            except Exception as e:
+                logger.error(f"CV2 draw failed: {e}")
     def track_multi_objects(self, video_path: str, initial_data: Dict[str, List[float]]) -> Dict[str, Any]:
         """
         Track multiple objects in a video.

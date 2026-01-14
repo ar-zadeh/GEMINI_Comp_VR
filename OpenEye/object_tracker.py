@@ -54,7 +54,7 @@ class ObjectTracker:
                 
                 # Build model and processor
                 self.model = build_sam3_image_model(bpe_path=bpe_path)
-                self.processor = Sam3Processor(self.model, confidence_threshold=0.5)
+                self.processor = Sam3Processor(self.model, confidence_threshold=0.85)
                 logger.info("SAM 3 Model initialized.")
             except Exception as e:
                 logger.error(f"Failed to init SAM 3: {e}")

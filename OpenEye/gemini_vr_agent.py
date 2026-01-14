@@ -341,7 +341,7 @@ def _get_tools(executor, grounder, tracker):
             # Robust Save
             try:
                 with Image.open(io.BytesIO(img_data)) as img:
-                    img.save(path)
+                    img.save(path, quality=95)  # High quality JPEG
             except:
                 with open(path, "wb") as f: f.write(img_data)
             saved_frames.append(path)
@@ -455,7 +455,7 @@ def _get_tools(executor, grounder, tracker):
             # This "cleans" the file structure so OpenCV won't complain about corruption.
             try:
                 with Image.open(io.BytesIO(img_data)) as img:
-                    img.save(path)
+                    img.save(path, quality=95)  # High quality JPEG
             except Exception as e:
                 # Fallback if image is too broken even for PIL
                 print(f"Warning: PIL failed to clean frame {i}: {e}. Saving raw.")

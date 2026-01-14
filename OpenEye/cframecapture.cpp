@@ -214,7 +214,15 @@ bool CFrameCapture::CaptureWindow(HWND hwnd, std::vector<uint8_t>& outRgbData, i
         return false;
     }
 
-    // Get window dimensions
+    // Get window's screen position for direct screen capture
+    RECT windowRect;
+    if (!GetWindowRect(hwnd, &windowRect))
+    {
+        DriverLog("CFrameCapture: Failed to get window rect\n");
+        return false;
+    }
+
+    // Get client area dimensions
     RECT clientRect;
     if (!GetClientRect(hwnd, &clientRect))
     {
@@ -230,6 +238,10 @@ bool CFrameCapture::CaptureWindow(HWND hwnd, std::vector<uint8_t>& outRgbData, i
         DriverLog("CFrameCapture: Invalid window dimensions %dx%d\n", width, height);
         return false;
     }
+
+    // Convert client area origin to screen coordinates
+    POINT clientOrigin = { 0, 0 };
+    ClientToScreen(hwnd, &clientOrigin);
 
     // Recreate bitmap if size changed
     if (width != m_windowWidth || height != m_windowHeight)
@@ -250,31 +262,37 @@ bool CFrameCapture::CaptureWindow(HWND hwnd, std::vector<uint8_t>& outRgbData, i
         SelectObject(m_hdcMem, m_hBitmap);
     }
 
-    // Get window DC
-    HDC hdcWindow = GetDC(hwnd);
-    if (!hdcWindow)
-    {
-        DriverLog("CFrameCapture: Failed to get window DC\n");
-        return false;
-    }
-
-    // Use PrintWindow for better compatibility with hardware-accelerated windows
-    // PW_RENDERFULLCONTENT (0x00000002) captures DirectX content on Windows 8.1+
-    BOOL result = PrintWindow(hwnd, m_hdcMem, 0x00000002);
+    // Method 1: Direct screen capture at window's screen position
+    // This works better for DirectX/OpenGL windows than PrintWindow
+    // CAPTUREBLT flag is needed to capture layered windows
+    BOOL result = BitBlt(m_hdcMem, 0, 0, width, height,
+                         m_hdcScreen, clientOrigin.x, clientOrigin.y, 
+                         SRCCOPY | CAPTUREBLT);
     
     if (!result)
     {
-        // Fallback to BitBlt from window DC
-        result = BitBlt(m_hdcMem, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY);
+        DriverLog("CFrameCapture: Direct screen BitBlt failed, trying PrintWindow...\n");
+        
+        // Fallback to PrintWindow (may produce gray images on some DirectX apps)
+        result = PrintWindow(hwnd, m_hdcMem, 0x00000002);
+        
         if (!result)
         {
-            DriverLog("CFrameCapture: Both PrintWindow and BitBlt failed\n");
-            ReleaseDC(hwnd, hdcWindow);
+            // Last resort: try window DC
+            HDC hdcWindow = GetDC(hwnd);
+            if (hdcWindow)
+            {
+                result = BitBlt(m_hdcMem, 0, 0, width, height, hdcWindow, 0, 0, SRCCOPY);
+                ReleaseDC(hwnd, hdcWindow);
+            }
+        }
+        
+        if (!result)
+        {
+            DriverLog("CFrameCapture: All capture methods failed\n");
             return false;
         }
     }
-
-    ReleaseDC(hwnd, hdcWindow);
 
     // Get bitmap data
     BITMAPINFOHEADER bi;

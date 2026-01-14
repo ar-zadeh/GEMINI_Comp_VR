@@ -135,17 +135,15 @@ class ObjectTracker:
                         elif mask.ndim == 3: # 1, H, W or H, W, ?
                             mask = mask[0]
                         
-                        # Draw mask overlay
-                        # Create colored mask (Green or Red)
-                        overlay = frame.copy()
-                        # Color: BGR
-                        color = [0, 255, 0] # Green
-                        
-                        # Apply color to masked area
-                        overlay[mask] = color
-                        
-                        # Blend with original
-                        cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
+                        # Draw mask overlay with reduced opacity to avoid gray hue
+                        # Only apply if mask covers a reasonable area (not entire frame)
+                        mask_ratio = np.sum(mask) / (mask.shape[0] * mask.shape[1])
+                        if mask_ratio < 0.9:  # Skip overlay if mask covers >90% of frame
+                            overlay = frame.copy()
+                            color = [0, 255, 0]  # Green (BGR)
+                            overlay[mask] = color
+                            # Blend with 20% overlay, 80% original (reduced from 40/60)
+                            cv2.addWeighted(overlay, 0.2, frame, 0.8, 0, frame)
                         
                         # Update bounding box for next frame based on mask
                         rows = np.any(mask, axis=1)
@@ -423,8 +421,8 @@ class ObjectTracker:
                          # Fallback to center of previous box
                          frame_telemetry[label] = [(box_x + box_w/2)/w, (box_y + box_h/2)/h]
 
-                # Blend
-                cv2.addWeighted(vis_frame, 0.5, frame, 0.5, 0, frame)
+                # Blend with reduced opacity to avoid gray hue (20% overlay, 80% original)
+                cv2.addWeighted(vis_frame, 0.2, frame, 0.8, 0, frame)
                 out.write(frame)
                 telemetry_data.append(frame_telemetry)
 

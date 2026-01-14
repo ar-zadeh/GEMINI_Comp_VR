@@ -1,3 +1,4 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include "cframecapture.h"
 #include "driverlog.h"
 #include <chrono>

@@ -17,7 +17,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 import io
+import math
 import shutil
+import cv2
+import numpy as np
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -499,10 +502,234 @@ def _get_tools(executor, grounder, tracker):
         """
         return track_object(object_description)
 
+    def visual_servo_to_object(object_description: str):
+        """
+        Rotates the controller (modifies yaw/pitch) so that the 'blue VR controller ray' aligns with the center of the specified target object.
+        Use this when the user asks to 'align', 'point', or 'aim' the controller or its ray at something.
+        """
+        _log_action("visual_servo_to_object", description=object_description)
+        logger = get_logger()
+
+        if not _tracker or not _tracker.available:
+            return "Error: Object Tracking (SAM 3) is not available."
+
+        # Config
+        Kp_YAW = 0.05   # Gain for Horizontal (Yaw) - Increased for faster convergence
+        Kp_PITCH = 0.05 # Gain for Vertical (Pitch) - Increased for faster convergence
+        MAX_ITER = 100
+        TOLERANCE_PX = 5  # Stop if within this many pixels
+        
+        # 1. Get Initial Pose
+        print("Getting initial pose of controller2...")
+        curr_pitch = 0.0
+        curr_yaw = 0.0
+        curr_roll = 0.0
+        
+        status = _executor.call("get_current_pose", device="controller2")
+        try:
+            if "Rotation: [" in status:
+                rot_str = status.split("Rotation: [")[1].split("]")[0]
+                curr_pitch, curr_yaw, curr_roll = map(float, rot_str.split(","))
+                print(f"Initial Rotation: Pitch={curr_pitch}, Yaw={curr_yaw}, Roll={curr_roll}")
+        except Exception as e:
+            msg = f"Failed to parse initial pose: {e}"
+            logger.error(msg)
+            return msg
+
+        # 2. Capture Initial Image for Grounding
+        print("Capturing initial image for grounding...")
+        res = _executor.call("inspect_surroundings")
+        if isinstance(res, str) and res.startswith("Error"): return f"Capture failed: {res}"
+        
+        try:
+            data = json.loads(res).get("data")
+            img_bytes = base64.b64decode(data)
+            # Use PIL to clean/load
+            pil_img_init = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            w, h = pil_img_init.size
+        except Exception as e:
+            return f"Initial image parsing failed: {e}"
+
+        # 3. Ground Targets (Gemini - Once)
+        targets = {
+            "ray": "blue VR controller ray",
+            "logo": object_description
+        }
+        current_boxes = {}
+        
+        print(f"Grounding '{targets['ray']}' and '{targets['logo']}'...")
+        # We can use the multi-object grounder
+        grounding_results = _grounder.ground_multiple_objects(img_bytes, list(targets.values()))
+        
+        all_found = True
+        for key, desc in targets.items():
+            if desc in grounding_results:
+                # Normalized [ymin, xmin, ymax, xmax] -> Pixel [x, y, w, h]
+                ymin, xmin, ymax, xmax = grounding_results[desc]
+                box_x, box_y = xmin * w, ymin * h
+                box_w, box_h = (xmax - xmin) * w, (ymax - ymin) * h
+                current_boxes[key] = [box_x, box_y, box_w, box_h]
+            else:
+                print(f"[{key}] '{desc}' NOT found by Gemini.")
+                all_found = False
+        
+        if not all_found:
+             return f"Failed to find both the controller ray and '{object_description}' in the initial view. Cannot start servoing."
+             
+        print("Initial grounding successful. Starting control loop.")
+
+        # 4. Control Loop
+        for i in range(MAX_ITER):
+            print(f"\n--- Servo Iteration {i+1}/{MAX_ITER} ---")
+            
+            # A. Capture New Image
+            res = _executor.call("inspect_surroundings")
+            if isinstance(res, str) and res.startswith("Error"):
+                print("Capture failed in loop.")
+                break
+                
+            try:
+                data = json.loads(res).get("data")
+                img_bytes_loop = base64.b64decode(data)
+                pil_img_loop = Image.open(io.BytesIO(img_bytes_loop)).convert("RGB")
+                img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR) # For Vis
+            except Exception as e:
+                print(f"Image parse error in loop: {e}")
+                break
+
+            # B. SAM Tracking (Update state with new image)
+            inference_state = _tracker.processor.set_image(pil_img_loop)
+            
+            points = {}
+            
+            for key, desc in targets.items():
+                if key not in current_boxes: continue # Should not happen unless lost
+                
+                box_x, box_y, box_w, box_h = current_boxes[key]
+                
+                # Format box for SAM
+                box_input_xywh = _tracker.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
+                box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
+                norm_box_cxcywh = _tracker.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
+                
+                _tracker.processor.reset_all_prompts(inference_state)
+                inference_state = _tracker.processor.add_geometric_prompt(
+                    state=inference_state, box=norm_box_cxcywh, label=True
+                )
+                
+                # Get Mask
+                mask = None
+                if "masks" in inference_state and inference_state["masks"] is not None:
+                    m = inference_state["masks"].detach().cpu().numpy() > 0.5
+                    if m.ndim == 4: mask = m[0, 0]
+                    elif m.ndim == 3: mask = m[0]
+                
+                if mask is None:
+                    print(f"[{key}] Lost tracking (no mask).")
+                    del current_boxes[key]
+                    continue
+                    
+                # Update Box & Extract Point
+                rows = np.any(mask, axis=1)
+                cols = np.any(mask, axis=0)
+                
+                if rows.any() and cols.any():
+                    rmin, rmax = np.where(rows)[0][[0, -1]]
+                    cmin, cmax = np.where(cols)[0][[0, -1]]
+                    current_boxes[key] = [cmin, rmin, cmax - cmin, rmax - rmin]
+                    
+                    # Points logic
+                    if key == "ray":
+                        # Ray Tip = Min Y (Highest point visually)
+                        ys, xs = np.where(mask)
+                        if len(ys) > 0:
+                            idx = np.argmin(ys) 
+                            points[key] = (xs[idx], ys[idx])
+                            cv2.circle(img_cv, (xs[idx], ys[idx]), 5, (0, 0, 255), -1) # Red Tip
+                    elif key == "logo":
+                        # Centroid
+                        M = cv2.moments(mask.astype(np.uint8))
+                        if M["m00"] != 0:
+                            cx = int(M["m10"]/M["m00"])
+                            cy = int(M["m01"]/M["m00"])
+                            points[key] = (cx, cy)
+                            cv2.circle(img_cv, (cx, cy), 5, (0, 255, 0), -1) # Green center
+                else:
+                    print(f"[{key}] Mask empty.")
+                    del current_boxes[key]
+            
+            # C. PID & Control
+            if "ray" in points and "logo" in points:
+                rx, ry = points["ray"]
+                lx, ly = points["logo"]
+                
+                dx = lx - rx
+                dy = ly - ry
+                dist = math.sqrt(dx*dx + dy*dy)
+                
+                print(f"Error: dx={dx}, dy={dy}, dist={dist:.2f}")
+                
+                # Save debug image with telemetry
+                cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
+                
+                # Prepare info text
+                # We calculate PID terms here just for display before applying them
+                d_yaw_disp = Kp_YAW * dx
+                d_pitch_disp = Kp_PITCH * dy
+                info_text = f"Err: {dist:.1f}px | dYaw: {d_yaw_disp:.2f} | dPitch: {d_pitch_disp:.2f}"
+                
+                # Draw text background
+                (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(img_cv, (10, 10), (10 + tw + 10, 10 + th + 10), (0, 0, 0), -1)
+                cv2.putText(img_cv, info_text, (15, 15 + th), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                timestamp = datetime.now().strftime("%H%M%S")
+                debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
+                cv2.imwrite(str(debug_path), img_cv)
+                logger.info(f"Saved servo debug image: {debug_path}")
+                
+                if dist < TOLERANCE_PX:
+                    return f"Visual Servoing Complete. Aligned with {object_description} (Error: {dist:.2f}px)."
+                
+                # PID
+                # INVERTED LOGIC: Previous test showed error increasing with positive gain.
+                # If dx < 0 (Target Left), we need to move Left. 
+                # Observation showed Yaw- moved Right. So we need Yaw+ to move Left.
+                # So if dx is negative, we need dYaw positive -> Invert sign.
+                d_yaw = -Kp_YAW * dx
+                d_pitch = -Kp_PITCH * dy
+                
+                curr_yaw += d_yaw
+                curr_pitch += d_pitch
+                
+                print(f"Adjusting: dYaw={d_yaw:.2f}, dPitch={d_pitch:.2f} -> New Yaw={curr_yaw:.2f}, Pitch={curr_pitch:.2f}")
+                
+                _executor.call("rotate_device", device="controller2", 
+                               pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
+                               
+                # Short wait for physical movement
+                time.sleep(5)
+                
+                # Check actual rotation
+                status_check = _executor.call("get_current_pose", device="controller2")
+                try:
+                    if "Rotation: [" in status_check:
+                        rot_str = status_check.split("Rotation: [")[1].split("]")[0]
+                        p, y, r = map(float, rot_str.split(","))
+                        print(f"Current controller rotation values: Pitch={p:.2f}, Yaw={y:.2f}, Roll={r:.2f}")
+                except Exception as e:
+                    print(f"Could not read back pose: {e}")
+                
+            else:
+                 return f"Lost tracking of one or both objects during loop. Stopping."
+
+        return f"Visual servoing finished max iterations ({MAX_ITER}). Final error: {dist if 'dist' in locals() else 'Unknown'}."
+
     return [
         start_bridge, move_relative, teleport, rotate_device, 
         inspect_surroundings, locate_object, capture_video, 
-        track_object, track_multiple_items, # <--- Added here
+        track_object, track_multiple_items, visual_servo_to_object, # <--- Added here
         create_tracking_video, finish_task, get_connection_status
     ]
 # ============================================================================
@@ -536,11 +763,12 @@ class GeminiAgent:
         1. Always locate objects before interacting with them.
         2. Use `locate_object` for single items.
         3. Use `track_multiple_items` if the user asks to track specifically multiple things (e.g., "Track the cup and the bottle").
-        4. TRANSLATE 2D coordinates to 3D moves:
+        4. Use `visual_servo_to_object` to ALIGN or POINT the controller/ray at an object.
+        5. TRANSLATE 2D coordinates to 3D moves:
            - Object is Left (x < 0.5) -> Move Left (dx < 0).
            - Object is Right (x > 0.5) -> Move Right (dx > 0).
-        5. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
-        6. When done, call `finish_task`.
+        6. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
+        7. When done, call `finish_task`.
         """
         
         self.chat = self.client.chats.create(

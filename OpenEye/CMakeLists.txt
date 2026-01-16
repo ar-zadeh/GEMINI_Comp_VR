@@ -58,3 +58,4 @@ install(TARGETS ${TARGET_NAME}
 )
 
 install(FILES default.vrsettings DESTINATION drivers/sample/resources/settings)
+install(FILES mycontroller_profile.json DESTINATION drivers/sample/resources/input)

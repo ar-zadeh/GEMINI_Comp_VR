@@ -28,29 +28,38 @@ add_library(${TARGET_NAME} MODULE
   jpge.h
 )
 
-SET_TARGET_PROPERTIES(${TARGET_NAME} PROPERTIES PREFIX "")
-
-target_link_libraries(${TARGET_NAME}
-  ${OPENVR_LIBRARIES}
-  ${CMAKE_DL_LIBS}
-)
-
-if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    target_link_libraries(${TARGET_NAME} ws2_32)
-    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
-endif()
-
-if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
-    set(PREFIX "win")
-else()
-    set(PREFIX "linux")
-endif()
+# --- DEPLOYMENT CONFIGURATION ---
+# Force output to a structure compatible with SteamVR driver layout
+# This ensures that a simple Build (without Install) creates a valid driver folder.
 
 if(CMAKE_SIZEOF_VOID_P STREQUAL "8")
     set(ARCH 64)
 else()
-    set(ARCH 64)
+    set(ARCH 32) # Just in case
 endif()
+
+# Determine binary output path, e.g., build/drivers/sample/bin/win64
+set(DRIVER_ROOT "${CMAKE_BINARY_DIR}/drivers/sample")
+set(DRIVER_BIN_DIR "${DRIVER_ROOT}/bin/${PREFIX}${ARCH}")
+
+set_target_properties(${TARGET_NAME} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${DRIVER_BIN_DIR}"
+    LIBRARY_OUTPUT_DIRECTORY "${DRIVER_BIN_DIR}"
+    ARCHIVE_OUTPUT_DIRECTORY "${DRIVER_BIN_DIR}"
+)
+
+# Copy resources to the build tree structure so the driver works immediately after build
+add_custom_command(TARGET ${TARGET_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DRIVER_ROOT}/resources/input"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${DRIVER_ROOT}/resources/settings"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/mycontroller_profile.json"
+        "${DRIVER_ROOT}/resources/input/mycontroller_profile.json"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/default.vrsettings"
+        "${DRIVER_ROOT}/resources/settings/default.vrsettings"
+    COMMENT "Copying driver resources to build tree structure"
+)
 
 install(TARGETS ${TARGET_NAME}
     RUNTIME DESTINATION drivers/sample/bin/${PREFIX}${ARCH}

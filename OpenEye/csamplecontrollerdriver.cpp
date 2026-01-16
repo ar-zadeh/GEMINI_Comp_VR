@@ -146,6 +146,9 @@ vr::EVRInitError CSampleControllerDriver::Activate(vr::TrackedDeviceIndex_t unOb
 
     vr::VRProperties()->SetInt32Property(m_ulPropertyContainer, vr::Prop_Axis0Type_Int32, vr::k_eControllerAxis_TrackPad);
 
+    // Disable SteamVR's pose prediction for this controller - we're providing real-time updates
+    vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DoNotApplyPrediction_Bool, true);
+
     // Create our haptic component
     vr::VRDriverInput()->CreateHapticComponent(m_ulPropertyContainer, "/output/haptic", &m_compHaptic);
 

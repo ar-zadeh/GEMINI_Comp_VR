@@ -38,6 +38,12 @@ public:
 
     std::string GetSerialNumber() const;
 
+public:
+    // Public access for push-based pose updates from TCP thread
+    vr::TrackedDeviceIndex_t GetObjectId() const { return m_unObjectId; }
+    bool IsActivated() const { return m_unObjectId != vr::k_unTrackedDeviceIndexInvalid; }
+    int32_t GetControllerIndex() const { return ControllerIndex; }
+
 private:
     vr::TrackedDeviceIndex_t m_unObjectId;
     vr::PropertyContainerHandle_t m_ulPropertyContainer;

@@ -214,6 +214,8 @@ def run_tcp_server():
     try:
         # Enable address reuse to fix reconnection issues
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # Disable Nagle's algorithm for lower latency
+        server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         server.bind((HOST, PORT))
         server.listen(5)
         print(f"TCP Server listening on {HOST}:{PORT}")
@@ -222,6 +224,7 @@ def run_tcp_server():
             try:
                 server.settimeout(1.0)
                 client, _ = server.accept()
+                client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 t = threading.Thread(target=handle_client, args=(client,), daemon=True)
                 t.start()
             except socket.timeout:
@@ -230,6 +233,31 @@ def run_tcp_server():
         print(f"Server error: {e}")
     finally:
         server.close()
+
+@mcp.tool()
+def kill_address() -> str:
+    """
+    Kills the process using the configured TCP port (default 5555).
+    Useful if the server cannot start because 'Address already in use'.
+    """
+    import subprocess
+    try:
+        # Try fuser first (standard on many Linux distros)
+        cmd = f"fuser -k -n tcp {PORT}"
+        subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return f"Successfully killed process on port {PORT}"
+    except subprocess.CalledProcessError:
+        try:
+            # Fallback to lsof + kill
+            # This complex command finds PIDs using the port and kills them
+            cmd = f"lsof -t -i:{PORT} | xargs -r kill"
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            return f"Successfully killed process on port {PORT} (using lsof)"
+        except subprocess.CalledProcessError:
+             # Fallback to netstat if lsof is missing? Or just return error.
+             return f"Could not kill process on port {PORT}. Please do it manually (e.g. 'fuser -k {PORT}/tcp')."
+    except Exception as e:
+        return f"Error executing kill command: {e}"
 
 # --- MCP TOOLS: Connection Management ---
 

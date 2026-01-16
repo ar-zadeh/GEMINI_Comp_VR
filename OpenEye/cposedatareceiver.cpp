@@ -1,5 +1,6 @@
 #include "cposedatareceiver.h"
 #include "cvisionserver.h"
+#include "cserverdriver_sample.h"
 #include "driverlog.h"
 #include <cstdlib>
 #include <cstring>
@@ -127,22 +128,51 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
     DriverLog("CPoseDataReceiver: Parsed device=%s, pos=[%.2f,%.2f,%.2f], rot=[%.2f,%.2f,%.2f]\n",
         device.c_str(), pose.posX, pose.posY, pose.posZ, pose.rotX, pose.rotY, pose.rotZ);
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (device == "headset")
+        if (device == "headset")
+        {
+            m_headsetPose = pose;
+            m_headsetPose.updated = true;
+        }
+        else if (device == "controller1")
+        {
+            m_controller1Pose = pose;
+            m_controller1Pose.updated = true;
+        }
+        else if (device == "controller2")
+        {
+            m_controller2Pose = pose;
+            m_controller2Pose.updated = true;
+        }
+    } // Release mutex before calling OpenVR
+
+    // PUSH-BASED UPDATE: Immediately notify SteamVR of pose change
+    // This bypasses the slow RunFrame() polling and reduces latency from ~4s to near-instant
+    if (device == "headset" && g_pHeadsetDriver && g_pHeadsetDriver->IsActivated())
     {
-        m_headsetPose = pose;
-        m_headsetPose.updated = true;
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
+            g_pHeadsetDriver->GetObjectId(),
+            g_pHeadsetDriver->GetPose(),
+            sizeof(vr::DriverPose_t));
+        DriverLog("CPoseDataReceiver: Pushed headset pose update\n");
     }
-    else if (device == "controller1")
+    else if (device == "controller1" && g_pController1Driver && g_pController1Driver->IsActivated())
     {
-        m_controller1Pose = pose;
-        m_controller1Pose.updated = true;
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
+            g_pController1Driver->GetObjectId(),
+            g_pController1Driver->GetPose(),
+            sizeof(vr::DriverPose_t));
+        DriverLog("CPoseDataReceiver: Pushed controller1 pose update\n");
     }
-    else if (device == "controller2")
+    else if (device == "controller2" && g_pController2Driver && g_pController2Driver->IsActivated())
     {
-        m_controller2Pose = pose;
-        m_controller2Pose.updated = true;
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
+            g_pController2Driver->GetObjectId(),
+            g_pController2Driver->GetPose(),
+            sizeof(vr::DriverPose_t));
+        DriverLog("CPoseDataReceiver: Pushed controller2 pose update\n");
     }
 }
 

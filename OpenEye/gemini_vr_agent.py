@@ -5,6 +5,7 @@ Uses Google GenAI SDK for native tool calling and state management.
 """
 
 import os
+import shlex
 import json
 import time
 import base64
@@ -152,17 +153,34 @@ class VisualGrounder:
                         types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=clean_image_data))
                     ])
                 ],
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json", 
+
+                )
             )
             
             # 2. Robust JSON Parsing (Strips Markdown)
+            if not response.candidates:
+                logger.error(f"Gemini returned NO candidates. Finish reason: {response.prompt_feedback if hasattr(response, 'prompt_feedback') else 'Unknown'}")
+                # Log full response for debugging
+                logger.debug(f"Full Response: {response}")
+                return {}
+
+            if not response.candidates[0].content or not response.candidates[0].content.parts:
+                 logger.error("Gemini candidate content is empty.")
+                 return {}
+
             text = response.candidates[0].content.parts[0].text
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1].rsplit("\n", 1)[0]
             if text.startswith("json"):
                 text = text[4:]
             
-            data = json.loads(text.strip())
+            try:
+                data = json.loads(text.strip())
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON from Gemini: {e}. Text: {text}")
+                return {}
             
             results = {}
             valid_boxes_for_draw = []
@@ -388,6 +406,14 @@ def _get_tools(executor, grounder, tracker):
         """Check VR driver connection."""
         _log_action("get_connection_status")
         return _executor.call("get_connection_status")
+
+    def kill_address():
+        """
+        Kills the process using the configured TCP port (default 5555).
+        Use this when the server fails to start with "Address already in use".
+        """
+        _log_action("kill_address")
+        return _executor.call("kill_address")
 
     def capture_video(duration: float = 3.0):
         """Capture a short video clip (sequence of frames) and save it."""
@@ -709,7 +735,7 @@ def _get_tools(executor, grounder, tracker):
                                pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
                                
                 # Short wait for physical movement
-                time.sleep(5)
+                time.sleep(2)
                 
                 # Check actual rotation
                 status_check = _executor.call("get_current_pose", device="controller2")
@@ -729,8 +755,8 @@ def _get_tools(executor, grounder, tracker):
     return [
         start_bridge, move_relative, teleport, rotate_device, 
         inspect_surroundings, locate_object, capture_video, 
-        track_object, track_multiple_items, visual_servo_to_object, # <--- Added here
-        create_tracking_video, finish_task, get_connection_status
+        track_object, track_multiple_items, visual_servo_to_object, 
+        create_tracking_video, finish_task, get_connection_status, kill_address
     ]
 # ============================================================================
 # AGENT
@@ -827,6 +853,87 @@ class GeminiAgent:
             self.logger.error(f"Error: {e}")
             traceback.print_exc()
 
+    def handle_direct_command(self, user_input: str):
+        """
+        Parses and executes a direct command in the format ((function arg1 arg2 ...))
+        Arguments are automatically converted to int/float/bool/None if possible.
+        """
+        try:
+            # Strip (( and ))
+            content = user_input[2:-2].strip()
+            if not content:
+                print("Empty direct command.")
+                return
+
+            # Parse with shlex (handles quoted strings)
+            parts = shlex.split(content)
+            func_name = parts[0]
+            raw_args = parts[1:]
+            
+            # Convert args
+            args = []
+            for arg in raw_args:
+                if arg.lower() == 'true':
+                    args.append(True)
+                elif arg.lower() == 'false':
+                    args.append(False)
+                elif arg.lower() == 'none':
+                    args.append(None)
+                else:
+                    try:
+                        if '.' in arg:
+                            args.append(float(arg))
+                        else:
+                            args.append(int(arg))
+                    except ValueError:
+                        args.append(arg) # Keep as string
+            
+            print(f"Direct Execution: {func_name}({args})")
+            self.logger.info(f"Direct Execution: {func_name}({args})")
+
+            # 1. Check Agent Tools (Wrapped functions)
+            # self.tools is a list of callables
+            tool_func = next((t for t in self.tools if t.__name__ == func_name), None)
+            
+            if tool_func:
+                # Introspect to map args if needed, or just pass *args
+                # Since our tools are simple python functions, *args usually works 
+                # if the user provided them in order.
+                import inspect
+                sig = inspect.signature(tool_func)
+                
+                # Simple binding attempt
+                try:
+                    bound_args = sig.bind(*args)
+                    bound_args.apply_defaults()
+                    res = tool_func(*bound_args.args, **bound_args.kwargs)
+                    print(f"Result: {res}")
+                    self.logger.info(f"Result: {res}")
+                    return
+                except TypeError as e:
+                    print(f"Argument mismatch for tool '{func_name}': {e}")
+                    return
+
+            # 2. Check MCP Server directly (underlying functions)
+            # This allows calling functions not exposed as agent tools
+            if hasattr(self.executor.module, func_name):
+                func = getattr(self.executor.module, func_name)
+                try:
+                    res = func(*args)
+                    print(f"Result: {res}")
+                    self.logger.info(f"Result: {res}")
+                    return
+                except Exception as e:
+                     print(f"Error executing MCP function '{func_name}': {e}")
+                     return
+
+            print(f"Error: Function '{func_name}' not found in Agent Tools or MCP Server.")
+
+        except Exception as e:
+            print(f"Failed to execute direct command: {e}")
+            traceback.print_exc()
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -848,8 +955,13 @@ if __name__ == "__main__":
                 continue
             elif cmd == 'status':
                 agent.print_status()
-                
                 continue
+                
+            # Direct Command Check
+            if user_input.startswith("((") and user_input.endswith("))"):
+                agent.handle_direct_command(user_input)
+                continue
+
             agent.run(user_input)
         except KeyboardInterrupt:
             break

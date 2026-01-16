@@ -6,6 +6,11 @@
 #include "csamplecontrollerdriver.h"
 #include "cposedatareceiver.h"
 
+// Global pointers for push-based pose updates from TCP thread
+extern CSampleDeviceDriver* g_pHeadsetDriver;
+extern CSampleControllerDriver* g_pController1Driver;
+extern CSampleControllerDriver* g_pController2Driver;
+
 //-----------------------------------------------------------------------------
 // Purpose:
 //-----------------------------------------------------------------------------

@@ -5,6 +5,11 @@
 
 using namespace vr;
 
+// Global driver pointers for push-based pose updates
+CSampleDeviceDriver* g_pHeadsetDriver = nullptr;
+CSampleControllerDriver* g_pController1Driver = nullptr;
+CSampleControllerDriver* g_pController2Driver = nullptr;
+
 EVRInitError CServerDriver_Sample::Init(vr::IVRDriverContext *pDriverContext)
 {
     VR_INIT_SERVER_DRIVER_CONTEXT(pDriverContext);
@@ -35,14 +40,17 @@ EVRInitError CServerDriver_Sample::Init(vr::IVRDriverContext *pDriverContext)
     }
 
     m_pNullHmdLatest = new CSampleDeviceDriver();
+    g_pHeadsetDriver = m_pNullHmdLatest;  // Set global pointer for push-based updates
     vr::VRServerDriverHost()->TrackedDeviceAdded(m_pNullHmdLatest->GetSerialNumber().c_str(), vr::TrackedDeviceClass_HMD, m_pNullHmdLatest);
 
     m_pController = new CSampleControllerDriver();
     m_pController->SetControllerIndex(1);
+    g_pController1Driver = m_pController;  // Set global pointer for push-based updates
     vr::VRServerDriverHost()->TrackedDeviceAdded(m_pController->GetSerialNumber().c_str(), vr::TrackedDeviceClass_Controller, m_pController);
 
     m_pController2 = new CSampleControllerDriver();
     m_pController2->SetControllerIndex(2);
+    g_pController2Driver = m_pController2;  // Set global pointer for push-based updates
     vr::VRServerDriverHost()->TrackedDeviceAdded(m_pController2->GetSerialNumber().c_str(), vr::TrackedDeviceClass_Controller, m_pController2);
 
     // Initialize vision server for frame capture
@@ -102,6 +110,11 @@ void CServerDriver_Sample::Cleanup()
         g_pPoseDataReceiver = nullptr;
     }
 
+    // Clear global pointers before deleting
+    g_pHeadsetDriver = nullptr;
+    g_pController1Driver = nullptr;
+    g_pController2Driver = nullptr;
+    
     delete m_pNullHmdLatest;
     m_pNullHmdLatest = NULL;
     delete m_pController;

@@ -735,7 +735,7 @@ def _get_tools(executor, grounder, tracker):
                                pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
                                
                 # Short wait for physical movement
-                time.sleep(2)
+                time.sleep(0.1)
                 
                 # Check actual rotation
                 status_check = _executor.call("get_current_pose", device="controller2")

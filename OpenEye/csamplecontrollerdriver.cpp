@@ -260,6 +260,10 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
 }
 
 void CSampleControllerDriver::RunFrame() {
+    // IMPORTANT: Fetch latest pose AND input from TCP BEFORE using input values
+    // This ensures we have the most recent button states before applying them
+    GetPose();
+    
     ControllerInput* input = (ControllerIndex == 1) ? &ctrl1Input : &ctrl2Input;
     
     // Check for Shift+F10 toggle (only check once per frame, on controller 1)

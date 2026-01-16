@@ -134,6 +134,37 @@ def broadcast_state():
         
         clients[:] = active_clients
 
+def send_device_update(device: str):
+    """Send update for a single device instead of all devices. Lower latency for targeted updates."""
+    with state_lock:
+        if device not in current_poses:
+            return
+        
+        # Build message for just this device
+        pose = current_poses[device]
+        msg = {
+            "device": device,
+            "pos": pose['pos'],
+            "rot": pose['rot']
+        }
+        # Add input state for controllers
+        if device in controller_inputs:
+            msg["input"] = controller_inputs[device]
+        
+        payload = json.dumps(msg) + '\n'
+        
+        active_clients = []
+        for client in clients:
+            try:
+                client.sendall(payload.encode('utf-8'))
+                active_clients.append(client)
+            except Exception:
+                try: client.close()
+                except: pass
+        
+        clients[:] = active_clients
+
+
 def send_vision_request(request: Dict) -> bool:
     """Send a vision request to the driver."""
     with state_lock:
@@ -327,7 +358,8 @@ def rotate_device(device: str, pitch: float, yaw: float, roll: float) -> str:
     with state_lock:
         current_poses[device]['rot'] = [pitch, yaw, roll]
     
-    broadcast_state()
+    # Use targeted update for lower latency (only sends this device, not all 3)
+    send_device_update(device)
     return f"{device} rotated to pitch={pitch}, yaw={yaw}, roll={roll}"
 
 @mcp.tool()

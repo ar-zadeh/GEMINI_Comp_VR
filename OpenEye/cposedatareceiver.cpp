@@ -160,12 +160,21 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
             g_pController1Driver->GetPose(),
             sizeof(vr::DriverPose_t));
     }
-    else if (device == "controller2" && g_pController2Driver && g_pController2Driver->IsActivated())
+    else if (device == "controller2")
     {
-        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
-            g_pController2Driver->GetObjectId(),
-            g_pController2Driver->GetPose(),
-            sizeof(vr::DriverPose_t));
+        // DEBUG: Log why controller2 might not be updating
+        if (!g_pController2Driver) {
+            DriverLog("PUSH DEBUG: controller2 - g_pController2Driver is NULL!\n");
+        } else if (!g_pController2Driver->IsActivated()) {
+            DriverLog("PUSH DEBUG: controller2 - not activated (ObjectId=%u)\n", 
+                     g_pController2Driver->GetObjectId());
+        } else {
+            DriverLog("PUSH DEBUG: controller2 - calling TrackedDevicePoseUpdated\n");
+            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
+                g_pController2Driver->GetObjectId(),
+                g_pController2Driver->GetPose(),
+                sizeof(vr::DriverPose_t));
+        }
     }
 }
 

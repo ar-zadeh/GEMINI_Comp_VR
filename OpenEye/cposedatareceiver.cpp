@@ -323,6 +323,15 @@ bool CPoseDataReceiver::ParseJson(const std::string& json, std::string& device, 
         pose.input.triggerValue = parseFloat("triggerValue", 0.0f);
         pose.input.joystickX = parseFloat("joystickX", 0.0f);
         pose.input.joystickY = parseFloat("joystickY", 0.0f);
+        
+        // Debug: Log when any button is pressed
+        if (pose.input.triggerClick || pose.input.buttonA || pose.input.buttonB || 
+            pose.input.menu || pose.input.grip || pose.input.system)
+        {
+            DriverLog("[INPUT] Received: trigger=%d, A=%d, B=%d, menu=%d, grip=%d, system=%d, triggerValue=%.2f\n",
+                pose.input.triggerClick, pose.input.buttonA, pose.input.buttonB,
+                pose.input.menu, pose.input.grip, pose.input.system, pose.input.triggerValue);
+        }
     }
 
     return true;

@@ -214,6 +214,14 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
             // Update input state if received
             if (tcpPose.input.inputUpdated)
             {
+                // Log when input changes
+                if (tcpPose.input.triggerClick != ctrl2Input.triggerClick ||
+                    tcpPose.input.buttonA != ctrl2Input.buttonA ||
+                    tcpPose.input.menu != ctrl2Input.menu)
+                {
+                    DriverLog("[CTRL2] Input update: trigger=%d, A=%d, menu=%d\n",
+                        tcpPose.input.triggerClick, tcpPose.input.buttonA, tcpPose.input.menu);
+                }
                 ctrl2Input = tcpPose.input;
             }
         }

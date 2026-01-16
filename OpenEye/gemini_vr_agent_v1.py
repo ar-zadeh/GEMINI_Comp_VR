@@ -5,6 +5,7 @@ Uses Google GenAI SDK for native tool calling and state management.
 """
 
 import os
+import shlex
 import json
 import time
 import base64
@@ -17,7 +18,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont, ImageFile
 import io
+import math
 import shutil
+import cv2
+import numpy as np
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # Allow loading truncated images (fixes issues with simple MJPEG streams)
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -54,7 +61,7 @@ except ImportError:
 # --- CONFIG ---
 GEMINI_MODEL = "gemini-3-flash-preview"  # User requested "Flash 3.0" (mapping to latest 2.0 Flash Exp)
 LOG_DIR = Path("agent_logs")
-SHOW_VISION_PREVIEW = True
+SHOW_VISION_PREVIEW = False
 
 # ============================================================================
 # UTILS
@@ -100,62 +107,114 @@ class VisualGrounder:
         self.model_name = model_name
         self.log_dir = log_dir / "grounding"
         self.log_dir.mkdir(exist_ok=True, parents=True)
-        
-    def ground_object(self, image_data: bytes, object_description: str) -> List[Dict]:
+
+    def ground_multiple_objects(self, image_data: bytes, object_names: List[str]) -> Dict[str, List[float]]:
         logger = get_logger()
-        logger.info(f"Grounding: '{object_description}'")
+        objects_str = ", ".join(object_names)
+        logger.info(f"Grounding Multiple: '{objects_str}'")
         
         prompt = f"""
-        Find this object: {object_description}
+        Find the following objects in the image: {objects_str}.
         
         You MUST return the answer in the following JSON format:
         {{
-            "thinking": "Reasoning about where the object is in the image...",
-            "coordinates": [ymin, xmin, ymax, xmax]
+            "thinking": "Reasoning about the scene...",
+            "detections": [
+                {{
+                    "label": "exact_object_name_from_list",
+                    "coordinates": [ymin, xmin, ymax, xmax]
+                }}
+            ]
         }}
         
-        ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
-        If multiple instances are found, return the most prominent one.
+        1. ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
+        2. Only return objects you are confident you see.
         """
         
         try:
+            # 1. robust image loading (fixes Corrupt JPEG errors)
+            try:
+                pil_img = Image.open(io.BytesIO(image_data))
+                # Convert to RGB to ensure compatibility
+                pil_img = pil_img.convert("RGB")
+                # Save to a clean buffer
+                out_buffer = io.BytesIO()
+                pil_img.save(out_buffer, format="JPEG")
+                clean_image_data = out_buffer.getvalue()
+            except Exception as e:
+                logger.warning(f"Image cleaning failed, using raw bytes: {e}")
+                clean_image_data = image_data
+
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=[
                     types.Content(role="user", parts=[
                         types.Part(text=prompt),
-                        types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_data))
+                        types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=clean_image_data))
                     ])
                 ],
-                config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json", 
+
+                )
             )
             
-            # Parse result
+            # 2. Robust JSON Parsing (Strips Markdown)
+            if not response.candidates:
+                logger.error(f"Gemini returned NO candidates. Finish reason: {response.prompt_feedback if hasattr(response, 'prompt_feedback') else 'Unknown'}")
+                # Log full response for debugging
+                logger.debug(f"Full Response: {response}")
+                return {}
+
+            if not response.candidates[0].content or not response.candidates[0].content.parts:
+                 logger.error("Gemini candidate content is empty.")
+                 return {}
+
             text = response.candidates[0].content.parts[0].text
-            data = json.loads(text)
+            if text.startswith("```"):
+                text = text.split("\n", 1)[-1].rsplit("\n", 1)[0]
+            if text.startswith("json"):
+                text = text[4:]
             
-            # Log thinking
-            if "thinking" in data:
-                logger.info(f"[Grounding Thought] {data['thinking']}")
-                print(f"Grounding Thought: {data['thinking']}")
+            try:
+                data = json.loads(text.strip())
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse JSON from Gemini: {e}. Text: {text}")
+                return {}
             
-            # Extract coordinates (handle single list)
-            coords = data.get("coordinates", [])
-            boxes = []
-            if coords and len(coords) == 4 and isinstance(coords[0], (int, float)):
-                # Found single box
-                boxes.append({"box_2d": coords, "label": object_description})
-                # User request: Print and Log coordinates
-                coord_msg = f"Found Coordinates: {coords}"
-                print(coord_msg)
-                logger.info(coord_msg)
-            
-            # Draw and save
-            self._draw_and_save(image_data, boxes, object_description)
-            return boxes
+            results = {}
+            valid_boxes_for_draw = []
+
+            for det in data.get("detections", []):
+                label = det.get("label")
+                coords = det.get("coordinates")
+                
+                if label and coords and len(coords) == 4:
+                    # Handle 0-1000 scale correction
+                    if any(c > 1.0 for c in coords):
+                        coords = [c / 1000.0 for c in coords]
+                    
+                    results[label] = coords
+                    valid_boxes_for_draw.append({"label": label, "box_2d": coords})
+
+            if valid_boxes_for_draw:
+                self._draw_and_save(clean_image_data, valid_boxes_for_draw, f"multi_{len(results)}_objs")
+            else:
+                logger.warning(f"Gemini returned no detections. Raw text: {text[:100]}...")
+                
+            return results
+
         except Exception as e:
-            logger.error(f"Grounding failed: {e}")
-            return []
+            logger.error(f"Multi-Grounding failed: {e}")
+            return {}
+
+    def ground_object(self, image_data: bytes, object_description: str) -> List[Dict]:
+        # Update single grounding to use the same robust cleaning/parsing logic if you wish
+        # For now, we can just wrap the new multi-grounder for simplicity:
+        res_dict = self.ground_multiple_objects(image_data, [object_description])
+        if object_description in res_dict:
+            return [{"box_2d": res_dict[object_description], "label": object_description}]
+        return []
 
     def _draw_and_save(self, image_data: bytes, boxes: List[Dict], description: str):
         logger = get_logger()
@@ -166,27 +225,26 @@ class VisualGrounder:
             try:
                 nparr = np.frombuffer(image_data, np.uint8)
                 img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                if img is None: return 
+                
                 h, w = img.shape[:2]
-                for box in boxes:
-                    # ymin, xmin, ymax, xmax
+                colors = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (0, 255, 255)]
+
+                for i, box in enumerate(boxes):
                     y1, x1, y2, x2 = box['box_2d']
+                    label = box.get('label', description)
+                    color = colors[i % len(colors)]
+                    
                     p1 = (int(x1*w), int(y1*h))
                     p2 = (int(x2*w), int(y2*h))
-                    cv2.rectangle(img, p1, p2, (0,0,0), 3)
-                    cv2.putText(img, description, (p1[0], max(20, p1[1]-10)), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+                    cv2.rectangle(img, p1, p2, color, 2)
+                    cv2.putText(img, label, (p1[0], max(20, p1[1]-10)), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 
                 cv2.imwrite(str(filename), img)
-                if SHOW_VISION_PREVIEW:
-                    cv2.imshow("Grounding", img)
-                    cv2.waitKey(2000)
                 logger.info(f"Saved grounding to {filename}")
-                return
             except Exception as e:
                 logger.error(f"CV2 draw failed: {e}")
-
-        # Fallback to PIL (omitted for brevity, assume CV2 for now or easy add back)
-
 # ============================================================================
 # EXECUTOR
 # ============================================================================
@@ -273,7 +331,72 @@ def _get_tools(executor, grounder, tracker):
             results.append(f"Found at Center(x={cx:.2f}, y={cy:.2f})")
             
         return "; ".join(results)
-    
+    def track_multiple_items(object_names: List[str]):
+        """
+        Track multiple objects simultaneously in a video.
+        Example input: ["red cup", "keyboard", "blue pen"]
+        """
+        _log_action("track_multiple_items", objects=object_names)
+        
+        if not _tracker or not _tracker.available:
+            return "Error: Object Tracking (SAM 3) is not available."
+
+        # 1. Capture Video
+        print(f"Capturing video to track: {object_names}...")
+        res_str = _executor.call("capture_video", duration=3.0)
+        
+        # Parse video response
+        try:
+            res = json.loads(res_str)
+            frames = res.get("frames", [])
+            if not frames: return "Error: No frames captured."
+        except:
+            return "Error parsing video data."
+
+        # Save Frames
+        timestamp = datetime.now().strftime("%H%M%S")
+        temp_dir = LOG_DIR / "tracking" / f"multi_{timestamp}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        saved_frames = []
+        for i, b64 in enumerate(frames):
+            path = temp_dir / f"frame_{i:04d}.jpg"
+            img_data = base64.b64decode(b64)
+            # Robust Save
+            try:
+                with Image.open(io.BytesIO(img_data)) as img:
+                    img.save(path, quality=95)  # High quality JPEG
+            except:
+                with open(path, "wb") as f: f.write(img_data)
+            saved_frames.append(path)
+
+        # Grounding
+        print("Locating objects in first frame...")
+        with open(saved_frames[0], "rb") as f:
+            first_frame_data = f.read()
+
+        # Call the new multi-grounder
+        # Returns Dict: {'cup': [y,x,y,x], 'keyboard': [y,x,y,x]}
+        initial_data = _grounder.ground_multiple_objects(first_frame_data, object_names)
+        if not initial_data:
+            print(f"FAILED: Grounding found 0 objects. Expected: {object_names}")
+            # This return string tells the agent to try fallback
+            return f"Could not locate any of the requested objects: {object_names}"
+            
+        print(f"Found {len(initial_data)} objects: {list(initial_data.keys())}")
+
+        # Tracking
+        print("Running SAM 3 Multi-Tracking...")
+        result = _tracker.track_multi_objects(str(temp_dir), initial_data)
+        
+        if "error" in result:
+            return f"Tracking failed: {result['error']}"
+            
+        video_path = result.get("video_path")
+        print(f"\n[SUCCESS] Multi-Tracking Video: {video_path}\n")
+        get_logger().info(f"Multi-Tracking Video: {video_path}")
+        
+        return f"Tracking Complete. Video saved to {video_path}"
     def finish_task(summary: str):
         """Call this when the user's request is fully completed."""
         _log_action("finish_task", summary=summary)
@@ -283,6 +406,14 @@ def _get_tools(executor, grounder, tracker):
         """Check VR driver connection."""
         _log_action("get_connection_status")
         return _executor.call("get_connection_status")
+
+    def kill_address():
+        """
+        Kills the process using the configured TCP port (default 5555).
+        Use this when the server fails to start with "Address already in use".
+        """
+        _log_action("kill_address")
+        return _executor.call("kill_address")
 
     def capture_video(duration: float = 3.0):
         """Capture a short video clip (sequence of frames) and save it."""
@@ -356,7 +487,7 @@ def _get_tools(executor, grounder, tracker):
             # This "cleans" the file structure so OpenCV won't complain about corruption.
             try:
                 with Image.open(io.BytesIO(img_data)) as img:
-                    img.save(path)
+                    img.save(path, quality=95)  # High quality JPEG
             except Exception as e:
                 # Fallback if image is too broken even for PIL
                 print(f"Warning: PIL failed to clean frame {i}: {e}. Saving raw.")
@@ -397,8 +528,720 @@ def _get_tools(executor, grounder, tracker):
         """
         return track_object(object_description)
 
-    return [start_bridge, move_relative, teleport, rotate_device, inspect_surroundings, locate_object, capture_video, track_object, create_tracking_video, finish_task, get_connection_status]
+    def visual_servo_to_object(object_description: str):
+        """
+        Rotates the controller (modifies yaw/pitch) so that the 'blue VR controller ray' aligns with the center of the specified target object.
+        Use this when the user asks to 'align', 'point', or 'aim' the controller or its ray at something.
+        """
+        _log_action("visual_servo_to_object", description=object_description)
+        logger = get_logger()
 
+        if not _tracker or not _tracker.available:
+            return "Error: Object Tracking (SAM 3) is not available."
+
+        # Config
+        Kp_YAW = 0.05   # Gain for Horizontal (Yaw) - Increased for faster convergence
+        Kp_PITCH = 0.05 # Gain for Vertical (Pitch) - Increased for faster convergence
+        MAX_ITER = 100
+        TOLERANCE_PX = 5  # Stop if within this many pixels
+        
+        # 1. Get Initial Pose
+        print("Getting initial pose of controller2...")
+        curr_pitch = 0.0
+        curr_yaw = 0.0
+        curr_roll = 0.0
+        
+        status = _executor.call("get_current_pose", device="controller2")
+        try:
+            if "Rotation: [" in status:
+                rot_str = status.split("Rotation: [")[1].split("]")[0]
+                curr_pitch, curr_yaw, curr_roll = map(float, rot_str.split(","))
+                print(f"Initial Rotation: Pitch={curr_pitch}, Yaw={curr_yaw}, Roll={curr_roll}")
+        except Exception as e:
+            msg = f"Failed to parse initial pose: {e}"
+            logger.error(msg)
+            return msg
+
+        # 2. Capture Initial Image for Grounding
+        print("Capturing initial image for grounding...")
+        res = _executor.call("inspect_surroundings")
+        if isinstance(res, str) and res.startswith("Error"): return f"Capture failed: {res}"
+        
+        try:
+            data = json.loads(res).get("data")
+            img_bytes = base64.b64decode(data)
+            # Use PIL to clean/load
+            pil_img_init = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            w, h = pil_img_init.size
+        except Exception as e:
+            return f"Initial image parsing failed: {e}"
+
+        # 3. Ground Targets (Gemini - Once)
+        targets = {
+            "ray": "blue VR controller ray",
+            "logo": object_description
+        }
+        current_boxes = {}
+        
+        print(f"Grounding '{targets['ray']}' and '{targets['logo']}'...")
+        # We can use the multi-object grounder
+        grounding_results = _grounder.ground_multiple_objects(img_bytes, list(targets.values()))
+        
+        all_found = True
+        for key, desc in targets.items():
+            if desc in grounding_results:
+                # Normalized [ymin, xmin, ymax, xmax] -> Pixel [x, y, w, h]
+                ymin, xmin, ymax, xmax = grounding_results[desc]
+                box_x, box_y = xmin * w, ymin * h
+                box_w, box_h = (xmax - xmin) * w, (ymax - ymin) * h
+                current_boxes[key] = [box_x, box_y, box_w, box_h]
+            else:
+                print(f"[{key}] '{desc}' NOT found by Gemini.")
+                all_found = False
+        
+        if not all_found:
+             return f"Failed to find both the controller ray and '{object_description}' in the initial view. Cannot start servoing."
+             
+        print("Initial grounding successful. Starting control loop.")
+
+        # 4. Control Loop
+        for i in range(MAX_ITER):
+            print(f"\n--- Servo Iteration {i+1}/{MAX_ITER} ---")
+            
+            # A. Capture New Image
+            res = _executor.call("inspect_surroundings")
+            if isinstance(res, str) and res.startswith("Error"):
+                print("Capture failed in loop.")
+                break
+                
+            try:
+                data = json.loads(res).get("data")
+                img_bytes_loop = base64.b64decode(data)
+                pil_img_loop = Image.open(io.BytesIO(img_bytes_loop)).convert("RGB")
+                img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR) # For Vis
+            except Exception as e:
+                print(f"Image parse error in loop: {e}")
+                break
+
+            # B. SAM Tracking (Update state with new image)
+            inference_state = _tracker.processor.set_image(pil_img_loop)
+            
+            points = {}
+            
+            for key, desc in targets.items():
+                if key not in current_boxes: continue # Should not happen unless lost
+                
+                box_x, box_y, box_w, box_h = current_boxes[key]
+                
+                # Format box for SAM
+                box_input_xywh = _tracker.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
+                box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
+                norm_box_cxcywh = _tracker.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
+                
+                _tracker.processor.reset_all_prompts(inference_state)
+                inference_state = _tracker.processor.add_geometric_prompt(
+                    state=inference_state, box=norm_box_cxcywh, label=True
+                )
+                
+                # Get Mask
+                mask = None
+                if "masks" in inference_state and inference_state["masks"] is not None:
+                    m = inference_state["masks"].detach().cpu().numpy() > 0.5
+                    if m.ndim == 4: mask = m[0, 0]
+                    elif m.ndim == 3: mask = m[0]
+                
+                if mask is None:
+                    print(f"[{key}] Lost tracking (no mask).")
+                    del current_boxes[key]
+                    continue
+                    
+                # Update Box & Extract Point
+                rows = np.any(mask, axis=1)
+                cols = np.any(mask, axis=0)
+                
+                if rows.any() and cols.any():
+                    rmin, rmax = np.where(rows)[0][[0, -1]]
+                    cmin, cmax = np.where(cols)[0][[0, -1]]
+                    current_boxes[key] = [cmin, rmin, cmax - cmin, rmax - rmin]
+                    
+                    # Points logic
+                    if key == "ray":
+                        # Ray Tip = Min Y (Highest point visually)
+                        ys, xs = np.where(mask)
+                        if len(ys) > 0:
+                            idx = np.argmin(ys) 
+                            points[key] = (xs[idx], ys[idx])
+                            cv2.circle(img_cv, (xs[idx], ys[idx]), 5, (0, 0, 255), -1) # Red Tip
+                    elif key == "logo":
+                        # Centroid
+                        M = cv2.moments(mask.astype(np.uint8))
+                        if M["m00"] != 0:
+                            cx = int(M["m10"]/M["m00"])
+                            cy = int(M["m01"]/M["m00"])
+                            points[key] = (cx, cy)
+                            cv2.circle(img_cv, (cx, cy), 5, (0, 255, 0), -1) # Green center
+                else:
+                    print(f"[{key}] Mask empty.")
+                    del current_boxes[key]
+            
+            # C. PID & Control
+            if "ray" in points and "logo" in points:
+                rx, ry = points["ray"]
+                lx, ly = points["logo"]
+                
+                dx = lx - rx
+                dy = ly - ry
+                dist = math.sqrt(dx*dx + dy*dy)
+                
+                print(f"Error: dx={dx}, dy={dy}, dist={dist:.2f}")
+                
+                # Save debug image with telemetry
+                cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
+                
+                # Prepare info text
+                # We calculate PID terms here just for display before applying them
+                d_yaw_disp = Kp_YAW * dx
+                d_pitch_disp = Kp_PITCH * dy
+                info_text = f"Err: {dist:.1f}px | dYaw: {d_yaw_disp:.2f} | dPitch: {d_pitch_disp:.2f}"
+                
+                # Draw text background
+                (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(img_cv, (10, 10), (10 + tw + 10, 10 + th + 10), (0, 0, 0), -1)
+                cv2.putText(img_cv, info_text, (15, 15 + th), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                timestamp = datetime.now().strftime("%H%M%S")
+                debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
+                cv2.imwrite(str(debug_path), img_cv)
+                logger.info(f"Saved servo debug image: {debug_path}")
+                
+                if dist < TOLERANCE_PX:
+                    return f"Visual Servoing Complete. Aligned with {object_description} (Error: {dist:.2f}px)."
+                
+                # PID
+                # INVERTED LOGIC: Previous test showed error increasing with positive gain.
+                # If dx < 0 (Target Left), we need to move Left. 
+                # Observation showed Yaw- moved Right. So we need Yaw+ to move Left.
+                # So if dx is negative, we need dYaw positive -> Invert sign.
+                d_yaw = -Kp_YAW * dx
+                d_pitch = -Kp_PITCH * dy
+                
+                curr_yaw += d_yaw
+                curr_pitch += d_pitch
+                
+                print(f"Adjusting: dYaw={d_yaw:.2f}, dPitch={d_pitch:.2f} -> New Yaw={curr_yaw:.2f}, Pitch={curr_pitch:.2f}")
+                
+                _executor.call("rotate_device", device="controller2", 
+                               pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
+                               
+                # Short wait for physical movement
+                time.sleep(0.1)
+                
+                # Check actual rotation
+                status_check = _executor.call("get_current_pose", device="controller2")
+                try:
+                    if "Rotation: [" in status_check:
+                        rot_str = status_check.split("Rotation: [")[1].split("]")[0]
+                        p, y, r = map(float, rot_str.split(","))
+                        print(f"Current controller rotation values: Pitch={p:.2f}, Yaw={y:.2f}, Roll={r:.2f}")
+                except Exception as e:
+                    print(f"Could not read back pose: {e}")
+                
+            else:
+                 return f"Lost tracking of one or both objects during loop. Stopping."
+
+        return f"Visual servoing finished max iterations ({MAX_ITER}). Final error: {dist if 'dist' in locals() else 'Unknown'}."
+
+    def type_text(text: str, controller: str = "controller2"):
+        """
+        Types text on a virtual keyboard by visually aligning the controller ray 
+        to each key and pressing the trigger.
+        
+        This function makes ONE Gemini API call to ground all unique characters,
+        then uses PID control to align and select each key sequentially.
+        
+        Args:
+            text: The text to type (e.g., "temp", "hello world")
+            controller: Which controller to use (default: controller2)
+        """
+        _log_action("type_text", text=text, controller=controller)
+        logger = get_logger()
+        
+        if not _tracker or not _tracker.available:
+            return "Error: Object Tracking (SAM 3) is not available."
+        
+        if not text:
+            return "Error: No text provided to type."
+        
+        # Config
+        Kp_YAW = 0.05
+        Kp_PITCH = 0.05
+        MAX_ITER_PER_CHAR = 50
+        TOLERANCE_PX = 8  # Slightly larger tolerance for keyboard keys
+        
+        # 1. Get Initial Pose
+        print(f"Getting initial pose of {controller}...")
+        curr_pitch = 0.0
+        curr_yaw = 0.0
+        curr_roll = 0.0
+        
+        status = _executor.call("get_current_pose", device=controller)
+        try:
+            if "Rotation: [" in status:
+                rot_str = status.split("Rotation: [")[1].split("]")[0]
+                curr_pitch, curr_yaw, curr_roll = map(float, rot_str.split(","))
+                print(f"Initial Rotation: Pitch={curr_pitch}, Yaw={curr_yaw}, Roll={curr_roll}")
+        except Exception as e:
+            msg = f"Failed to parse initial pose: {e}"
+            logger.error(msg)
+            return msg
+        
+        # 2. Capture Initial Image for Grounding
+        print("Capturing initial image for keyboard grounding...")
+        res = _executor.call("inspect_surroundings")
+        if isinstance(res, str) and res.startswith("Error"): 
+            return f"Capture failed: {res}"
+        
+        try:
+            data = json.loads(res).get("data")
+            img_bytes = base64.b64decode(data)
+            pil_img_init = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            w, h = pil_img_init.size
+        except Exception as e:
+            return f"Initial image parsing failed: {e}"
+        
+        # 3. Ground All Unique Characters + Controller Ray (Single API Call)
+        unique_chars = list(set(text.lower()))  # Get unique characters
+        print(f"Grounding keyboard keys for characters: {unique_chars}")
+        
+        # Build the prompt for Gemini to return JSON with key-value pairs
+        chars_list = ", ".join([f'"{c}"' for c in unique_chars])
+        prompt = f"""
+Find the following keyboard keys in the image: {chars_list}
+Also find the "blue VR controller ray".
+
+You MUST return the answer in the following JSON format:
+{{
+    "thinking": "Describe what you see and where the keys are located...",
+    "keys": {{
+        "a": [ymin, xmin, ymax, xmax],
+        "b": [ymin, xmin, ymax, xmax]
+    }},
+    "controller_ray": [ymin, xmin, ymax, xmax]
+}}
+
+Rules:
+1. ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
+2. Include ONLY the keys you can confidently locate.
+3. The "keys" object maps each character to its bounding box.
+4. "controller_ray" is the bounding box of the blue VR controller ray.
+"""
+        
+        try:
+            # Clean image for API
+            out_buffer = io.BytesIO()
+            pil_img_init.save(out_buffer, format="JPEG")
+            clean_image_data = out_buffer.getvalue()
+            
+            response = _grounder.client.models.generate_content(
+                model=_grounder.model_name,
+                contents=[
+                    types.Content(role="user", parts=[
+                        types.Part(text=prompt),
+                        types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=clean_image_data))
+                    ])
+                ],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                )
+            )
+            
+            # Parse response
+            if not response.candidates or not response.candidates[0].content.parts:
+                return "Error: Gemini returned no grounding results."
+            
+            resp_text = response.candidates[0].content.parts[0].text
+            if resp_text.startswith("```"):
+                resp_text = resp_text.split("\n", 1)[-1].rsplit("\n", 1)[0]
+            if resp_text.startswith("json"):
+                resp_text = resp_text[4:]
+            
+            grounding_data = json.loads(resp_text.strip())
+            
+        except Exception as e:
+            logger.error(f"Keyboard grounding failed: {e}")
+            return f"Error grounding keyboard keys: {e}"
+        
+        # Extract grounded keys and ray
+        grounded_keys = grounding_data.get("keys", {})
+        ray_box_norm = grounding_data.get("controller_ray")
+        
+        if not ray_box_norm:
+            return "Error: Could not find the controller ray in the image."
+        
+        # Log what was found
+        print(f"Grounded {len(grounded_keys)} keys: {list(grounded_keys.keys())}")
+        print(f"Controller ray found: {ray_box_norm}")
+        
+        # Check which characters we're missing
+        missing_chars = [c for c in unique_chars if c not in grounded_keys]
+        if missing_chars:
+            print(f"Warning: Could not find keys for: {missing_chars}")
+        
+        # Convert normalized boxes to pixel coordinates [x, y, w, h]
+        def norm_to_pixel_box(norm_box):
+            ymin, xmin, ymax, xmax = norm_box
+            # Handle 0-1000 scale
+            if any(c > 1.0 for c in norm_box):
+                ymin, xmin, ymax, xmax = [c / 1000.0 for c in norm_box]
+            box_x = xmin * w
+            box_y = ymin * h
+            box_w = (xmax - xmin) * w
+            box_h = (ymax - ymin) * h
+            return [box_x, box_y, box_w, box_h]
+        
+        key_boxes = {k: norm_to_pixel_box(v) for k, v in grounded_keys.items()}
+        ray_box = norm_to_pixel_box(ray_box_norm)
+        
+        # 4. Type Each Character
+        typed_chars = []
+        failed_chars = []
+        
+        for char_idx, char in enumerate(text.lower()):
+            print(f"\n=== Typing character '{char}' ({char_idx + 1}/{len(text)}) ===")
+            
+            # Check if we have this key grounded
+            if char not in key_boxes:
+                print(f"Skipping '{char}' - key not found on keyboard.")
+                failed_chars.append(char)
+                continue
+            
+            target_box = key_boxes[char]
+            current_ray_box = ray_box.copy()
+            
+            # PID control loop to align to this key
+            converged = False
+            final_dist = 0
+            
+            for i in range(MAX_ITER_PER_CHAR):
+                # A. Capture New Image
+                res = _executor.call("inspect_surroundings")
+                if isinstance(res, str) and res.startswith("Error"):
+                    print("Capture failed in typing loop.")
+                    break
+                
+                try:
+                    data = json.loads(res).get("data")
+                    img_bytes_loop = base64.b64decode(data)
+                    pil_img_loop = Image.open(io.BytesIO(img_bytes_loop)).convert("RGB")
+                    img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    print(f"Image parse error: {e}")
+                    break
+                
+                # B. SAM Tracking for ray and target key
+                inference_state = _tracker.processor.set_image(pil_img_loop)
+                
+                points = {}
+                boxes_to_track = {"ray": current_ray_box, "key": target_box}
+                updated_boxes = {}
+                
+                for key, box in boxes_to_track.items():
+                    box_x, box_y, box_w, box_h = box
+                    
+                    # Format box for SAM
+                    box_input_xywh = _tracker.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
+                    box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
+                    norm_box_cxcywh = _tracker.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
+                    
+                    _tracker.processor.reset_all_prompts(inference_state)
+                    inference_state = _tracker.processor.add_geometric_prompt(
+                        state=inference_state, box=norm_box_cxcywh, label=True
+                    )
+                    
+                    # Get Mask
+                    mask = None
+                    if "masks" in inference_state and inference_state["masks"] is not None:
+                        m = inference_state["masks"].detach().cpu().numpy() > 0.5
+                        if m.ndim == 4: mask = m[0, 0]
+                        elif m.ndim == 3: mask = m[0]
+                    
+                    if mask is None:
+                        print(f"[{key}] Lost tracking (no mask).")
+                        continue
+                    
+                    # Update Box & Extract Point
+                    rows = np.any(mask, axis=1)
+                    cols = np.any(mask, axis=0)
+                    
+                    if rows.any() and cols.any():
+                        rmin, rmax = np.where(rows)[0][[0, -1]]
+                        cmin, cmax = np.where(cols)[0][[0, -1]]
+                        updated_boxes[key] = [cmin, rmin, cmax - cmin, rmax - rmin]
+                        
+                        if key == "ray":
+                            # Ray Tip = Min Y (topmost point)
+                            ys, xs = np.where(mask)
+                            if len(ys) > 0:
+                                idx = np.argmin(ys)
+                                points[key] = (xs[idx], ys[idx])
+                                cv2.circle(img_cv, (xs[idx], ys[idx]), 5, (0, 0, 255), -1)
+                        elif key == "key":
+                            # Key Centroid
+                            M = cv2.moments(mask.astype(np.uint8))
+                            if M["m00"] != 0:
+                                cx = int(M["m10"]/M["m00"])
+                                cy = int(M["m01"]/M["m00"])
+                                points[key] = (cx, cy)
+                                cv2.circle(img_cv, (cx, cy), 5, (0, 255, 0), -1)
+                
+                # Update boxes for next iteration
+                if "ray" in updated_boxes:
+                    current_ray_box = updated_boxes["ray"]
+                if "key" in updated_boxes:
+                    target_box = updated_boxes["key"]
+                
+                # C. PID Control
+                if "ray" in points and "key" in points:
+                    rx, ry = points["ray"]
+                    kx, ky = points["key"]
+                    
+                    dx = kx - rx
+                    dy = ky - ry
+                    dist = math.sqrt(dx*dx + dy*dy)
+                    final_dist = dist
+                    
+                    # Draw debug visualization
+                    cv2.line(img_cv, (rx, ry), (kx, ky), (0, 255, 255), 2)
+                    cv2.putText(img_cv, f"'{char}' err:{dist:.1f}px", (10, 30),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    
+                    # Save debug image
+                    timestamp = datetime.now().strftime("%H%M%S")
+                    debug_dir = LOG_DIR / "typing"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    debug_path = debug_dir / f"type_{char}_{timestamp}_iter_{i}.jpg"
+                    cv2.imwrite(str(debug_path), img_cv)
+                    
+                    if dist < TOLERANCE_PX:
+                        print(f"Aligned to '{char}' (Error: {dist:.2f}px). Pressing trigger...")
+                        converged = True
+                        break
+                    
+                    # Apply PID correction
+                    d_yaw = -Kp_YAW * dx
+                    d_pitch = -Kp_PITCH * dy
+                    
+                    curr_yaw += d_yaw
+                    curr_pitch += d_pitch
+                    
+                    _executor.call("rotate_device", device=controller,
+                                   pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
+                    time.sleep(0.05)
+                else:
+                    print(f"Lost tracking during alignment to '{char}'")
+                    break
+            
+            # Press trigger if converged
+            if converged:
+                _executor.call("click_button", controller=controller, button="trigger", duration=0.1)
+                time.sleep(0.15)  # Wait for key press to register
+                typed_chars.append(char)
+                print(f"Typed '{char}' successfully!")
+            else:
+                print(f"Failed to align to '{char}' (final error: {final_dist:.2f}px)")
+                failed_chars.append(char)
+        
+        # 5. Summary
+        result = f"Typed {len(typed_chars)}/{len(text)} characters: '{''.join(typed_chars)}'"
+        if failed_chars:
+            result += f". Failed: {failed_chars}"
+        
+        logger.info(result)
+        return result
+
+    # =========================================================================
+    # CONTROLLER INPUT FUNCTIONS (Buttons, Triggers, Joystick)
+    # =========================================================================
+    
+    def press_button(controller: str, button: str):
+        """
+        Press a button on a controller. The button stays pressed until release_button is called.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            button: One of: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+        
+        Common uses:
+        - "trigger": Primary action (select, shoot, grab)
+        - "grip": Secondary grab, hold objects
+        - "menu": Open menu
+        - "a"/"b": Context-dependent actions
+        - "trackpad": Trackpad/joystick click
+        """
+        _log_action("press_button", controller=controller, button=button)
+        return _executor.call("press_button", controller=controller, button=button)
+
+    def release_button(controller: str, button: str):
+        """
+        Release a previously pressed button on a controller.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            button: One of: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+        """
+        _log_action("release_button", controller=controller, button=button)
+        return _executor.call("release_button", controller=controller, button=button)
+
+    def click_button(controller: str, button: str, duration: float = 0.1):
+        """
+        Click a button (press and release) on a controller.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            button: One of: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+            duration: How long to hold the button in seconds (default 0.1)
+        """
+        _log_action("click_button", controller=controller, button=button, duration=duration)
+        return _executor.call("click_button", controller=controller, button=button, duration=duration)
+
+    def set_trigger(controller: str, value: float):
+        """
+        Set the analog trigger value (for partial pulls).
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            value: Trigger value from 0.0 (released) to 1.0 (fully pressed)
+        """
+        _log_action("set_trigger", controller=controller, value=value)
+        return _executor.call("set_trigger", controller=controller, value=value)
+
+    def set_joystick(controller: str, x: float, y: float):
+        """
+        Set the joystick/trackpad position.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            x: Horizontal position from -1.0 (left) to 1.0 (right)
+            y: Vertical position from -1.0 (down) to 1.0 (up)
+        
+        Common uses:
+        - Movement: Use left controller joystick for locomotion
+        - Camera: Use right controller joystick for turning
+        - Menu navigation: Move through UI elements
+        """
+        _log_action("set_joystick", controller=controller, x=x, y=y)
+        return _executor.call("set_joystick", controller=controller, x=x, y=y)
+
+    def move_joystick_direction(controller: str, direction: str, magnitude: float = 1.0):
+        """
+        Move the joystick in a cardinal direction.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            direction: "up", "down", "left", "right", "center", "forward", "backward"
+            magnitude: How far to push (0.0 to 1.0, default 1.0)
+        """
+        _log_action("move_joystick_direction", controller=controller, direction=direction, magnitude=magnitude)
+        return _executor.call("move_joystick_direction", controller=controller, direction=direction, magnitude=magnitude)
+
+    def perform_grab(controller: str):
+        """
+        Perform a grab action - press grip and trigger together.
+        Common interaction pattern in VR for picking up objects.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+        """
+        _log_action("perform_grab", controller=controller)
+        return _executor.call("perform_grab", controller=controller)
+
+    def perform_release(controller: str):
+        """
+        Release a grabbed object - release grip and trigger.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+        """
+        _log_action("perform_release", controller=controller)
+        return _executor.call("perform_release", controller=controller)
+
+    def release_all_inputs(controller: str = "both"):
+        """
+        Release all buttons and reset joystick to center.
+        
+        Args:
+            controller: "controller1", "controller2", or "both" (default)
+        """
+        _log_action("release_all_inputs", controller=controller)
+        return _executor.call("release_all_inputs", controller=controller)
+
+    def get_controller_state(controller: str):
+        """
+        Get the current input state of a controller (buttons, joystick, trigger).
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+        """
+        _log_action("get_controller_state", controller=controller)
+        return _executor.call("get_controller_state", controller=controller)
+
+    def get_current_pose(device: str = "headset"):
+        """
+        Get the current position and rotation of a device.
+        
+        Args:
+            device: "headset", "controller1", or "controller2"
+        """
+        _log_action("get_current_pose", device=device)
+        return _executor.call("get_current_pose", device=device)
+
+    def reset_controller_positions():
+        """
+        Reset both controllers to natural positions relative to the headset.
+        Controller1 (left): slightly left and in front
+        Controller2 (right): slightly right and in front
+        """
+        _log_action("reset_controller_positions")
+        return _executor.call("reset_controller_positions")
+
+    def position_controller_relative_to_headset(
+        controller: str, 
+        forward: float = -0.3, 
+        right: float = 0.0, 
+        up: float = -0.5
+    ):
+        """
+        Position a controller relative to the headset position.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            forward: Distance in front of headset (negative = in front, positive = behind)
+            right: Distance to the right (negative = left, positive = right)
+            up: Distance up/down from headset (negative = below, positive = above)
+        """
+        _log_action("position_controller_relative_to_headset", 
+                   controller=controller, forward=forward, right=right, up=up)
+        return _executor.call("position_controller_relative_to_headset", 
+                             controller=controller, forward=forward, right=right, up=up)
+
+    return [
+        # Movement & Orientation
+        start_bridge, move_relative, teleport, rotate_device, get_current_pose,
+        # Vision
+        inspect_surroundings, locate_object, capture_video, 
+        # Tracking
+        track_object, track_multiple_items, visual_servo_to_object, create_tracking_video, type_text, 
+        # Controller Positioning
+        reset_controller_positions, position_controller_relative_to_headset,
+        # Button/Input Controls
+        press_button, release_button, click_button, set_trigger,
+        set_joystick, move_joystick_direction,
+        perform_grab, perform_release, release_all_inputs,
+        get_controller_state,
+        # Utility
+        finish_task, get_connection_status, kill_address
+    ]
 # ============================================================================
 # AGENT
 # ============================================================================
@@ -424,21 +1267,36 @@ class GeminiAgent:
         
         # Create Chat Session
         system_prompt = """You are an expert VR Agent.
-        You control a headset and controllers.
+        You control a headset and two controllers (controller1=left, controller2=right).
         
         RULES:
-        1. Always locate objects before interacting with them if you don't know where they are.
-        2. Use `locate_object` to find things. It gives you 2D image coordinates (0.0-1.0).
-        3. TRANSLATE 2D coordinates to 3D moves:
+        1. Always locate objects before interacting with them.
+        2. Use `locate_object` for single items.
+        3. Use `track_multiple_items` if the user asks to track specifically multiple things (e.g., "Track the cup and the bottle").
+        4. Use `visual_servo_to_object` to ALIGN or POINT the controller/ray at an object.
+        5. Use `type_text(text)` when the user wants to TYPE TEXT on a virtual keyboard.
+           - This function grounds all keyboard keys in ONE API call, then aligns and presses each key.
+           - Example: type_text("hello") will type 'h', 'e', 'l', 'l', 'o' sequentially.
+        6. TRANSLATE 2D coordinates to 3D moves:
            - Object is Left (x < 0.5) -> Move Left (dx < 0).
            - Object is Right (x > 0.5) -> Move Right (dx > 0).
-           - Object is High (y < 0.5) -> Move Up (dy > 0).
-        4. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
-        5. When done, call `finish_task`.
-        6. Coordinate System:
-          X: Left(-)/Right(+)
-          Y: Down(-)/Up(+)
-          Z: Forward(-)/Back(+)
+        7. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
+        8. When done, call `finish_task`.
+        
+        CONTROLLER INPUT TOOLS:
+        - Use `click_button(controller, button)` to click a button (quick press and release).
+        - Use `press_button(controller, button)` to hold a button down.
+        - Use `release_button(controller, button)` to release a held button.
+        - Buttons: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+        - Use `set_trigger(controller, value)` for analog trigger (0.0-1.0).
+        - Use `set_joystick(controller, x, y)` for joystick position (-1.0 to 1.0).
+        - Use `move_joystick_direction(controller, direction)` for easy movement ("up", "down", "left", "right", "forward", "backward").
+        - Use `perform_grab(controller)` to grab objects (presses grip+trigger).
+        - Use `perform_release(controller)` to release grabbed objects.
+        - Use `release_all_inputs(controller)` to reset all buttons/joystick.
+        - Use `get_controller_state(controller)` to check current button states.
+        - Use `get_current_pose(device)` to get position/rotation of headset or controllers.
+        - Use `reset_controller_positions()` to reset controllers to natural positions.
         """
         
         self.chat = self.client.chats.create(
@@ -497,6 +1355,87 @@ class GeminiAgent:
             self.logger.error(f"Error: {e}")
             traceback.print_exc()
 
+    def handle_direct_command(self, user_input: str):
+        """
+        Parses and executes a direct command in the format ((function arg1 arg2 ...))
+        Arguments are automatically converted to int/float/bool/None if possible.
+        """
+        try:
+            # Strip (( and ))
+            content = user_input[2:-2].strip()
+            if not content:
+                print("Empty direct command.")
+                return
+
+            # Parse with shlex (handles quoted strings)
+            parts = shlex.split(content)
+            func_name = parts[0]
+            raw_args = parts[1:]
+            
+            # Convert args
+            args = []
+            for arg in raw_args:
+                if arg.lower() == 'true':
+                    args.append(True)
+                elif arg.lower() == 'false':
+                    args.append(False)
+                elif arg.lower() == 'none':
+                    args.append(None)
+                else:
+                    try:
+                        if '.' in arg:
+                            args.append(float(arg))
+                        else:
+                            args.append(int(arg))
+                    except ValueError:
+                        args.append(arg) # Keep as string
+            
+            print(f"Direct Execution: {func_name}({args})")
+            self.logger.info(f"Direct Execution: {func_name}({args})")
+
+            # 1. Check Agent Tools (Wrapped functions)
+            # self.tools is a list of callables
+            tool_func = next((t for t in self.tools if t.__name__ == func_name), None)
+            
+            if tool_func:
+                # Introspect to map args if needed, or just pass *args
+                # Since our tools are simple python functions, *args usually works 
+                # if the user provided them in order.
+                import inspect
+                sig = inspect.signature(tool_func)
+                
+                # Simple binding attempt
+                try:
+                    bound_args = sig.bind(*args)
+                    bound_args.apply_defaults()
+                    res = tool_func(*bound_args.args, **bound_args.kwargs)
+                    print(f"Result: {res}")
+                    self.logger.info(f"Result: {res}")
+                    return
+                except TypeError as e:
+                    print(f"Argument mismatch for tool '{func_name}': {e}")
+                    return
+
+            # 2. Check MCP Server directly (underlying functions)
+            # This allows calling functions not exposed as agent tools
+            if hasattr(self.executor.module, func_name):
+                func = getattr(self.executor.module, func_name)
+                try:
+                    res = func(*args)
+                    print(f"Result: {res}")
+                    self.logger.info(f"Result: {res}")
+                    return
+                except Exception as e:
+                     print(f"Error executing MCP function '{func_name}': {e}")
+                     return
+
+            print(f"Error: Function '{func_name}' not found in Agent Tools or MCP Server.")
+
+        except Exception as e:
+            print(f"Failed to execute direct command: {e}")
+            traceback.print_exc()
+
+
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -520,6 +1459,11 @@ if __name__ == "__main__":
                 agent.print_status()
                 continue
                 
+            # Direct Command Check
+            if user_input.startswith("((") and user_input.endswith("))"):
+                agent.handle_direct_command(user_input)
+                continue
+
             agent.run(user_input)
         except KeyboardInterrupt:
             break

@@ -752,11 +752,187 @@ def _get_tools(executor, grounder, tracker):
 
         return f"Visual servoing finished max iterations ({MAX_ITER}). Final error: {dist if 'dist' in locals() else 'Unknown'}."
 
+    # =========================================================================
+    # CONTROLLER INPUT FUNCTIONS (Buttons, Triggers, Joystick)
+    # =========================================================================
+    
+    def press_button(controller: str, button: str):
+        """
+        Press a button on a controller. The button stays pressed until release_button is called.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            button: One of: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+        
+        Common uses:
+        - "trigger": Primary action (select, shoot, grab)
+        - "grip": Secondary grab, hold objects
+        - "menu": Open menu
+        - "a"/"b": Context-dependent actions
+        - "trackpad": Trackpad/joystick click
+        """
+        _log_action("press_button", controller=controller, button=button)
+        return _executor.call("press_button", controller=controller, button=button)
+
+    def release_button(controller: str, button: str):
+        """
+        Release a previously pressed button on a controller.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            button: One of: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+        """
+        _log_action("release_button", controller=controller, button=button)
+        return _executor.call("release_button", controller=controller, button=button)
+
+    def click_button(controller: str, button: str, duration: float = 0.1):
+        """
+        Click a button (press and release) on a controller.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            button: One of: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+            duration: How long to hold the button in seconds (default 0.1)
+        """
+        _log_action("click_button", controller=controller, button=button, duration=duration)
+        return _executor.call("click_button", controller=controller, button=button, duration=duration)
+
+    def set_trigger(controller: str, value: float):
+        """
+        Set the analog trigger value (for partial pulls).
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            value: Trigger value from 0.0 (released) to 1.0 (fully pressed)
+        """
+        _log_action("set_trigger", controller=controller, value=value)
+        return _executor.call("set_trigger", controller=controller, value=value)
+
+    def set_joystick(controller: str, x: float, y: float):
+        """
+        Set the joystick/trackpad position.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            x: Horizontal position from -1.0 (left) to 1.0 (right)
+            y: Vertical position from -1.0 (down) to 1.0 (up)
+        
+        Common uses:
+        - Movement: Use left controller joystick for locomotion
+        - Camera: Use right controller joystick for turning
+        - Menu navigation: Move through UI elements
+        """
+        _log_action("set_joystick", controller=controller, x=x, y=y)
+        return _executor.call("set_joystick", controller=controller, x=x, y=y)
+
+    def move_joystick_direction(controller: str, direction: str, magnitude: float = 1.0):
+        """
+        Move the joystick in a cardinal direction.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            direction: "up", "down", "left", "right", "center", "forward", "backward"
+            magnitude: How far to push (0.0 to 1.0, default 1.0)
+        """
+        _log_action("move_joystick_direction", controller=controller, direction=direction, magnitude=magnitude)
+        return _executor.call("move_joystick_direction", controller=controller, direction=direction, magnitude=magnitude)
+
+    def perform_grab(controller: str):
+        """
+        Perform a grab action - press grip and trigger together.
+        Common interaction pattern in VR for picking up objects.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+        """
+        _log_action("perform_grab", controller=controller)
+        return _executor.call("perform_grab", controller=controller)
+
+    def perform_release(controller: str):
+        """
+        Release a grabbed object - release grip and trigger.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+        """
+        _log_action("perform_release", controller=controller)
+        return _executor.call("perform_release", controller=controller)
+
+    def release_all_inputs(controller: str = "both"):
+        """
+        Release all buttons and reset joystick to center.
+        
+        Args:
+            controller: "controller1", "controller2", or "both" (default)
+        """
+        _log_action("release_all_inputs", controller=controller)
+        return _executor.call("release_all_inputs", controller=controller)
+
+    def get_controller_state(controller: str):
+        """
+        Get the current input state of a controller (buttons, joystick, trigger).
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+        """
+        _log_action("get_controller_state", controller=controller)
+        return _executor.call("get_controller_state", controller=controller)
+
+    def get_current_pose(device: str = "headset"):
+        """
+        Get the current position and rotation of a device.
+        
+        Args:
+            device: "headset", "controller1", or "controller2"
+        """
+        _log_action("get_current_pose", device=device)
+        return _executor.call("get_current_pose", device=device)
+
+    def reset_controller_positions():
+        """
+        Reset both controllers to natural positions relative to the headset.
+        Controller1 (left): slightly left and in front
+        Controller2 (right): slightly right and in front
+        """
+        _log_action("reset_controller_positions")
+        return _executor.call("reset_controller_positions")
+
+    def position_controller_relative_to_headset(
+        controller: str, 
+        forward: float = -0.3, 
+        right: float = 0.0, 
+        up: float = -0.5
+    ):
+        """
+        Position a controller relative to the headset position.
+        
+        Args:
+            controller: "controller1" (left) or "controller2" (right)
+            forward: Distance in front of headset (negative = in front, positive = behind)
+            right: Distance to the right (negative = left, positive = right)
+            up: Distance up/down from headset (negative = below, positive = above)
+        """
+        _log_action("position_controller_relative_to_headset", 
+                   controller=controller, forward=forward, right=right, up=up)
+        return _executor.call("position_controller_relative_to_headset", 
+                             controller=controller, forward=forward, right=right, up=up)
+
     return [
-        start_bridge, move_relative, teleport, rotate_device, 
+        # Movement & Orientation
+        start_bridge, move_relative, teleport, rotate_device, get_current_pose,
+        # Vision
         inspect_surroundings, locate_object, capture_video, 
-        track_object, track_multiple_items, visual_servo_to_object, 
-        create_tracking_video, finish_task, get_connection_status, kill_address
+        # Tracking
+        track_object, track_multiple_items, visual_servo_to_object, create_tracking_video, 
+        # Controller Positioning
+        reset_controller_positions, position_controller_relative_to_headset,
+        # Button/Input Controls
+        press_button, release_button, click_button, set_trigger,
+        set_joystick, move_joystick_direction,
+        perform_grab, perform_release, release_all_inputs,
+        get_controller_state,
+        # Utility
+        finish_task, get_connection_status, kill_address
     ]
 # ============================================================================
 # AGENT
@@ -783,7 +959,7 @@ class GeminiAgent:
         
         # Create Chat Session
         system_prompt = """You are an expert VR Agent.
-        You control a headset and controllers.
+        You control a headset and two controllers (controller1=left, controller2=right).
         
         RULES:
         1. Always locate objects before interacting with them.
@@ -795,6 +971,21 @@ class GeminiAgent:
            - Object is Right (x > 0.5) -> Move Right (dx > 0).
         6. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
         7. When done, call `finish_task`.
+        
+        CONTROLLER INPUT TOOLS:
+        - Use `click_button(controller, button)` to click a button (quick press and release).
+        - Use `press_button(controller, button)` to hold a button down.
+        - Use `release_button(controller, button)` to release a held button.
+        - Buttons: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+        - Use `set_trigger(controller, value)` for analog trigger (0.0-1.0).
+        - Use `set_joystick(controller, x, y)` for joystick position (-1.0 to 1.0).
+        - Use `move_joystick_direction(controller, direction)` for easy movement ("up", "down", "left", "right", "forward", "backward").
+        - Use `perform_grab(controller)` to grab objects (presses grip+trigger).
+        - Use `perform_release(controller)` to release grabbed objects.
+        - Use `release_all_inputs(controller)` to reset all buttons/joystick.
+        - Use `get_controller_state(controller)` to check current button states.
+        - Use `get_current_pose(device)` to get position/rotation of headset or controllers.
+        - Use `reset_controller_positions()` to reset controllers to natural positions.
         """
         
         self.chat = self.client.chats.create(

@@ -126,6 +126,9 @@ def broadcast_state():
         for client in clients:
             try:
                 for msg in messages:
+                    # Debug: Log what we're sending for controllers
+                    if '"input"' in msg:
+                        print(f"[BROADCAST] Sending: {msg.strip()}", flush=True)
                     client.sendall(msg.encode('utf-8'))
                 active_clients.append(client)
             except Exception:
@@ -532,6 +535,8 @@ def press_button(controller: str, button: str) -> str:
         # Also set trigger value if pressing trigger
         if button.lower() == 'trigger':
             controller_inputs[controller]['triggerValue'] = 1.0
+        # Debug: show current input state
+        print(f"[DEBUG] {controller} input state: {controller_inputs[controller]}", flush=True)
     
     broadcast_state()
     return f"{controller}: {button} pressed"

@@ -19,6 +19,7 @@
 #if !defined(_WIN32)
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>  // For TCP_NODELAY
 #include <arpa/inet.h>
 #include <unistd.h>
 #define SOCKET int

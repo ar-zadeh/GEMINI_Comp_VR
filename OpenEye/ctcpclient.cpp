@@ -84,8 +84,17 @@ bool CTcpClient::Connect(const std::string& host, int port)
         return false;
     }
 
+    // Disable Nagle algorithm for low-latency pose updates
+    // Without this, small packets are buffered causing 4-5 second delays!
+    int flag = 1;
+#if defined(_WIN32)
+    setsockopt(m_socket, IPPROTO_TCP, TCP_NODELAY, (char*)&flag, sizeof(flag));
+#else
+    setsockopt(m_socket, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+#endif
+
     m_bConnected = true;
-    DriverLog("CTcpClient: Connected to %s:%d\n", host.c_str(), port);
+    DriverLog("CTcpClient: Connected to %s:%d (TCP_NODELAY enabled)\n", host.c_str(), port);
     return true;
 }
 

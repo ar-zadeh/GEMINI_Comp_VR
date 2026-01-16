@@ -131,9 +131,18 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
         auto now = std::chrono::system_clock::now();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
         std::time_t time = std::chrono::system_clock::to_time_t(now);
-        std::tm* tm = std::localtime(&time);
+        std::tm tm;
+#if defined(_WIN32)
+        localtime_s(&tm, &time);
+#else
+        tm = *std::localtime(&time);
+#endif
         char buf[32];
-        sprintf(buf, "%02d:%02d:%02d.%03d", tm->tm_hour, tm->tm_min, tm->tm_sec, (int)ms.count());
+#if defined(_WIN32)
+        sprintf_s(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
+#else
+        sprintf(buf, "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
+#endif
         recvTs = buf;
         
         // Extract send_ts from message and log comparison

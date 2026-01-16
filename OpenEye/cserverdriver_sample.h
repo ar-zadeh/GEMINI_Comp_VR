@@ -21,7 +21,7 @@ public:
     virtual void Cleanup();
     virtual const char *const *GetInterfaceVersions() { return vr::k_InterfaceVersions; }
     virtual void RunFrame();
-    virtual bool ShouldBlockStandbyMode()  { return false; }
+    virtual bool ShouldBlockStandbyMode()  { return true; }  // Block standby to prevent pose update throttling
     virtual void EnterStandby()  {}
     virtual void LeaveStandby()  {}
 

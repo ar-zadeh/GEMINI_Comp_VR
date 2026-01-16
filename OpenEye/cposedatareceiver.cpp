@@ -4,6 +4,7 @@
 #include "driverlog.h"
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <thread>
 #include <atomic>
 #include <chrono>
@@ -123,7 +124,32 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
         return;
     }
 
-    // Strategy 3: Removed logging for pose updates to reduce latency
+    // Get receive timestamp for controller2 latency debugging
+    std::string recvTs;
+    if (device == "controller2")
+    {
+        auto now = std::chrono::system_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        std::time_t time = std::chrono::system_clock::to_time_t(now);
+        std::tm* tm = std::localtime(&time);
+        char buf[32];
+        sprintf(buf, "%02d:%02d:%02d.%03d", tm->tm_hour, tm->tm_min, tm->tm_sec, (int)ms.count());
+        recvTs = buf;
+        
+        // Extract send_ts from message and log comparison
+        size_t tsPos = message.find("\"send_ts\":\"");
+        if (tsPos != std::string::npos)
+        {
+            std::string sendTs = message.substr(tsPos + 11, 12);
+            DriverLog("[RECV] controller2 | sent=%s | recv=%s\n", sendTs.c_str(), recvTs.c_str());
+        }
+        else
+        {
+            DriverLog("[RECV] controller2 at %s (no send_ts in msg)\n", recvTs.c_str());
+        }
+    }
+
+    // Store pose data
     {
         std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -160,21 +186,13 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
             g_pController1Driver->GetPose(),
             sizeof(vr::DriverPose_t));
     }
-    else if (device == "controller2")
+    else if (device == "controller2" && g_pController2Driver && g_pController2Driver->IsActivated())
     {
-        // DEBUG: Log why controller2 might not be updating
-        if (!g_pController2Driver) {
-            DriverLog("PUSH DEBUG: controller2 - g_pController2Driver is NULL!\n");
-        } else if (!g_pController2Driver->IsActivated()) {
-            DriverLog("PUSH DEBUG: controller2 - not activated (ObjectId=%u)\n", 
-                     g_pController2Driver->GetObjectId());
-        } else {
-            DriverLog("PUSH DEBUG: controller2 - calling TrackedDevicePoseUpdated\n");
-            vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
-                g_pController2Driver->GetObjectId(),
-                g_pController2Driver->GetPose(),
-                sizeof(vr::DriverPose_t));
-        }
+        DriverLog("[PUSH] controller2 at %s\n", recvTs.c_str());
+        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
+            g_pController2Driver->GetObjectId(),
+            g_pController2Driver->GetPose(),
+            sizeof(vr::DriverPose_t));
     }
 }
 

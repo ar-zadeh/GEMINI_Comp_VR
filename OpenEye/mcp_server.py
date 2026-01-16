@@ -136,6 +136,7 @@ def broadcast_state():
 
 def send_device_update(device: str):
     """Send update for a single device instead of all devices. Lower latency for targeted updates."""
+    import datetime
     with state_lock:
         if device not in current_poses:
             return
@@ -150,6 +151,11 @@ def send_device_update(device: str):
         # Add input state for controllers
         if device in controller_inputs:
             msg["input"] = controller_inputs[device]
+        
+        # Add timestamp for latency debugging
+        send_ts = datetime.datetime.now()
+        msg["send_ts"] = send_ts.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
+        print(f"[SEND] {device} at {msg['send_ts']}")
         
         payload = json.dumps(msg) + '\n'
         

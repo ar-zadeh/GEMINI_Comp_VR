@@ -187,21 +187,17 @@ vr::DriverPose_t CSampleDeviceDriver::GetPose() {
     pose.qWorldFromDriverRotation = HmdQuaternion_Init(1, 0, 0, 0);
     pose.qDriverFromHeadRotation = HmdQuaternion_Init(1, 0, 0, 0);
 
-    // Get pose data from TCP receiver
+    // Get pose data from TCP receiver - ALWAYS use latest values (no updated flag check)
     if (g_pPoseDataReceiver && g_pPoseDataReceiver->IsConnected())
     {
         PoseData tcpPose = g_pPoseDataReceiver->GetHeadsetPose();
-        if (tcpPose.updated)
-        {
-            DriverLog("CSampleDeviceDriver: Got headset pose update: pos=[%.2f,%.2f,%.2f], rot=[%.2f,%.2f,%.2f]\n",
-                tcpPose.posX, tcpPose.posY, tcpPose.posZ, tcpPose.rotX, tcpPose.rotY, tcpPose.rotZ);
-            pX = tcpPose.posX;
-            pY = tcpPose.posY;
-            pZ = tcpPose.posZ;
-            angleX = tcpPose.rotX;
-            angleY = tcpPose.rotY;
-            angleZ = tcpPose.rotZ;
-        }
+        // Always update pose - don't check .updated flag (Strategy 4)
+        pX = tcpPose.posX;
+        pY = tcpPose.posY;
+        pZ = tcpPose.posZ;
+        angleX = tcpPose.rotX;
+        angleY = tcpPose.rotY;
+        angleZ = tcpPose.rotZ;
     }
 
     // Update pose position

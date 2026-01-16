@@ -107,8 +107,6 @@ PoseData CPoseDataReceiver::GetController2Pose()
 
 void CPoseDataReceiver::OnMessageReceived(const std::string& message)
 {
-    DriverLog("CPoseDataReceiver: Received message: %s\n", message.c_str());
-
     // Check if this is a vision request
     if (IsVisionRequest(message))
     {
@@ -125,9 +123,7 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
         return;
     }
 
-    DriverLog("CPoseDataReceiver: Parsed device=%s, pos=[%.2f,%.2f,%.2f], rot=[%.2f,%.2f,%.2f]\n",
-        device.c_str(), pose.posX, pose.posY, pose.posZ, pose.rotX, pose.rotY, pose.rotZ);
-
+    // Strategy 3: Removed logging for pose updates to reduce latency
     {
         std::lock_guard<std::mutex> lock(m_mutex);
 
@@ -156,7 +152,6 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
             g_pHeadsetDriver->GetObjectId(),
             g_pHeadsetDriver->GetPose(),
             sizeof(vr::DriverPose_t));
-        DriverLog("CPoseDataReceiver: Pushed headset pose update\n");
     }
     else if (device == "controller1" && g_pController1Driver && g_pController1Driver->IsActivated())
     {
@@ -164,7 +159,6 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
             g_pController1Driver->GetObjectId(),
             g_pController1Driver->GetPose(),
             sizeof(vr::DriverPose_t));
-        DriverLog("CPoseDataReceiver: Pushed controller1 pose update\n");
     }
     else if (device == "controller2" && g_pController2Driver && g_pController2Driver->IsActivated())
     {
@@ -172,7 +166,6 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
             g_pController2Driver->GetObjectId(),
             g_pController2Driver->GetPose(),
             sizeof(vr::DriverPose_t));
-        DriverLog("CPoseDataReceiver: Pushed controller2 pose update\n");
     }
 }
 

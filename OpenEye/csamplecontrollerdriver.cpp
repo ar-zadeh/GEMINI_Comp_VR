@@ -178,24 +178,20 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
     pose.qWorldFromDriverRotation = HmdQuaternion_Init(1, 0, 0, 0);
     pose.qDriverFromHeadRotation = HmdQuaternion_Init(1, 0, 0, 0);
 
-    // Get pose data from TCP receiver
+    // Get pose data from TCP receiver - ALWAYS use latest values (no updated flag check)
     if (g_pPoseDataReceiver && g_pPoseDataReceiver->IsConnected())
     {
         PoseData tcpPose;
         if (ControllerIndex == 1)
         {
             tcpPose = g_pPoseDataReceiver->GetController1Pose();
-            if (tcpPose.updated)
-            {
-                DriverLog("CSampleControllerDriver: Got controller1 pose update: pos=[%.2f,%.2f,%.2f]\n",
-                    tcpPose.posX, tcpPose.posY, tcpPose.posZ);
-                cpX = tcpPose.posX;
-                cpY = tcpPose.posY;
-                cpZ = tcpPose.posZ;
-                cAngleX = tcpPose.rotX;
-                cAngleY = tcpPose.rotY;
-                cAngleZ = tcpPose.rotZ;
-            }
+            // Always update pose - don't check .updated flag (Strategy 4)
+            cpX = tcpPose.posX;
+            cpY = tcpPose.posY;
+            cpZ = tcpPose.posZ;
+            cAngleX = tcpPose.rotX;
+            cAngleY = tcpPose.rotY;
+            cAngleZ = tcpPose.rotZ;
             // Update input state if received
             if (tcpPose.input.inputUpdated)
             {
@@ -205,17 +201,13 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
         else
         {
             tcpPose = g_pPoseDataReceiver->GetController2Pose();
-            if (tcpPose.updated)
-            {
-                DriverLog("CSampleControllerDriver: Got controller2 pose update: pos=[%.2f,%.2f,%.2f]\n",
-                    tcpPose.posX, tcpPose.posY, tcpPose.posZ);
-                c2pX = tcpPose.posX;
-                c2pY = tcpPose.posY;
-                c2pZ = tcpPose.posZ;
-                c2AngleX = tcpPose.rotX;
-                c2AngleY = tcpPose.rotY;
-                c2AngleZ = tcpPose.rotZ;
-            }
+            // Always update pose - don't check .updated flag (Strategy 4)
+            c2pX = tcpPose.posX;
+            c2pY = tcpPose.posY;
+            c2pZ = tcpPose.posZ;
+            c2AngleX = tcpPose.rotX;
+            c2AngleY = tcpPose.rotY;
+            c2AngleZ = tcpPose.rotZ;
             // Update input state if received
             if (tcpPose.input.inputUpdated)
             {

@@ -197,11 +197,12 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
     }
     else if (device == "controller2" && g_pController2Driver && g_pController2Driver->IsActivated())
     {
-        DriverLog("[PUSH] controller2 at %s\n", recvTs.c_str());
+        DriverLog("[PUSH] controller2 at %s - calling TrackedDevicePoseUpdated\n", recvTs.c_str());
         vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
             g_pController2Driver->GetObjectId(),
             g_pController2Driver->GetPose(),
             sizeof(vr::DriverPose_t));
+        DriverLog("[DONE] controller2 TrackedDevicePoseUpdated returned\n");
     }
 }
 

@@ -358,6 +358,7 @@ def teleport(device: str, x: float, y: float, z: float) -> str:
 @mcp.tool()
 def rotate_device(device: str, pitch: float, yaw: float, roll: float) -> str:
     """Set the rotation of a device in degrees (pitch=up/down, yaw=left/right, roll=tilt)."""
+    import time
     if device not in current_poses:
         return f"Invalid device. Options: {list(current_poses.keys())}"
     
@@ -366,6 +367,17 @@ def rotate_device(device: str, pitch: float, yaw: float, roll: float) -> str:
     
     # Use targeted update for lower latency (only sends this device, not all 3)
     send_device_update(device)
+    
+    # Verification: wait 0.1s and check if values match
+    time.sleep(0.1)
+    with state_lock:
+        stored_rot = current_poses[device]['rot']
+    expected = [pitch, yaw, roll]
+    if stored_rot == expected:
+        print(f"[VERIFY] good - {device} rot={stored_rot}")
+    else:
+        print(f"[VERIFY] not good - {device} expected={expected} got={stored_rot}")
+    
     return f"{device} rotated to pitch={pitch}, yaw={yaw}, roll={roll}"
 
 @mcp.tool()

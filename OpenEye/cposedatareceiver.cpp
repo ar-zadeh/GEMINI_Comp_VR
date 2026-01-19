@@ -1,18 +1,12 @@
 #include "cposedatareceiver.h"
 #include "cvisionserver.h"
-#include "cserverdriver_sample.h"
 #include "driverlog.h"
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
-#include <thread>
-#include <atomic>
-#include <chrono>
 
 CPoseDataReceiver* g_pPoseDataReceiver = nullptr;
 
 CPoseDataReceiver::CPoseDataReceiver()
-    : m_bMonitorRunning(false)
 {
 }
 
@@ -23,58 +17,25 @@ CPoseDataReceiver::~CPoseDataReceiver()
 
 bool CPoseDataReceiver::Start(const std::string& host, int port)
 {
-    m_host = host;
-    m_port = port;
-
     m_tcpClient.SetMessageCallback([this](const std::string& msg) {
         OnMessageReceived(msg);
     });
 
-    m_bMonitorRunning = true;
-    m_monitorThread = std::thread(&CPoseDataReceiver::MonitorConnectionThread, this);
-    
-    DriverLog("CPoseDataReceiver: Started connection monitor for %s:%d\n", host.c_str(), port);
+    if (!m_tcpClient.Connect(host, port))
+    {
+        DriverLog("CPoseDataReceiver: Failed to connect to %s:%d\n", host.c_str(), port);
+        return false;
+    }
+
+    m_tcpClient.StartReceiveThread();
+    DriverLog("CPoseDataReceiver: Started receiving pose data from %s:%d\n", host.c_str(), port);
     return true;
 }
 
 void CPoseDataReceiver::Stop()
 {
-    m_bMonitorRunning = false;
-    if (m_monitorThread.joinable())
-    {
-        m_monitorThread.join();
-    }
-
     m_tcpClient.StopReceiveThread();
     m_tcpClient.Disconnect();
-}
-
-void CPoseDataReceiver::MonitorConnectionThread()
-{
-    while (m_bMonitorRunning)
-    {
-        if (!m_tcpClient.IsConnected())
-        {
-            // Ensure previous thread is cleaned up
-             m_tcpClient.StopReceiveThread();
-             
-             // Try to connect
-             if (m_tcpClient.Connect(m_host, m_port))
-             {
-                 m_tcpClient.StartReceiveThread();
-                 DriverLog("CPoseDataReceiver: Connection established\n");
-             }
-             else 
-             {
-                 // Wait before retry
-                 std::this_thread::sleep_for(std::chrono::seconds(2));
-             }
-        }
-        else
-        {
-             std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
 }
 
 bool CPoseDataReceiver::IsConnected() const
@@ -95,6 +56,7 @@ PoseData CPoseDataReceiver::GetController1Pose()
     std::lock_guard<std::mutex> lock(m_mutex);
     PoseData pose = m_controller1Pose;
     m_controller1Pose.updated = false;
+    m_controller1Pose.input.inputUpdated = false;  // Reset input flag
     return pose;
 }
 
@@ -103,11 +65,14 @@ PoseData CPoseDataReceiver::GetController2Pose()
     std::lock_guard<std::mutex> lock(m_mutex);
     PoseData pose = m_controller2Pose;
     m_controller2Pose.updated = false;
+    m_controller2Pose.input.inputUpdated = false;  // Reset input flag
     return pose;
 }
 
 void CPoseDataReceiver::OnMessageReceived(const std::string& message)
 {
+    DriverLog("CPoseDataReceiver: Received message: %s\n", message.c_str());
+
     // Check if this is a vision request
     if (IsVisionRequest(message))
     {
@@ -124,85 +89,35 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
         return;
     }
 
-    // Get receive timestamp for controller2 latency debugging
-    std::string recvTs;
-    if (device == "controller2")
+    // Debug: Log input parsing for controllers
+    if ((device == "controller1" || device == "controller2") && pose.input.inputUpdated)
     {
-        auto now = std::chrono::system_clock::now();
-        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-        std::time_t time = std::chrono::system_clock::to_time_t(now);
-        std::tm tm;
-#if defined(_WIN32)
-        localtime_s(&tm, &time);
-#else
-        tm = *std::localtime(&time);
-#endif
-        char buf[32];
-#if defined(_WIN32)
-        sprintf_s(buf, sizeof(buf), "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
-#else
-        sprintf(buf, "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, (int)ms.count());
-#endif
-        recvTs = buf;
-        
-        // Extract send_ts from message and log comparison
-        size_t tsPos = message.find("\"send_ts\":\"");
-        if (tsPos != std::string::npos)
-        {
-            std::string sendTs = message.substr(tsPos + 11, 12);
-            DriverLog("[RECV] controller2 | sent=%s | recv=%s\n", sendTs.c_str(), recvTs.c_str());
-        }
-        else
-        {
-            DriverLog("[RECV] controller2 at %s (no send_ts in msg)\n", recvTs.c_str());
-        }
+        DriverLog("CPoseDataReceiver: Parsed %s input - grip=%s, trigger=%s, triggerValue=%.2f\n",
+                  device.c_str(),
+                  pose.input.grip ? "true" : "false",
+                  pose.input.triggerClick ? "true" : "false",
+                  pose.input.triggerValue);
     }
 
-    // Store pose data
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
+    DriverLog("CPoseDataReceiver: Parsed device=%s, pos=[%.2f,%.2f,%.2f], rot=[%.2f,%.2f,%.2f]\n",
+        device.c_str(), pose.posX, pose.posY, pose.posZ, pose.rotX, pose.rotY, pose.rotZ);
 
-        if (device == "headset")
-        {
-            m_headsetPose = pose;
-            m_headsetPose.updated = true;
-        }
-        else if (device == "controller1")
-        {
-            m_controller1Pose = pose;
-            m_controller1Pose.updated = true;
-        }
-        else if (device == "controller2")
-        {
-            m_controller2Pose = pose;
-            m_controller2Pose.updated = true;
-        }
-    } // Release mutex before calling OpenVR
+    std::lock_guard<std::mutex> lock(m_mutex);
 
-    // PUSH-BASED UPDATE: Immediately notify SteamVR of pose change
-    // This bypasses the slow RunFrame() polling and reduces latency from ~4s to near-instant
-    if (device == "headset" && g_pHeadsetDriver && g_pHeadsetDriver->IsActivated())
+    if (device == "headset")
     {
-        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
-            g_pHeadsetDriver->GetObjectId(),
-            g_pHeadsetDriver->GetPose(),
-            sizeof(vr::DriverPose_t));
+        m_headsetPose = pose;
+        m_headsetPose.updated = true;
     }
-    else if (device == "controller1" && g_pController1Driver && g_pController1Driver->IsActivated())
+    else if (device == "controller1")
     {
-        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
-            g_pController1Driver->GetObjectId(),
-            g_pController1Driver->GetPose(),
-            sizeof(vr::DriverPose_t));
+        m_controller1Pose = pose;
+        m_controller1Pose.updated = true;
     }
-    else if (device == "controller2" && g_pController2Driver && g_pController2Driver->IsActivated())
+    else if (device == "controller2")
     {
-        DriverLog("[PUSH] controller2 at %s - calling TrackedDevicePoseUpdated\n", recvTs.c_str());
-        vr::VRServerDriverHost()->TrackedDevicePoseUpdated(
-            g_pController2Driver->GetObjectId(),
-            g_pController2Driver->GetPose(),
-            sizeof(vr::DriverPose_t));
-        DriverLog("[DONE] controller2 TrackedDevicePoseUpdated returned\n");
+        m_controller2Pose = pose;
+        m_controller2Pose.updated = true;
     }
 }
 
@@ -294,15 +209,23 @@ bool CPoseDataReceiver::ParseJson(const std::string& json, std::string& device, 
     {
         pose.input.inputUpdated = true;
         
-        // Parse boolean buttons
-        pose.input.system = json.find("\"system\":true", inputStart) != std::string::npos;
-        pose.input.menu = json.find("\"menu\":true", inputStart) != std::string::npos;
-        pose.input.grip = json.find("\"grip\":true", inputStart) != std::string::npos;
-        pose.input.triggerClick = json.find("\"triggerClick\":true", inputStart) != std::string::npos;
-        pose.input.trackpadClick = json.find("\"trackpadClick\":true", inputStart) != std::string::npos;
-        pose.input.trackpadTouch = json.find("\"trackpadTouch\":true", inputStart) != std::string::npos;
-        pose.input.buttonA = json.find("\"buttonA\":true", inputStart) != std::string::npos;
-        pose.input.buttonB = json.find("\"buttonB\":true", inputStart) != std::string::npos;
+        // Parse boolean buttons - handle both "key":true and "key": true (with space)
+        pose.input.system = (json.find("\"system\":true", inputStart) != std::string::npos) || 
+                            (json.find("\"system\": true", inputStart) != std::string::npos);
+        pose.input.menu = (json.find("\"menu\":true", inputStart) != std::string::npos) || 
+                          (json.find("\"menu\": true", inputStart) != std::string::npos);
+        pose.input.grip = (json.find("\"grip\":true", inputStart) != std::string::npos) || 
+                          (json.find("\"grip\": true", inputStart) != std::string::npos);
+        pose.input.triggerClick = (json.find("\"triggerClick\":true", inputStart) != std::string::npos) || 
+                                  (json.find("\"triggerClick\": true", inputStart) != std::string::npos);
+        pose.input.trackpadClick = (json.find("\"trackpadClick\":true", inputStart) != std::string::npos) || 
+                                   (json.find("\"trackpadClick\": true", inputStart) != std::string::npos);
+        pose.input.trackpadTouch = (json.find("\"trackpadTouch\":true", inputStart) != std::string::npos) || 
+                                   (json.find("\"trackpadTouch\": true", inputStart) != std::string::npos);
+        pose.input.buttonA = (json.find("\"buttonA\":true", inputStart) != std::string::npos) || 
+                             (json.find("\"buttonA\": true", inputStart) != std::string::npos);
+        pose.input.buttonB = (json.find("\"buttonB\":true", inputStart) != std::string::npos) || 
+                             (json.find("\"buttonB\": true", inputStart) != std::string::npos);
 
         // Parse analog values
         auto parseFloat = [&json, inputStart](const char* key, float defaultVal) -> float {
@@ -323,15 +246,6 @@ bool CPoseDataReceiver::ParseJson(const std::string& json, std::string& device, 
         pose.input.triggerValue = parseFloat("triggerValue", 0.0f);
         pose.input.joystickX = parseFloat("joystickX", 0.0f);
         pose.input.joystickY = parseFloat("joystickY", 0.0f);
-        
-        // Debug: Log when any button is pressed
-        if (pose.input.triggerClick || pose.input.buttonA || pose.input.buttonB || 
-            pose.input.menu || pose.input.grip || pose.input.system)
-        {
-            DriverLog("[INPUT] Received: trigger=%d, A=%d, B=%d, menu=%d, grip=%d, system=%d, triggerValue=%.2f\n",
-                pose.input.triggerClick, pose.input.buttonA, pose.input.buttonB,
-                pose.input.menu, pose.input.grip, pose.input.system, pose.input.triggerValue);
-        }
     }
 
     return true;

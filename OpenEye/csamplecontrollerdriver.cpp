@@ -111,12 +111,19 @@ vr::EVRInitError CSampleControllerDriver::Activate(vr::TrackedDeviceIndex_t unOb
         break;
     }
 
-    vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, Prop_InputProfilePath_String, "{driver}/resources/input/mycontroller_profile.json");
+    vr::VRProperties()->SetStringProperty(m_ulPropertyContainer, Prop_InputProfilePath_String, "{null}/input/mycontroller_profile.json");
 
     // Button handles
-    vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/system/click", &HButtons[0]);
-    vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/application_menu/click", &HButtons[1]);
-    vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/grip/click", &HButtons[2]);
+    vr::EVRInputError result;
+    result = vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/system/click", &HButtons[0]);
+    if (result != vr::VRInputError_None) DriverLog("Failed to create system button: %d\n", result);
+    
+    result = vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/application_menu/click", &HButtons[1]);
+    if (result != vr::VRInputError_None) DriverLog("Failed to create menu button: %d\n", result);
+    
+    result = vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/grip/click", &HButtons[2]);
+    if (result != vr::VRInputError_None) DriverLog("Failed to create grip button: %d\n", result);
+    
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/dpad_left/click", &HButtons[3]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/dpad_up/click", &HButtons[4]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/dpad_right/click", &HButtons[5]);
@@ -125,10 +132,15 @@ vr::EVRInitError CSampleControllerDriver::Activate(vr::TrackedDeviceIndex_t unOb
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/b/click", &HButtons[8]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/x/click", &HButtons[9]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/y/click", &HButtons[10]);
-    vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trigger/click", &HButtons[11]);
-    // vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trigger/value", &HButtons[12]);
-    vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trackpad/click", &HButtons[13]);
-    vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trackpad/touch", &HButtons[14]);
+    
+    result = vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trigger/click", &HButtons[11]);
+    if (result != vr::VRInputError_None) DriverLog("Failed to create trigger button: %d\n", result);
+    
+    result = vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trackpad/click", &HButtons[12]);
+    if (result != vr::VRInputError_None) DriverLog("Failed to create trackpad click: %d\n", result);
+    
+    result = vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trackpad/touch", &HButtons[13]);
+    if (result != vr::VRInputError_None) DriverLog("Failed to create trackpad touch: %d\n", result);
 
     // Analog handles
     vr::VRDriverInput()->CreateScalarComponent(
@@ -145,9 +157,6 @@ vr::EVRInitError CSampleControllerDriver::Activate(vr::TrackedDeviceIndex_t unOb
     );
 
     vr::VRProperties()->SetInt32Property(m_ulPropertyContainer, vr::Prop_Axis0Type_Int32, vr::k_eControllerAxis_TrackPad);
-
-    // Disable SteamVR's pose prediction for this controller - we're providing real-time updates
-    vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DoNotApplyPrediction_Bool, true);
 
     // Create our haptic component
     vr::VRDriverInput()->CreateHapticComponent(m_ulPropertyContainer, "/output/haptic", &m_compHaptic);
@@ -181,20 +190,24 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
     pose.qWorldFromDriverRotation = HmdQuaternion_Init(1, 0, 0, 0);
     pose.qDriverFromHeadRotation = HmdQuaternion_Init(1, 0, 0, 0);
 
-    // Get pose data from TCP receiver - ALWAYS use latest values (no updated flag check)
+    // Get pose data from TCP receiver
     if (g_pPoseDataReceiver && g_pPoseDataReceiver->IsConnected())
     {
         PoseData tcpPose;
         if (ControllerIndex == 1)
         {
             tcpPose = g_pPoseDataReceiver->GetController1Pose();
-            // Always update pose - don't check .updated flag (Strategy 4)
-            cpX = tcpPose.posX;
-            cpY = tcpPose.posY;
-            cpZ = tcpPose.posZ;
-            cAngleX = tcpPose.rotX;
-            cAngleY = tcpPose.rotY;
-            cAngleZ = tcpPose.rotZ;
+            if (tcpPose.updated)
+            {
+                DriverLog("CSampleControllerDriver: Got controller1 pose update: pos=[%.2f,%.2f,%.2f]\n",
+                    tcpPose.posX, tcpPose.posY, tcpPose.posZ);
+                cpX = tcpPose.posX;
+                cpY = tcpPose.posY;
+                cpZ = tcpPose.posZ;
+                cAngleX = tcpPose.rotX;
+                cAngleY = tcpPose.rotY;
+                cAngleZ = tcpPose.rotZ;
+            }
             // Update input state if received
             if (tcpPose.input.inputUpdated)
             {
@@ -204,25 +217,24 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
         else
         {
             tcpPose = g_pPoseDataReceiver->GetController2Pose();
-            // Always update pose - don't check .updated flag (Strategy 4)
-            c2pX = tcpPose.posX;
-            c2pY = tcpPose.posY;
-            c2pZ = tcpPose.posZ;
-            c2AngleX = tcpPose.rotX;
-            c2AngleY = tcpPose.rotY;
-            c2AngleZ = tcpPose.rotZ;
+            if (tcpPose.updated)
+            {
+                DriverLog("CSampleControllerDriver: Got controller2 pose update: pos=[%.2f,%.2f,%.2f]\n",
+                    tcpPose.posX, tcpPose.posY, tcpPose.posZ);
+                c2pX = tcpPose.posX;
+                c2pY = tcpPose.posY;
+                c2pZ = tcpPose.posZ;
+                c2AngleX = tcpPose.rotX;
+                c2AngleY = tcpPose.rotY;
+                c2AngleZ = tcpPose.rotZ;
+            }
             // Update input state if received
             if (tcpPose.input.inputUpdated)
             {
-                // Log when input changes
-                if (tcpPose.input.triggerClick != ctrl2Input.triggerClick ||
-                    tcpPose.input.buttonA != ctrl2Input.buttonA ||
-                    tcpPose.input.menu != ctrl2Input.menu)
-                {
-                    DriverLog("[CTRL2] Input update: trigger=%d, A=%d, menu=%d\n",
-                        tcpPose.input.triggerClick, tcpPose.input.buttonA, tcpPose.input.menu);
-                }
                 ctrl2Input = tcpPose.input;
+                DriverLog("Controller2 input updated: grip=%s, triggerClick=%s, triggerValue=%.2f\n",
+                          ctrl2Input.grip ? "true" : "false",
+                          ctrl2Input.triggerClick ? "true" : "false", ctrl2Input.triggerValue);
             }
         }
     }
@@ -260,11 +272,14 @@ vr::DriverPose_t CSampleControllerDriver::GetPose() {
 }
 
 void CSampleControllerDriver::RunFrame() {
-    // IMPORTANT: Fetch latest pose AND input from TCP BEFORE using input values
-    // This ensures we have the most recent button states before applying them
-    GetPose();
-    
     ControllerInput* input = (ControllerIndex == 1) ? &ctrl1Input : &ctrl2Input;
+    
+    // Debug logging for trigger input
+    if (ControllerIndex == 2 && input->inputUpdated) {
+        DriverLog("Controller2 RunFrame: grip=%s, triggerClick=%s, triggerValue=%.2f\n", 
+                  input->grip ? "true" : "false",
+                  input->triggerClick ? "true" : "false", input->triggerValue);
+    }
     
     // Check for Shift+F10 toggle (only check once per frame, on controller 1)
     if (ControllerIndex == 1) {
@@ -296,9 +311,9 @@ void CSampleControllerDriver::RunFrame() {
             useKeyboard ? ((0x8000 & GetAsyncKeyState('O')) != 0) : input->buttonB, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[11], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('S')) != 0) : input->triggerClick, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[13], 
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('F')) != 0) : input->trackpadClick, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[14], 
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[13], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('G')) != 0) : input->trackpadTouch, 0);
 
         // D-pad (keyboard only for now, respects toggle)
@@ -309,7 +324,6 @@ void CSampleControllerDriver::RunFrame() {
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], dpadEnabled && (0x8000 & GetAsyncKeyState('U')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], dpadEnabled && (0x8000 & GetAsyncKeyState('P')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], dpadEnabled && (0x8000 & GetAsyncKeyState('A')) != 0, 0);
-        // vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('D')) != 0, 0);
 
         // Analog inputs - TCP or keyboard
         if (useKeyboard) {
@@ -343,9 +357,9 @@ void CSampleControllerDriver::RunFrame() {
             useKeyboard ? ((0x8000 & GetAsyncKeyState('B')) != 0) : input->buttonB, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[11], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('1')) != 0) : input->triggerClick, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[13], 
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('3')) != 0) : input->trackpadClick, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[14], 
+        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[13], 
             useKeyboard ? ((0x8000 & GetAsyncKeyState('4')) != 0) : input->trackpadTouch, 0);
 
         // D-pad (keyboard only, respects toggle)
@@ -356,7 +370,6 @@ void CSampleControllerDriver::RunFrame() {
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], dpadEnabled && (0x8000 & GetAsyncKeyState('C')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], dpadEnabled && (0x8000 & GetAsyncKeyState('N')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], dpadEnabled && (0x8000 & GetAsyncKeyState('M')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('2')) != 0, 0);
 
         // Analog inputs
         if (useKeyboard) {

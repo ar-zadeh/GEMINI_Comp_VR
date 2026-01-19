@@ -17,7 +17,7 @@
          ]
       },
       "/input/grip": {
-         "type": "button",
+         "type": "trigger",
          "binding_image_point": [
             0,
             0

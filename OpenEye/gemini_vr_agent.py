@@ -305,7 +305,7 @@ def _get_tools(executor, grounder, tracker):
         return _executor.call("rotate_device", device=device, pitch=pitch, yaw=yaw, roll=roll)
         
     def inspect_surroundings():
-        """Take a picture."""
+        """Take a picture of the view of what is infront of the agent in the VR."""
         _log_action("inspect_surroundings")
         return _executor.call("inspect_surroundings")
         
@@ -445,80 +445,80 @@ def _get_tools(executor, grounder, tracker):
             
         return res_str
 
-    def track_object(object_description: str):
-        """
-        Track an object in a video.
-        1. Captures a 3-second video.
-        2. Finds the object in the first frame.
-        3. Tracks it using SAM 2.
-        """
-        _log_action("track_object", description=object_description)
-        logger = get_logger()
+    # def track_object(object_description: str):
+    #     """
+    #     Track an object in a video.
+    #     1. Captures a 3-second video.
+    #     2. Finds the object in the first frame.
+    #     3. Tracks it using SAM 2.
+    #     """
+    #     _log_action("track_object", description=object_description)
+    #     logger = get_logger()
         
-        if not _tracker or not _tracker.available:
-            return "Error: Object Tracking (SAM 2) is not available."
+    #     if not _tracker or not _tracker.available:
+    #         return "Error: Object Tracking (SAM 2) is not available."
 
-        # 1. Capture Video
-        print("Capturing video...")
-        res_str = _executor.call("capture_video", duration=3.0)
-        if "Error" in res_str and not res_str.startswith("{"): return res_str
+    #     # 1. Capture Video
+    #     print("Capturing video...")
+    #     res_str = _executor.call("capture_video", duration=3.0)
+    #     if "Error" in res_str and not res_str.startswith("{"): return res_str
         
-        try:
-            res = json.loads(res_str)
-            if res.get("type") != "video": return f"Error capturing video: {res_str[:100]}"
-            frames = res.get("frames", [])
-            if not frames: return "Error: No frames in video."
-        except json.JSONDecodeError:
-            return f"Error parsing video response: {res_str[:100]}"
+    #     try:
+    #         res = json.loads(res_str)
+    #         if res.get("type") != "video": return f"Error capturing video: {res_str[:100]}"
+    #         frames = res.get("frames", [])
+    #         if not frames: return "Error: No frames in video."
+    #     except json.JSONDecodeError:
+    #         return f"Error parsing video response: {res_str[:100]}"
 
-        # 2. Save Frames to Temp Dir
-        timestamp = datetime.now().strftime("%H%M%S")
-        temp_dir = LOG_DIR / "tracking" / f"temp_{timestamp}"
-        temp_dir.mkdir(parents=True, exist_ok=True)
+    #     # 2. Save Frames to Temp Dir
+    #     timestamp = datetime.now().strftime("%H%M%S")
+    #     temp_dir = LOG_DIR / "tracking" / f"temp_{timestamp}"
+    #     temp_dir.mkdir(parents=True, exist_ok=True)
         
-        saved_frames = []
-        for i, b64 in enumerate(frames):
-            path = temp_dir / f"frame_{i:04d}.jpg"
-            # Decode the base64 string to get the JPEG byte data. 
-            # This is required because the server sends images as base64 strings in JSON.
-            img_data = base64.b64decode(b64)
+    #     saved_frames = []
+    #     for i, b64 in enumerate(frames):
+    #         path = temp_dir / f"frame_{i:04d}.jpg"
+    #         # Decode the base64 string to get the JPEG byte data. 
+    #         # This is required because the server sends images as base64 strings in JSON.
+    #         img_data = base64.b64decode(b64)
             
-            # Use PIL to save, which handles/fixes truncated JPEGs gracefully.
-            # This "cleans" the file structure so OpenCV won't complain about corruption.
-            try:
-                with Image.open(io.BytesIO(img_data)) as img:
-                    img.save(path, quality=95)  # High quality JPEG
-            except Exception as e:
-                # Fallback if image is too broken even for PIL
-                print(f"Warning: PIL failed to clean frame {i}: {e}. Saving raw.")
-                with open(path, "wb") as f:
-                    f.write(img_data)
+    #         # Use PIL to save, which handles/fixes truncated JPEGs gracefully.
+    #         # This "cleans" the file structure so OpenCV won't complain about corruption.
+    #         try:
+    #             with Image.open(io.BytesIO(img_data)) as img:
+    #                 img.save(path, quality=95)  # High quality JPEG
+    #         except Exception as e:
+    #             # Fallback if image is too broken even for PIL
+    #             print(f"Warning: PIL failed to clean frame {i}: {e}. Saving raw.")
+    #             with open(path, "wb") as f:
+    #                 f.write(img_data)
             
-            saved_frames.append(path)
+    #         saved_frames.append(path)
             
-        # 3. Ground in First Frame
-        print("Locating object in first frame...")
-        # Re-read the first frame from disk to ensure we use the 'fixed' version
-        with open(saved_frames[0], "rb") as f:
-            first_frame_data = f.read()
+    #     # 3. Ground in First Frame
+    #     print("Locating object in first frame...")
+    #     # Re-read the first frame from disk to ensure we use the 'fixed' version
+    #     with open(saved_frames[0], "rb") as f:
+    #         first_frame_data = f.read()
 
-        boxes = _grounder.ground_object(first_frame_data, object_description)
+    #     boxes = _grounder.ground_object(first_frame_data, object_description)
         
-        if not boxes:
-            return f"Could not find '{object_description}' in the first frame to start tracking."
+    #     if not boxes:
+    #         return f"Could not find '{object_description}' in the first frame to start tracking."
             
-        # Select best box (first one)
-        init_box = boxes[0]['box_2d']
+    #     # Select best box (first one)
+    #     init_box = boxes[0]['box_2d']
         
-        # 4. Track
-        print("Running SAM 2 Tracking...")
-        video_output = _tracker.track(str(temp_dir), init_box, object_description)
+    #     # 4. Track
+    #     print("Running SAM 2 Tracking...")
+    #     video_output = _tracker.track(str(temp_dir), init_box, object_description)
         
-        # Explicitly print the location for the user
-        print(f"\n[SUCCESS] Tracking Video Saved to: {video_output}\n")
-        get_logger().info(f"Tracking Video Saved to: {video_output}")
+    #     # Explicitly print the location for the user
+    #     print(f"\n[SUCCESS] Tracking Video Saved to: {video_output}\n")
+    #     get_logger().info(f"Tracking Video Saved to: {video_output}")
         
-        return f"Tracking completed. Output video: {video_output}"
+    #     return f"Tracking completed. Output video: {video_output}"
 
     def create_tracking_video(object_description: str):
         """
@@ -530,8 +530,16 @@ def _get_tools(executor, grounder, tracker):
 
     def visual_servo_to_object(object_description: str):
         """
-        Rotates the controller (modifies yaw/pitch) so that the 'blue VR controller ray' aligns with the center of the specified target object.
-        Use this when the user asks to 'align', 'point', or 'aim' the controller or its ray at something.
+        AUTOMATED INTERACTION: Rotates the controller to align the 'blue VR controller ray' with the target object AND clicks the trigger once aligned.
+        
+        Use this tool whenever the user asks to:
+        - "Click on [object]"
+        - "Select [object]"
+        - "Shoot [object]"
+        - "Aim at [object]"
+        
+        Args:
+            object_description: The visual description of the object to click (e.g., "steam logo", "red cup").
         """
         _log_action("visual_servo_to_object", description=object_description)
         logger = get_logger()
@@ -603,29 +611,41 @@ def _get_tools(executor, grounder, tracker):
              return f"Failed to find both the controller ray and '{object_description}' in the initial view. Cannot start servoing."
              
         print("Initial grounding successful. Starting control loop.")
+        last_img_bytes = img_bytes
 
         # 4. Control Loop
         for i in range(MAX_ITER):
             print(f"\n--- Servo Iteration {i+1}/{MAX_ITER} ---")
             
-            # A. Capture New Image
-            res = _executor.call("inspect_surroundings")
-            if isinstance(res, str) and res.startswith("Error"):
-                print("Capture failed in loop.")
-                break
-                
-            try:
+
+            img_changed = False
+            for attempt in range(3):
+
+                # A. Capture New Image
+                res = _executor.call("inspect_surroundings")
                 data = json.loads(res).get("data")
                 img_bytes_loop = base64.b64decode(data)
-                pil_img_loop = Image.open(io.BytesIO(img_bytes_loop)).convert("RGB")
-                img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR) # For Vis
-            except Exception as e:
-                print(f"Image parse error in loop: {e}")
-                break
+
+                # Check if the image is identical to previous (stuck)
+                if img_bytes_loop != last_img_bytes:
+                    img_changed = True
+                    last_img_bytes = img_bytes_loop
+                    break
+
+                print(f"   [Wait] Frame unchanged (attempt {attempt+1})...")
+                time.sleep(0.5) # Wait for VR render
+
+            if not img_changed:
+                print("   [Error] Image did not change after multiple attempts. Aborting servo.")
+                return "Visual servoing aborted: VR view did not change."
+
+
+            pil_img_loop = Image.open(io.BytesIO(img_bytes_loop)).convert("RGB")
+            img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR) # For Vis
+
 
             # B. SAM Tracking (Update state with new image)
             inference_state = _tracker.processor.set_image(pil_img_loop)
-            
             points = {}
             
             for key, desc in targets.items():
@@ -697,27 +717,32 @@ def _get_tools(executor, grounder, tracker):
                 
                 # Save debug image with telemetry
                 cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
-                
-                # Prepare info text
-                # We calculate PID terms here just for display before applying them
-                d_yaw_disp = Kp_YAW * dx
-                d_pitch_disp = Kp_PITCH * dy
-                info_text = f"Err: {dist:.1f}px | dYaw: {d_yaw_disp:.2f} | dPitch: {d_pitch_disp:.2f}"
-                
-                # Draw text background
-                (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                cv2.rectangle(img_cv, (10, 10), (10 + tw + 10, 10 + th + 10), (0, 0, 0), -1)
-                cv2.putText(img_cv, info_text, (15, 15 + th), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
                 timestamp = datetime.now().strftime("%H%M%S")
                 debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
                 cv2.imwrite(str(debug_path), img_cv)
-                logger.info(f"Saved servo debug image: {debug_path}")
-                
+
+                 
                 if dist < TOLERANCE_PX:
+                    print(f"Target aligned (Dist: {dist:.2f}). Clicking Trigger...")
+                    _executor.call("click_button", controller="controller2", button="trigger")
                     return f"Visual Servoing Complete. Aligned with {object_description} (Error: {dist:.2f}px)."
                 
+                
+                # Prepare info text
+                # We calculate PID terms here just for display before applying them
+                # d_yaw_disp = Kp_YAW * dx
+                # d_pitch_disp = Kp_PITCH * dy
+                # info_text = f"Err: {dist:.1f}px | dYaw: {d_yaw_disp:.2f} | dPitch: {d_pitch_disp:.2f}"
+                
+                # # Draw text background
+                # (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                # cv2.rectangle(img_cv, (10, 10), (10 + tw + 10, 10 + th + 10), (0, 0, 0), -1)
+                # cv2.putText(img_cv, info_text, (15, 15 + th), 
+                #            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                
+                
+                logger.info(f"Saved servo debug image: {debug_path}")
+               
                 # PID
                 # INVERTED LOGIC: Previous test showed error increasing with positive gain.
                 # If dx < 0 (Target Left), we need to move Left. 
@@ -735,7 +760,7 @@ def _get_tools(executor, grounder, tracker):
                                pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
                                
                 # Short wait for physical movement
-                time.sleep(0.1)
+                time.sleep(0.5)
                 
                 # Check actual rotation
                 status_check = _executor.call("get_current_pose", device="controller2")
@@ -923,7 +948,8 @@ def _get_tools(executor, grounder, tracker):
         # Vision
         inspect_surroundings, locate_object, capture_video, 
         # Tracking
-        track_object, track_multiple_items, visual_servo_to_object, create_tracking_video, 
+        # track_object, 
+        track_multiple_items, visual_servo_to_object, create_tracking_video, 
         # Controller Positioning
         reset_controller_positions, position_controller_relative_to_headset,
         # Button/Input Controls
@@ -964,28 +990,22 @@ class GeminiAgent:
         RULES:
         1. Always locate objects before interacting with them.
         2. Use `locate_object` for single items.
-        3. Use `track_multiple_items` if the user asks to track specifically multiple things (e.g., "Track the cup and the bottle").
-        4. Use `visual_servo_to_object` to ALIGN or POINT the controller/ray at an object.
+
         5. TRANSLATE 2D coordinates to 3D moves:
            - Object is Left (x < 0.5) -> Move Left (dx < 0).
            - Object is Right (x > 0.5) -> Move Right (dx > 0).
         6. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
         7. When done, call `finish_task`.
         
+        CRITICAL INTERACTION RULE:
+        - If the user asks to "CLICK ON", "SELECT", or "SHOOT" something in the world (e.g., "click the steam logo"), you MUST use `visual_servo_to_object`. 
+        - NEVER use `click_button` for these requests. `click_button` blindly presses the button without aiming. 
+        - Only use `click_button` if the user specifically names a button (e.g., "press the A button").
+        
         CONTROLLER INPUT TOOLS:
-        - Use `click_button(controller, button)` to click a button (quick press and release).
-        - Use `press_button(controller, button)` to hold a button down.
-        - Use `release_button(controller, button)` to release a held button.
-        - Buttons: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
-        - Use `set_trigger(controller, value)` for analog trigger (0.0-1.0).
-        - Use `set_joystick(controller, x, y)` for joystick position (-1.0 to 1.0).
-        - Use `move_joystick_direction(controller, direction)` for easy movement ("up", "down", "left", "right", "forward", "backward").
-        - Use `perform_grab(controller)` to grab objects (presses grip+trigger).
-        - Use `perform_release(controller)` to release grabbed objects.
-        - Use `release_all_inputs(controller)` to reset all buttons/joystick.
-        - Use `get_controller_state(controller)` to check current button states.
-        - Use `get_current_pose(device)` to get position/rotation of headset or controllers.
-        - Use `reset_controller_positions()` to reset controllers to natural positions.
+        - Use `visual_servo_to_object` for ALL aiming and clicking tasks.
+        - Use `set_joystick` for movement.
+        - Use `perform_grab` to grab objects.
         """
         
         self.chat = self.client.chats.create(
@@ -994,8 +1014,11 @@ class GeminiAgent:
                 system_instruction=system_prompt,
                 tools=self.tools,
                 max_output_tokens=2048,
-                temperature=0.5,
-                automatic_function_calling=dict(disable=False) 
+                temperature=1.0,
+                # automatic_function_calling=dict(disable=False) 
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                    disable=False,
+                    maximum_remote_calls=5,)
             )
         )
         

@@ -1,0 +1,75 @@
+{
+    "jsonid": "input_profile",
+    "controller_type": "vive_controller",
+    "input_source": {
+        "/input/system": {
+            "type": "button",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        },
+        "/input/application_menu": {
+            "type": "button",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        },
+        "/input/grip": {
+            "type": "button",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        },
+        "/input/a": {
+            "type": "button",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        },
+        "/input/b": {
+            "type": "button",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        },
+        "/input/trigger": {
+            "type": "trigger",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        },
+        "/input/trackpad": {
+            "type": "trackpad",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        },
+        "/output/haptic": {
+            "type": "haptic",
+            "binding_image_point": [
+                0,
+                0
+            ]
+        }
+    },
+    "compatibility": {
+        "priority": 100,
+        "bindings": {
+            "/input/system/click": "system",
+            "/input/application_menu/click": "application_menu",
+            "/input/grip/click": "grip",
+            "/input/trigger/value": "trigger",
+            "/input/trackpad/x": "trackpad_x",
+            "/input/trackpad/y": "trackpad_y",
+            "/input/trackpad/click": "trackpad_click",
+            "/input/trackpad/touch": "trackpad_touch"
+        }
+    }
+}

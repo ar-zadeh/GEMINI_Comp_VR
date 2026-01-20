@@ -58,5 +58,18 @@
             0
          ]
       }
+   },
+   "compatibility": {
+      "priority": 100,
+      "bindings": {
+         "/input/system/click": "system",
+         "/input/application_menu/click": "application_menu",
+         "/input/grip/click": "grip",
+         "/input/trigger/value": "trigger",
+         "/input/trackpad/x": "trackpad_x",
+         "/input/trackpad/y": "trackpad_y",
+         "/input/trackpad/click": "trackpad_click",
+         "/input/trackpad/touch": "trackpad_touch"
+      }
    }
 }

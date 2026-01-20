@@ -126,7 +126,8 @@ vr::EVRInitError CSampleControllerDriver::Activate(vr::TrackedDeviceIndex_t unOb
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/x/click", &HButtons[9]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/y/click", &HButtons[10]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trigger/click", &HButtons[11]);
-    vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trigger/value", &HButtons[12]);
+    // REMOVED: Erroneous boolean component for trigger value
+    // vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trigger/value", &HButtons[12]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trackpad/click", &HButtons[13]);
     vr::VRDriverInput()->CreateBooleanComponent(m_ulPropertyContainer, "/input/trackpad/touch", &HButtons[14]);
 
@@ -309,7 +310,8 @@ void CSampleControllerDriver::RunFrame() {
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], dpadEnabled && (0x8000 & GetAsyncKeyState('U')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], dpadEnabled && (0x8000 & GetAsyncKeyState('P')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], dpadEnabled && (0x8000 & GetAsyncKeyState('A')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('D')) != 0, 0);
+        // REMOVED: HButtons[12] update
+        // vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('D')) != 0, 0);
 
         // Analog inputs - TCP or keyboard
         if (useKeyboard) {
@@ -356,7 +358,8 @@ void CSampleControllerDriver::RunFrame() {
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[6], dpadEnabled && (0x8000 & GetAsyncKeyState('C')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[9], dpadEnabled && (0x8000 & GetAsyncKeyState('N')) != 0, 0);
         vr::VRDriverInput()->UpdateBooleanComponent(HButtons[10], dpadEnabled && (0x8000 & GetAsyncKeyState('M')) != 0, 0);
-        vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('2')) != 0, 0);
+        // REMOVED: HButtons[12] update
+        // vr::VRDriverInput()->UpdateBooleanComponent(HButtons[12], dpadEnabled && (0x8000 & GetAsyncKeyState('2')) != 0, 0);
 
         // Analog inputs
         if (useKeyboard) {

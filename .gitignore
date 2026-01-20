@@ -22,3 +22,5 @@ OpenEye/checkpoints/
 *.pt
 *.pth
 *.onnx
+sam3/
+Depth-Anything-3/

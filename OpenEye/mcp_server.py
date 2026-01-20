@@ -121,7 +121,7 @@ def broadcast_state():
             # Add input state for controllers
             if device in controller_inputs:
                 msg["input"] = controller_inputs[device]
-            messages.append(json.dumps(msg) + '\n')
+            messages.append(json.dumps(msg, separators=(',', ':')) + '\n')
         
         for client in clients:
             try:
@@ -160,7 +160,7 @@ def send_device_update(device: str):
         msg["send_ts"] = send_ts.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
         print(f"[SEND] {device} at {msg['send_ts']}")
         
-        payload = json.dumps(msg) + '\n'
+        payload = json.dumps(msg, separators=(',', ':')) + '\n'
         
         active_clients = []
         for client in clients:

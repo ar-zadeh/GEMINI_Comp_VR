@@ -54,8 +54,9 @@ class ObjectTracker:
                 
                 # Build model and processor
                 self.model = build_sam3_image_model(bpe_path=bpe_path)
-                self.processor = Sam3Processor(self.model, confidence_threshold=0.85)
-                logger.info("SAM 3 Model initialized.")
+                # User requested higher confidence to prevent tracking swaps
+                self.processor = Sam3Processor(self.model, confidence_threshold=0.92)
+                logger.info("SAM 3 Model initialized with confidence 0.92.")
             except Exception as e:
                 logger.error(f"Failed to init SAM 3: {e}")
                 self.available = False
@@ -290,11 +291,77 @@ class ObjectTracker:
                 logger.info(f"Saved grounding to {filename}")
             except Exception as e:
                 logger.error(f"CV2 draw failed: {e}")
-    def track_multi_objects(self, video_path: str, initial_data: Dict[str, List[float]]) -> Dict[str, Any]:
+    def segment_with_text(self, image_data: bytes, text_prompt: str) -> Dict[str, Any]:
+        """
+        Segment an object in an image using a text prompt.
+        
+        Args:
+            image_data: JPEG image bytes
+            text_prompt: Text description of the object to segment
+            
+        Returns:
+            Dict with keys: 'mask' (numpy boolean array), 'box_2d' (normalized [ymin, xmin, ymax, xmax])
+        """
+        if not self.available or not self.processor:
+            return {}
+        
+        try:
+            pil_image = Image.open(io.BytesIO(image_data)).convert("RGB")
+            w, h = pil_image.size
+            
+            inference_state = self.processor.set_image(pil_image)
+            self.processor.reset_all_prompts(inference_state)
+            
+            inference_state = self.processor.set_text_prompt(
+                state=inference_state,
+                prompt=text_prompt.strip()
+            )
+            
+            # Get masks
+            masks = inference_state.get("masks", [])
+            
+            if masks is not None and len(masks) > 0:
+                mask = masks.detach().cpu().numpy() > 0.5
+                if mask.ndim == 4: mask = mask[0, 0]
+                elif mask.ndim == 3: mask = mask[0]
+                
+                # Calculate bounding box
+                rows = np.any(mask, axis=1)
+                cols = np.any(mask, axis=0)
+                
+                if rows.any() and cols.any():
+                    rmin, rmax = np.where(rows)[0][[0, -1]]
+                    cmin, cmax = np.where(cols)[0][[0, -1]]
+                    
+                    # Log visualization
+                    timestamp = datetime.now().strftime("%H%M%S")
+                    debug_path = self.log_dir / f"seg_text_{timestamp}_{text_prompt}.jpg"
+                    
+                    # Convert overlay
+                    if CV2_AVAILABLE:
+                        import cv2
+                        img = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+                        img[mask] = [0, 0, 255] # Red overlay
+                        cv2.rectangle(img, (cmin, rmin), (cmax, rmax), (0, 255, 0), 2)
+                        cv2.imwrite(str(debug_path), img)
+                    
+                    return {
+                        "mask": mask,
+                        "box_2d": [rmin/h, cmin/w, rmax/h, cmax/w] # Normalized
+                    }
+            
+            return {}
+            
+        except Exception as e:
+            logger.error(f"Text segmentation failed: {e}")
+            return {}
+
+    def track_multi_objects(self, video_path: str, prompts: Dict[int, Dict[str, List[float]]]) -> Dict[str, Any]:
         """
         Track multiple objects in a video.
         video_path: Directory of frames.
-        initial_data: Dict mapping 'label' -> [ymin, xmin, ymax, xmax] (normalized)
+        prompts: Dict mapping frame_index -> { 'label': [ymin, xmin, ymax, xmax] (normalized) }
+                 Prompts at frame i are added to the tracking list.
 
         Returns:
             Dict containing:
@@ -317,24 +384,12 @@ class ObjectTracker:
             h, w = first_frame.shape[:2]
             
             # Setup output video
-            timestamp = 0 # timestamp logic if needed
             output_path = self.log_dir / f"tracked_multi.mp4"
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(str(output_path), fourcc, 10, (w, h))
 
-            # Initialize states for each object
-            # For simplicity, we'll re-run inference for each object per frame 
-            # (Independent tracking) as SAM3 multi-object API is more complex to setup here.
-            # We maintain current boxes for each object.
-            
-            # Convert normalized boxes to pixel [x, y, w, h]
+            # Current boxes stores the state for tracking: {label: [x, y, w, h]}
             current_boxes = {}
-            for label, box in initial_data.items():
-                ymin, xmin, ymax, xmax = box
-                current_boxes[label] = [
-                    xmin * w, ymin * h, 
-                    (xmax - xmin) * w, (ymax - ymin) * h
-                ]
             
             telemetry_data = [] # List of frame data
             
@@ -342,14 +397,32 @@ class ObjectTracker:
                 0: (0, 255, 0),   # Green
                 1: (0, 0, 255),   # Red
                 2: (255, 0, 0),   # Blue
-                3: (0, 255, 255)  # Yellow
+                3: (0, 255, 255), # Yellow
+                4: (255, 0, 255), # Magenta
+                5: (255, 255, 0)  # Cyan
             }
+            
+            # Track assigned colors
+            label_colors = {}
+            color_idx = 0
 
             for i, frame_file in enumerate(frame_files):
                 # Use PIL to read the file first to fix truncation/corruption, then feed to OpenCV
                 pil_image_raw = Image.open(frame_file)
                 pil_image = pil_image_raw.convert("RGB") # Ensure RGB for SAM
                 frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR) # Convert to BGR for OpenCV viz
+
+                # Check for new prompts for this frame
+                if i in prompts:
+                    for label, box in prompts[i].items():
+                        ymin, xmin, ymax, xmax = box
+                        current_boxes[label] = [
+                            xmin * w, ymin * h, 
+                            (xmax - xmin) * w, (ymax - ymin) * h
+                        ]
+                        if label not in label_colors:
+                            label_colors[label] = colors.get(color_idx % 6, (255, 255, 255))
+                            color_idx += 1
 
                 # We need to set image ONCE per frame
                 inference_state = self.processor.set_image(pil_image)
@@ -359,7 +432,9 @@ class ObjectTracker:
                 # For visualization blending
                 vis_frame = frame.copy()
                 
-                for idx, (label, box_rect) in enumerate(current_boxes.items()):
+                # Iterate over a copy of keys since we might delete lost objects (optional, or just keep trying)
+                for label in list(current_boxes.keys()):
+                    box_rect = current_boxes[label]
                     box_x, box_y, box_w, box_h = box_rect
                     
                     # Prepare box
@@ -408,7 +483,7 @@ class ObjectTracker:
                             mask_found = True
                             
                             # Viz Mask
-                            color = colors.get(idx % 4, (255, 255, 255))
+                            color = label_colors.get(label, (255, 255, 255))
                             vis_frame[mask] = color # Simple overlay
                             
                             # Viz Box & Label

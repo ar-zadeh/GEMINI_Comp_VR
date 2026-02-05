@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
-Gemini VR Agent - Simplified Single-Agent Architecture
-Uses Google GenAI SDK for native tool calling and state management.
+Gemini VR Agent - Multi-Model Architecture (v2)
+Changes from v1:
+- Implements specific Gemini models for distinct phases:
+  - Planning: gemini-3-flash-preview (Fast, structured plans)
+  - Grounding: gemini-robotics-er-1.5-preview (Specialized 2D spatial reasoning)
+  - Verification: gemini-2.5-pro (High-reasoning validation)
+  - Description: gemini-2.5-flash-lite-preview-09-2025 (Visual description)
+- Introduced ActionPlanner and Verifier classes.
+- Updated VisualGrounder to strictly use Robotics-ER 1.5 formats.
 """
 
 import os
@@ -22,11 +29,12 @@ import math
 import shutil
 import cv2
 import numpy as np
+from pydantic import BaseModel, Field
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# Allow loading truncated images (fixes issues with simple MJPEG streams)
+# Allow loading truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Import Object Tracker
@@ -50,7 +58,7 @@ except ImportError:
     print("Please install google-genai: pip install google-genai")
     exit(1)
 
-# OpenCV for drawing (optional but preferred)
+# OpenCV availability
 try:
     import cv2
     import numpy as np
@@ -59,8 +67,12 @@ except ImportError:
     CV2_AVAILABLE = False
 
 # --- CONFIG ---
-GEMINI_MODEL = "gemini-3-flash-preview"  # User requested "Flash 3.0" (mapping to latest 2.0 Flash Exp)
-LOG_DIR = Path("agent_logs")
+MODEL_PLANNER = "gemini-3-flash-preview"
+MODEL_GROUNDING = "gemini-3-pro-preview"
+MODEL_VERIFICATION = "gemini-2.5-pro" 
+MODEL_DESCRIPTION = "gemini-2.5-flash-lite-preview-09-2025"
+
+LOG_DIR = Path("agent_logs_v2")
 SHOW_VISION_PREVIEW = False
 
 # ============================================================================
@@ -97,22 +109,23 @@ def get_logger():
     return _logger
 
 # ============================================================================
-# VISUAL GROUNDING
+# VISUAL GROUNDING (Gemini 3 Flash)
 # ============================================================================
 
 class VisualGrounder:
-    """Handles object detection using Gemini."""
-    def __init__(self, client, model_name: str, log_dir: Path):
+    """Handles object detection using Gemini 3 Flash."""
+    def __init__(self, client, log_dir: Path):
         self.client = client
-        self.model_name = model_name
+        self.model_name = MODEL_GROUNDING
         self.log_dir = log_dir / "grounding"
         self.log_dir.mkdir(exist_ok=True, parents=True)
 
     def ground_multiple_objects(self, image_data: bytes, object_names: List[str]) -> Dict[str, List[float]]:
         logger = get_logger()
         objects_str = ", ".join(object_names)
-        logger.info(f"Grounding Multiple: '{objects_str}'")
+        logger.info(f"Grounding Multiple (Gemini 3 Flash): '{objects_str}'")
         
+        # Specific Prompt Format for Gemini 3 Flash (Bounding Box)
         prompt = f"""
         Find the following objects in the image: {objects_str}.
         
@@ -130,19 +143,24 @@ class VisualGrounder:
         1. ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
         2. Only return objects you are confident you see.
         """
+
+        class Detection(BaseModel):
+            label: str = Field(description="The exact name of the object found.")
+            coordinates: List[float] = Field(description="Normalized coordinates [ymin, xmin, ymax, xmax].")
+
+        class GroundingResponse(BaseModel):
+            thinking: str = Field(description="Reasoning about the scene and object locations.")
+            detections: List[Detection] = Field(description="List of detected objects.")
         
         try:
-            # 1. robust image loading (fixes Corrupt JPEG errors)
+            # 1. robust image loading
             try:
-                pil_img = Image.open(io.BytesIO(image_data))
-                # Convert to RGB to ensure compatibility
-                pil_img = pil_img.convert("RGB")
-                # Save to a clean buffer
+                pil_img = Image.open(io.BytesIO(image_data)).convert("RGB")
                 out_buffer = io.BytesIO()
-                pil_img.save(out_buffer, format="JPEG")
+                pil_img.save(out_buffer, format="JPEG", quality=100)
                 clean_image_data = out_buffer.getvalue()
             except Exception as e:
-                logger.warning(f"Image cleaning failed, using raw bytes: {e}")
+                logger.warning(f"Image cleaning failed: {e}")
                 clean_image_data = image_data
 
             response = self.client.models.generate_content(
@@ -153,55 +171,52 @@ class VisualGrounder:
                         types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=clean_image_data))
                     ])
                 ],
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json", 
-
-                )
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": GroundingResponse,
+                }
             )
             
-            # 2. Robust JSON Parsing (Strips Markdown)
+            # Robust JSON Parsing (Structured Output)
             if not response.candidates:
                 logger.error(f"Gemini returned NO candidates. Finish reason: {response.prompt_feedback if hasattr(response, 'prompt_feedback') else 'Unknown'}")
                 # Log full response for debugging
                 logger.debug(f"Full Response: {response}")
                 return {}
 
-            if not response.candidates[0].content or not response.candidates[0].content.parts:
-                 logger.error("Gemini candidate content is empty.")
-                 return {}
-
-            text = response.candidates[0].content.parts[0].text
-            if text.startswith("```"):
-                text = text.split("\n", 1)[-1].rsplit("\n", 1)[0]
-            if text.startswith("json"):
-                text = text[4:]
-            
             try:
-                data = json.loads(text.strip())
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse JSON from Gemini: {e}. Text: {text}")
-                return {}
-            
-            results = {}
-            valid_boxes_for_draw = []
+                # Use Pydantic to validate
+                parsed_response = response.parsed
+                if not parsed_response:
+                     # Fallback to text parsing if .parsed is empty for some reason (rare with config)
+                     parsed_response = GroundingResponse.model_validate_json(response.text)
 
-            for det in data.get("detections", []):
-                label = det.get("label")
-                coords = det.get("coordinates")
-                
-                if label and coords and len(coords) == 4:
-                    # Handle 0-1000 scale correction
-                    if any(c > 1.0 for c in coords):
-                        coords = [c / 1000.0 for c in coords]
+                results = {}
+                valid_boxes_for_draw = []
+
+                for det in parsed_response.detections:
+                    label = det.label
+                    coords = det.coordinates
                     
-                    results[label] = coords
-                    valid_boxes_for_draw.append({"label": label, "box_2d": coords})
+                    if label and coords and len(coords) == 4:
+                        # Handle 0-1000 scale correction
+                        if any(c > 1.0 for c in coords):
+                            coords = [c / 1000.0 for c in coords]
+                        
+                        results[label] = coords
+                        valid_boxes_for_draw.append({"label": label, "box_2d": coords})
 
-            if valid_boxes_for_draw:
-                self._draw_and_save(clean_image_data, valid_boxes_for_draw, f"multi_{len(results)}_objs")
-            else:
-                logger.warning(f"Gemini returned no detections. Raw text: {text[:100]}...")
-                
+                if valid_boxes_for_draw:
+                    self._draw_and_save(clean_image_data, valid_boxes_for_draw, f"multi_{len(results)}_objs")
+                else:
+                    logger.warning(f"Gemini returned no detections. Raw text: {response.text[:100]}...")
+                    
+                return results
+
+            except Exception as e:
+                logger.error(f"Failed to parse JSON with Pydantic: {e}. Text: {response.text}")
+                return {}
+             
             return results
 
         except Exception as e:
@@ -245,6 +260,164 @@ class VisualGrounder:
                 logger.info(f"Saved grounding to {filename}")
             except Exception as e:
                 logger.error(f"CV2 draw failed: {e}")
+
+# ============================================================================
+# PLANNING (Gemini 3 Flash)
+# ============================================================================
+
+@dataclass
+class ActionPlanItem:
+    tool: str
+    args: Dict[str, Any]
+    description: str
+
+class ActionPlanner:
+    """Uses Gemini 3 Flash to create a structured action plan."""
+    def __init__(self, client):
+        self.client = client
+        self.model_name = MODEL_PLANNER
+
+    def create_plan(self, user_request: str) -> List[ActionPlanItem]:
+        logger = get_logger()
+        logger.info(f"Planning for request: {user_request}")
+        
+        prompt = f"""
+        User Request: "{user_request}"
+        
+        You are a VR Agent Planner. Create a sequential list of tools to execute.
+        
+        AVAILABLE TOOLS:
+        1. GROUNDING & TRACKING:
+           - locate_object(object_description) -> Use for single items.
+           - visual_servo_to_object(object_description, controller, ray_description) -> Use to ALIGN or POINT.
+           - track_multiple_items(object_names) -> Use when specific multiple items are requested.
+           - type_text(text, controller) -> Use to type on virtual keyboard.
+           - inspect_surroundings() -> Take a picture.
+           - describe_view(question) -> Describe what is seen.
+           - verify_action(action_description) -> Check if action succeeded.
+        
+        2. CONTROLLER INPUTS (Low-level interaction):
+           - click_button(controller, button) -> Quick press & release.
+           - press_button(controller, button) -> Hold button down.
+           - release_button(controller, button) -> Release held button.
+             * Buttons: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
+           - set_trigger(controller, value) -> Analog trigger (0.0-1.0).
+           - set_joystick(controller, x, y) -> Joystick pos (-1.0 to 1.0).
+           - move_joystick_direction(controller, direction) -> "up", "down", "left", "right", "forward", "backward".
+           - perform_grab(controller) -> Grab object (grip+trigger).
+           - perform_release(controller) -> Release object.
+           - release_all_inputs(controller) -> Reset all.
+           - get_controller_state(controller) -> Check state.
+           - reset_controller_positions() -> Reset virtual hands.
+           - open_menu_sequence() -> Set positions and open menu.
+        
+        CONTROLLER DEFINITIONS:
+        - controller1: LEFT
+        - controller2: RIGHT
+        
+        Return STRICT JSON format:
+        {{
+            "plan": [
+                {{ "tool": "tool_name", "args": {{ "arg1": "val1" }}, "description": "Why this step?" }}
+            ]
+        }}
+        """
+
+        class PlanItem(BaseModel):
+            tool: str = Field(description="The name of the tool to call.")
+            args: str = Field(description="The arguments for the tool as a valid JSON object string (e.g. '{\"arg1\": \"value\"}').")
+            description: str = Field(description="Description of why this step is being taken.")
+
+        class PlanResponse(BaseModel):
+            plan: List[PlanItem] = Field(description="Sequential list of actions.")
+
+        
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": PlanResponse
+                }
+            )
+            
+            # Pydantic Parsing
+            try:
+                parsed = response.parsed
+                if not parsed:
+                    parsed = PlanResponse.model_validate_json(response.text)
+            except Exception as e:
+                logger.error(f"Plan validation failed: {e}. Text: {response.text}")
+                return []
+            
+            plan = []
+            for item in parsed.plan:
+                # Parse the JSON string args back to dict
+                try:
+                    args_dict = json.loads(item.args)
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to parse args json: {item.args}. Using empty dict.")
+                    args_dict = {}
+
+                plan.append(ActionPlanItem(
+                    tool=item.tool,
+                    args=args_dict,
+                    description=item.description
+                ))
+            return plan
+            
+        except Exception as e:
+            logger.error(f"Planning failed: {e}")
+            return []
+
+# ============================================================================
+# VERIFICATION (Gemini 2.5 Pro)
+# ============================================================================
+
+class Verifier:
+    """Uses Gemini 2.5 Pro to verify actions."""
+    def __init__(self, client):
+        self.client = client
+        self.model_name = MODEL_VERIFICATION
+
+    def verify(self, image_data: bytes, action_description: str) -> str:
+        prompt = f"""
+        Verify if the following action was successful based on the image:
+        Action: "{action_description}"
+        
+        Be critical. If you see failure, explain why. If success, confirm it.
+        """
+        
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[types.Content(role="user", parts=[
+                types.Part(text=prompt),
+                types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_data))
+            ])]
+        )
+        return response.text
+
+# ============================================================================
+# DESCRIPTION (Gemini 2.5 Flash Lite)
+# ============================================================================
+
+class Describer:
+    """Uses Gemini 2.5 Flash Lite for scene description."""
+    def __init__(self, client):
+        self.client = client
+        self.model_name = MODEL_DESCRIPTION
+        
+    def describe(self, image_data: bytes, question: str) -> str:
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[types.Content(role="user", parts=[
+                types.Part(text=question),
+                types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_data))
+            ])]
+        )
+        return response.text
+
 # ============================================================================
 # EXECUTOR
 # ============================================================================
@@ -1249,6 +1422,25 @@ Rules:
         _log_action("reset_controller_positions")
         return _executor.call("reset_controller_positions")
 
+    def open_menu_sequence():
+        """
+        Sets rigid positions for headset and controllers and opens menu.
+        """
+        _log_action("open_menu_sequence")
+        # Headset
+        move_absolute("headset", 0, 1.5, 0)
+        rotate_device("headset", 0, 0, 0)
+        
+        # Controller 1
+        move_absolute("controller1", -0.18, 1.2, -0.7)
+        rotate_device("controller1", 90, 0, 0)
+        
+        # Controller 2
+        move_absolute("controller2", 0.18, 1.2, -0.7)
+        rotate_device("controller2", 30, 0, 0)
+        
+        return click_button("controller1", "menu")
+
     def position_controller_relative_to_headset(
         controller: str, 
         forward: float = -0.3, 
@@ -1277,7 +1469,7 @@ Rules:
         # Tracking
         track_object, track_multiple_items, visual_servo_to_object, create_tracking_video, type_text, 
         # Controller Positioning
-        reset_controller_positions, position_controller_relative_to_headset,
+        reset_controller_positions, position_controller_relative_to_headset, open_menu_sequence,
         # Button/Input Controls
         press_button, release_button, click_button, set_trigger,
         set_joystick, move_joystick_direction,
@@ -1287,7 +1479,7 @@ Rules:
         finish_task, get_connection_status, kill_address
     ]
 # ============================================================================
-# AGENT
+# AGENT (Multi-Model Orchestrator)
 # ============================================================================
 
 class GeminiAgent:
@@ -1295,93 +1487,98 @@ class GeminiAgent:
         self.api_key = os.environ.get("GEMINI_API_KEY")
         if not self.api_key: raise ValueError("GEMINI_API_KEY not set")
         
+        # Clients for different models
         self.client = genai.Client(api_key=self.api_key, http_options={'api_version': 'v1alpha'})
         self.logger = get_logger()
         
+        # Initialize Core Components
         self.executor = DirectMCPExecutor()
-        self.grounder = VisualGrounder(self.client, GEMINI_MODEL, LOG_DIR)
+        self.grounder = VisualGrounder(self.client, LOG_DIR)
+        self.planner = ActionPlanner(self.client)
+        self.verifier = Verifier(self.client)
+        self.describer = Describer(self.client)
         
         if ObjectTracker:
             self.tracker = ObjectTracker(LOG_DIR)
         else:
             self.tracker = None
         
-        # Define tools
+        # Tools (for execution phase)
         self.tools = _get_tools(self.executor, self.grounder, self.tracker)
-        
-        # Create Chat Session
-        system_prompt = """You are an expert VR Agent.
-        You control a headset and two controllers:
-        
-        CONTROLLER DEFINITIONS:
-        - controller1: LEFT controller
-        - controller2: RIGHT controller
-        
-        RULES:
-        1. Always locate objects before interacting with them.
-        2. Use `locate_object` for single items.
-        3. Use `track_multiple_items` if the user asks to track specifically multiple things (e.g., "Track the cup and the bottle").
-        4. Use `visual_servo_to_object` to ALIGN or POINT the controller/ray at an object.
-        5. Use `type_text(text)` when the user wants to TYPE TEXT on a virtual keyboard.
-           - This function grounds all keyboard keys in ONE API call, then aligns and presses each key.
-           - Example: type_text("hello") will type 'h', 'e', 'l', 'l', 'o' sequentially.
-        6. TRANSLATE 2D coordinates to 3D moves:
-           - Object is Left (x < 0.5) -> Move Left (dx < 0).
-           - Object is Right (x > 0.5) -> Move Right (dx > 0).
-        7. BE DECISIVE. Do not keep looking for the same thing. Find it, then MOVE.
-        8. When done, call `finish_task`.
-        
-        CONTROLLER INPUT TOOLS:
-        - Use `click_button(controller, button)` to click a button (quick press and release).
-        - Use `press_button(controller, button)` to hold a button down.
-        - Use `release_button(controller, button)` to release a held button.
-        - Buttons: "trigger", "grip", "menu", "system", "trackpad", "a", "b"
-        - Use `set_trigger(controller, value)` for analog trigger (0.0-1.0).
-        - Use `set_joystick(controller, x, y)` for joystick position (-1.0 to 1.0).
-        - Use `move_joystick_direction(controller, direction)` for easy movement ("up", "down", "left", "right", "forward", "backward").
-        - Use `perform_grab(controller)` to grab objects (presses grip+trigger).
-        - Use `perform_release(controller)` to release grabbed objects.
-        - Use `release_all_inputs(controller)` to reset all buttons/joystick.
-        - Use `get_controller_state(controller)` to check current button states.
-        - Use `get_current_pose(device)` to get position/rotation of headset or controllers.
-        - Use `reset_controller_positions()` to reset controllers to natural positions.
-        """
-        
-        self.chat = self.client.chats.create(
-            model=GEMINI_MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=system_prompt,
-                tools=self.tools,
-                max_output_tokens=2048,
-                temperature=0.5,
-                automatic_function_calling=dict(disable=False) 
-            )
-        )
+        # Create a mapping for manual execution from plan
+        self.tool_map = {t.__name__: t for t in self.tools}
+        self.tool_map["describe_view"] = self._describe_view_tool
+        self.tool_map["verify_action"] = self._verify_action_tool
         
         # Start bridge immediately
         self.executor.call("start_vr_bridge")
         
-    def reset_chat(self):
-        """Reset the chat session."""
-        print("Resetting chat session...")
-        self.chat = self.client.chats.create(
-            model=GEMINI_MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=self.chat._config.system_instruction,
-                tools=self.tools,
-                max_output_tokens=2048,
-                temperature=0.5,
-                automatic_function_calling=dict(disable=False) 
-            )
-        )
-        self.logger.info("Chat session reset.")
-        print("Chat reset.")
+    def _describe_view_tool(self, question: str):
+        """Tool wrapper for description model."""
+        print("Capturing image for description...")
+        res = self.executor.call("inspect_surroundings")
+        try:
+            data = json.loads(res).get("data")
+            img_bytes = base64.b64decode(data)
+            return self.describer.describe(img_bytes, question)
+        except Exception as e:
+            return f"Description failed: {e}"
+
+    def _verify_action_tool(self, action_description: str):
+        """Tool wrapper for verification model."""
+        print("Capturing image for verification...")
+        res = self.executor.call("inspect_surroundings")
+        try:
+            data = json.loads(res).get("data")
+            img_bytes = base64.b64decode(data)
+            return self.verifier.verify(img_bytes, action_description)
+        except Exception as e:
+            return f"Verification failed: {e}"
+
+    def run(self, user_input: str):
+        self.logger.info(f"User: {user_input}")
+        print("\nAgent (Planner) is thinking...")
+        
+        # 1. PLANNING PHASE (Gemini 3 Flash)
+        plan = self.planner.create_plan(user_input)
+        
+        if not plan:
+            print("Failed to generate a plan.")
+            return
+
+        print(f"\nGenerated Plan ({len(plan)} steps):")
+        for i, step in enumerate(plan):
+            print(f"{i+1}. {step.tool}: {step.description}")
+
+        # 2. EXECUTION PHASE
+        print("\nExecuting Plan...")
+        for step in plan:
+            print(f"\n>> Step: {step.tool}({step.args})")
+            func = self.tool_map.get(step.tool)
+            
+            if func:
+                try:
+                    # Execute tool
+                    result = func(**step.args)
+                    print(f"Result: {str(result)[:200]}...")
+                    self.logger.info(f"Step '{step.tool}' Result: {result}")
+                except Exception as e:
+                    print(f"Execution Error: {e}")
+                    self.logger.error(f"Execution Error in {step.tool}: {e}")
+                    break
+            else:
+                print(f"Error: Unknown tool '{step.tool}'")
+
+
 
     def print_status(self):
         """Print current agent status."""
-        print(f"\n--- Status ---")
-        print(f"Model: {GEMINI_MODEL}")
-        print(f"Log Dir: {LOG_DIR}")
+        print(f"\n--- Status (v2 Multi-Model) ---")
+        print(f"Planner: {MODEL_PLANNER}")
+        print(f"Grounding: {MODEL_GROUNDING}")
+        print(f"Verification: {MODEL_VERIFICATION}")
+        print(f"Description: {MODEL_DESCRIPTION}")
+        print(f"Log Dir: {LOG_DIR}")        
         try:
             status = self.executor.call("get_connection_status")
             print(f"VR Bridge: {status}")
@@ -1389,19 +1586,7 @@ class GeminiAgent:
             print(f"VR Bridge: Error getting status ({e})")
         print("--------------")
 
-    def run(self, user_input: str):
-        self.logger.info(f"User: {user_input}")
-        print("\nAgent is thinking...")
-        
-        try:
-            # Send message and let SDK handle tool loop
-            response = self.chat.send_message(user_input)
-            print(f"\nAgent: {response.text}")
-            self.logger.info(f"Agent: {response.text}")
-            
-        except Exception as e:
-            self.logger.error(f"Error: {e}")
-            traceback.print_exc()
+
 
     def handle_direct_command(self, user_input: str):
         """
@@ -1466,16 +1651,16 @@ class GeminiAgent:
 
             # 2. Check MCP Server directly (underlying functions)
             # This allows calling functions not exposed as agent tools
-            if hasattr(self.executor.module, func_name):
-                func = getattr(self.executor.module, func_name)
-                try:
-                    res = func(*args)
-                    print(f"Result: {res}")
-                    self.logger.info(f"Result: {res}")
-                    return
-                except Exception as e:
-                     print(f"Error executing MCP function '{func_name}': {e}")
-                     return
+                if hasattr(self.executor.module, func_name):
+                    func = getattr(self.executor.module, func_name)
+                    try:
+                        res = func(*args)
+                        print(f"Result: {res}")
+                        self.logger.info(f"Result: {res}")
+                        return
+                    except Exception as e:
+                         print(f"Error executing MCP function '{func_name}': {e}")
+                         return
 
             print(f"Error: Function '{func_name}' not found in Agent Tools or MCP Server.")
 
@@ -1483,14 +1668,13 @@ class GeminiAgent:
             print(f"Failed to execute direct command: {e}")
             traceback.print_exc()
 
-
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == "__main__":
     agent = GeminiAgent()
-    print("VR Agent Ready. Type 'quit' to exit.")
+    print("VR Agent v2 (Multi-Model) Ready. Type 'quit' to exit.")
     
     while True:
         try:
@@ -1500,14 +1684,11 @@ if __name__ == "__main__":
             cmd = user_input.lower()
             if cmd in ['quit', 'exit']:
                 break
-            elif cmd == 'reset':
-                agent.reset_chat()
-                continue
+
             elif cmd == 'status':
                 agent.print_status()
                 continue
                 
-            # Direct Command Check
             if user_input.startswith("((") and user_input.endswith("))"):
                 agent.handle_direct_command(user_input)
                 continue

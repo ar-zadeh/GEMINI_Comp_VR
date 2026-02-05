@@ -66,9 +66,9 @@ mcp = FastMCP("openvr-controller")
 def distance_3d(pos1: List[float], pos2: List[float]) -> float:
     """Calculate 3D distance between two positions."""
     return math.sqrt(
-        (pos1[0] - pos2[0])**2 + 
-        (pos1[1] - pos2[1])**2 + 
-        (pos1[2] - pos2[2])**2
+        (float(pos1[0]) - float(pos2[0]))**2 + 
+        (float(pos1[1]) - float(pos2[1]))**2 + 
+        (float(pos1[2]) - float(pos2[2]))**2
     )
 
 def enforce_controller_tether():
@@ -85,16 +85,16 @@ def enforce_controller_tether():
         
         if dist > MAX_ARM_REACH:
             # Calculate direction from headset to controller
-            dx = ctrl_pos[0] - headset_pos[0]
-            dy = ctrl_pos[1] - headset_pos[1]
-            dz = ctrl_pos[2] - headset_pos[2]
+            dx = float(ctrl_pos[0]) - float(headset_pos[0])
+            dy = float(ctrl_pos[1]) - float(headset_pos[1])
+            dz = float(ctrl_pos[2]) - float(headset_pos[2])
             
             # Normalize and scale to max reach
             scale = MAX_ARM_REACH / dist
             new_pos = [
-                headset_pos[0] + dx * scale,
-                headset_pos[1] + dy * scale,
-                headset_pos[2] + dz * scale
+                float(headset_pos[0]) + dx * scale,
+                float(headset_pos[1]) + dy * scale,
+                float(headset_pos[2]) + dz * scale
             ]
             
             current_poses[ctrl]['pos'] = new_pos
@@ -332,9 +332,12 @@ def look_at(target_x: float, target_y: float, target_z: float) -> str:
     with state_lock:
         hx, hy, hz = current_poses['headset']['pos']
     
-    dx = target_x - hx
-    dy = target_y - hy
-    dz = target_z - hz
+    # Cast inputs to float
+    target_x, target_y, target_z = float(target_x), float(target_y), float(target_z)
+    
+    dx = target_x - float(hx)
+    dy = target_y - float(hy)
+    dz = target_z - float(hz)
     
     yaw = math.degrees(math.atan2(dx, -dz))
     dist = math.sqrt(dx*dx + dz*dz)
@@ -353,7 +356,7 @@ def teleport(device: str, x: float, y: float, z: float) -> str:
         return f"Invalid device. Options: {list(current_poses.keys())}"
     
     with state_lock:
-        current_poses[device]['pos'] = [x, y, z]
+        current_poses[device]['pos'] = [float(x), float(y), float(z)]
     
     broadcast_state()
     return f"{device} teleported to [{x}, {y}, {z}]"
@@ -392,10 +395,13 @@ def walk_path(x: float, z: float, steps: int = 10) -> str:
     with state_lock:
         start_x, start_y, start_z = current_poses['headset']['pos']
         
+    # Cast inputs to float
+    x, z = float(x), float(z)
+    
     for i in range(1, steps + 1):
         t = i / steps
-        curr_x = start_x + (x - start_x) * t
-        curr_z = start_z + (z - start_z) * t
+        curr_x = float(start_x) + (x - float(start_x)) * t
+        curr_z = float(start_z) + (z - float(start_z)) * t
         
         with state_lock:
             current_poses['headset']['pos'] = [curr_x, start_y, curr_z]
@@ -423,7 +429,8 @@ def move_relative(device: str, dx: float = 0, dy: float = 0, dz: float = 0) -> s
     
     with state_lock:
         pos = current_poses[device]['pos']
-        current_poses[device]['pos'] = [pos[0] + dx, pos[1] + dy, pos[2] + dz]
+        dx, dy, dz = float(dx), float(dy), float(dz)
+        current_poses[device]['pos'] = [float(pos[0]) + dx, float(pos[1]) + dy, float(pos[2]) + dz]
         new_pos = current_poses[device]['pos']
     
     broadcast_state()
@@ -454,13 +461,13 @@ def position_controller_relative_to_headset(
     
     with state_lock:
         headset_pos = current_poses['headset']['pos']
-        headset_yaw = math.radians(current_poses['headset']['rot'][1])
+        headset_yaw = math.radians(float(current_poses['headset']['rot'][1]))
         
         # Calculate world-space offset based on headset orientation
         # Forward is -Z in VR, Right is +X
-        world_x = headset_pos[0] + forward * math.sin(headset_yaw) + right * math.cos(headset_yaw)
-        world_y = headset_pos[1] + up
-        world_z = headset_pos[2] + forward * (-math.cos(headset_yaw)) + right * math.sin(headset_yaw)
+        world_x = float(headset_pos[0]) + float(forward) * math.sin(headset_yaw) + float(right) * math.cos(headset_yaw)
+        world_y = float(headset_pos[1]) + float(up)
+        world_z = float(headset_pos[2]) + float(forward) * (-math.cos(headset_yaw)) + float(right) * math.sin(headset_yaw)
         
         current_poses[controller]['pos'] = [world_x, world_y, world_z]
     

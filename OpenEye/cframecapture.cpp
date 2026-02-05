@@ -100,17 +100,13 @@ bool CFrameCapture::FindSteamVRMirrorWindow()
         m_hwndMirror = data.hwndFound;
         m_bUseMirrorWindow = true;
 
-        // Get window dimensions
-        RECT rect;
-        if (GetClientRect(m_hwndMirror, &rect))
-        {
-            m_windowWidth = rect.right - rect.left;
-            m_windowHeight = rect.bottom - rect.top;
-        }
+        // Force fixed capture resolution for consistent quality
+        m_windowWidth = 1200;
+        m_windowHeight = 600;
 
         char title[256];
         GetWindowTextA(m_hwndMirror, title, sizeof(title));
-        DriverLog("CFrameCapture: Using SteamVR mirror window: '%s' (%dx%d)\n", 
+        DriverLog("CFrameCapture: Using SteamVR mirror window: '%s' (forced to %dx%d)\n", 
                   title, m_windowWidth, m_windowHeight);
         return true;
     }

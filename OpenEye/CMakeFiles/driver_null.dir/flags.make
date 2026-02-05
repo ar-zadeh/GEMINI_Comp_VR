@@ -4,7 +4,7 @@
 # compile CXX with /usr/bin/c++
 CXX_DEFINES = -Ddriver_null_EXPORTS
 
-CXX_INCLUDES = -I/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/../../headers
+CXX_INCLUDES = -I/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/../headers
 
 CXX_FLAGS = -fPIC
 

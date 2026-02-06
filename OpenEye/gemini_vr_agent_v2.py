@@ -15,10 +15,15 @@ import os
 import shlex
 import json
 import time
+
+MENU_DATA_FILE = "menu_navigation.json"
+MENU_DATA = {}
 import base64
 import traceback
 import logging
 import threading
+import queue
+import asyncio
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Union
 from dataclasses import dataclass, field
@@ -310,6 +315,7 @@ class ActionPlanner:
            - get_controller_state(controller) -> Check state.
            - reset_controller_positions() -> Reset virtual hands.
            - open_menu_sequence() -> Set positions and open menu.
+           - perform_menu_action(action_name) -> Execute a menu action, user often explicitly mentions the interaction is with the menu.
         
         CONTROLLER DEFINITIONS:
         - controller1: LEFT
@@ -1439,7 +1445,82 @@ Rules:
         move_absolute("controller2", 0.18, 1.2, -0.7)
         rotate_device("controller2", 30, 0, 0)
         
-        return click_button("controller1", "menu")
+        click_button("controller1", "menu")
+
+        _log_action("bring_menu_closer")
+        move_absolute("controller1", -0.18, 1.2, -0.399)
+        rotate_device("controller1", 90, 0, 0)
+        
+        move_absolute("controller2", 0.18, 1.2, -0.7)
+        rotate_device("controller2", 30, 0, 0)
+
+        return "Menu opened successfully"
+
+    def load_menu_navigation():
+        """Loads menu navigation data from JSON file."""
+        global MENU_DATA
+        try:
+            with open(MENU_DATA_FILE, 'r') as f:
+                MENU_DATA = json.load(f)
+            get_logger().info(f"Loaded menu navigation data: {list(MENU_DATA.keys())}")
+        except Exception as e:
+            get_logger().error(f"Failed to load menu navigation data: {e}")
+            MENU_DATA = {}
+
+    def perform_menu_action(action_name: str):
+        """
+        Executes a defined menu action sequence from the loaded JSON date.
+        
+        Args:
+            action_name: The key of the action in menu_navigation.json (e.g., "select_row1_col1")
+        """
+        _log_action("perform_menu_action", action_name=action_name)
+        
+        if not MENU_DATA:
+            load_menu_navigation()
+            
+        if action_name not in MENU_DATA:
+            return f"Error: Menu action '{action_name}' not found."
+            
+        data = MENU_DATA[action_name]
+        
+        # 1. Set Headset Pose
+        if "headset" in data:
+            h_pos = data["headset"]["pos"]
+            h_rot = data["headset"]["rot"]
+            move_absolute("headset", h_pos[0], h_pos[1], h_pos[2])
+            rotate_device("headset", h_rot[0], h_rot[1], h_rot[2])
+            
+        # 2. Set Controller 1 Pose
+        if "controller1" in data:
+            c1_pos = data["controller1"]["pos"]
+            c1_rot = data["controller1"]["rot"]
+            move_absolute("controller1", c1_pos[0], c1_pos[1], c1_pos[2])
+            rotate_device("controller1", c1_rot[0], c1_rot[1], c1_rot[2])
+
+        # 3. Set Controller 2 Pose
+        if "controller2" in data:
+            c2_pos = data["controller2"]["pos"]
+            c2_rot = data["controller2"]["rot"]
+            move_absolute("controller2", c2_pos[0], c2_pos[1], c2_pos[2])
+            rotate_device("controller2", c2_rot[0], c2_rot[1], c2_rot[2])
+            
+        # 4. Perform Action
+        action_type = data.get("action", "click_trigger")
+        # Default to controller2 (Right) if not specified, unless it's open_menu which is usually specific
+        # But per user request, we want to handle specified controllers.
+        
+        # Check for explicit controller in JSON
+        action_controller = data.get("action_controller", "controller2")
+
+        if action_type == "click_trigger":
+            return click_button(action_controller, "trigger")
+        elif action_type == "click_menu":
+            return click_button(action_controller, "menu")
+        elif action_type == "click_grip":
+            return click_button(action_controller, "grip")
+        else:
+            return f"Action sequence '{action_name}' set positions, but unknown action type '{action_type}'"
 
     def position_controller_relative_to_headset(
         controller: str, 
@@ -1461,7 +1542,25 @@ Rules:
         return _executor.call("position_controller_relative_to_headset", 
                              controller=controller, forward=forward, right=right, up=up)
 
-    return [
+    # Generate Dynamic Menu Tools
+    load_menu_navigation()
+    dynamic_menu_tools = []
+    
+    # We need a factory to properly bind the loop variable
+    def create_menu_tool(name):
+        def menu_tool_wrapper():
+            """Executes this specific menu action."""
+            _log_action(name) # Log the specific function name
+            return perform_menu_action(name)
+        menu_tool_wrapper.__name__ = name
+        return menu_tool_wrapper
+
+    if MENU_DATA:
+        for action_key in MENU_DATA:
+            dynamic_menu_tools.append(create_menu_tool(action_key))
+            
+    # Combine all tools
+    all_tools = [
         # Movement & Orientation
         start_bridge, move_relative, move_absolute, teleport, rotate_device, get_current_pose,
         # Vision
@@ -1470,6 +1569,9 @@ Rules:
         track_object, track_multiple_items, visual_servo_to_object, create_tracking_video, type_text, 
         # Controller Positioning
         reset_controller_positions, position_controller_relative_to_headset, open_menu_sequence,
+        perform_menu_action, # Generic handler
+        # Example: select_row1_col1, etc.
+    ] + dynamic_menu_tools + [
         # Button/Input Controls
         press_button, release_button, click_button, set_trigger,
         set_joystick, move_joystick_direction,
@@ -1478,6 +1580,9 @@ Rules:
         # Utility
         finish_task, get_connection_status, kill_address
     ]
+
+    return all_tools
+
 # ============================================================================
 # AGENT (Multi-Model Orchestrator)
 # ============================================================================
@@ -1513,6 +1618,35 @@ class GeminiAgent:
         # Start bridge immediately
         self.executor.call("start_vr_bridge")
         
+        # UI State
+        self.plan = []
+        self.active_action = "Idle"
+        self.verification_status = "PENDING"
+        self.thinking_level = "LOW"
+        self._broadcast_state()
+
+    def _broadcast_state(self, correction_message=None):
+        """Broadcast agent state to WebSocket UI."""
+        if hasattr(self.executor.module, "ws_clients") and hasattr(self.executor.module, "ws_loop"):
+            msg_data = {
+                "type": "agent_state",
+                "plan": [p.description for p in self.plan] if self.plan else [],
+                "activeAction": self.active_action,
+                "verificationStatus": self.verification_status,
+                "thinkingLevel": self.thinking_level,
+                "correctionMessage": correction_message
+            }
+            # Use the module's loop to broadcast
+            try:
+                loop = self.executor.module.ws_loop
+                if loop and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(
+                        self.executor.module.broadcast_ws(json.dumps(msg_data)),
+                        loop
+                    )
+            except Exception as e:
+                print(f"Failed to broadcast agent state: {e}")
+        
     def _describe_view_tool(self, question: str):
         """Tool wrapper for description model."""
         print("Capturing image for description...")
@@ -1540,11 +1674,25 @@ class GeminiAgent:
         print("\nAgent (Planner) is thinking...")
         
         # 1. PLANNING PHASE (Gemini 3 Flash)
+        self.active_action = "Planning..."
+        self.thinking_level = "HIGH"
+        self.verification_status = "VERIFYING"
+        self._broadcast_state()
+        
         plan = self.planner.create_plan(user_input)
+        self.plan = plan
         
         if not plan:
             print("Failed to generate a plan.")
+            self.active_action = "Idle"
+            self.verification_status = "FAILED"
+            self.thinking_level = "LOW"
+            self._broadcast_state("Failed to generate plan")
             return
+
+        self.thinking_level = "MEDIUM"
+        self.verification_status = "SUCCESS"
+        self._broadcast_state()
 
         print(f"\nGenerated Plan ({len(plan)} steps):")
         for i, step in enumerate(plan):
@@ -1552,7 +1700,9 @@ class GeminiAgent:
 
         # 2. EXECUTION PHASE
         print("\nExecuting Plan...")
-        for step in plan:
+        for i, step in enumerate(plan):
+            self.active_action = f"Step {i+1}: {step.tool}"
+            self._broadcast_state()
             print(f"\n>> Step: {step.tool}({step.args})")
             func = self.tool_map.get(step.tool)
             
@@ -1565,9 +1715,16 @@ class GeminiAgent:
                 except Exception as e:
                     print(f"Execution Error: {e}")
                     self.logger.error(f"Execution Error in {step.tool}: {e}")
+                    self.verification_status = "FAILED"
+                    self._broadcast_state(str(e))
                     break
             else:
                 print(f"Error: Unknown tool '{step.tool}'")
+
+        self.active_action = "Idle"
+        self.verification_status = "SUCCESS"
+        self.thinking_level = "LOW"
+        self._broadcast_state()
 
 
 
@@ -1668,19 +1825,44 @@ class GeminiAgent:
             print(f"Failed to execute direct command: {e}")
             traceback.print_exc()
 
+def terminal_input_thread(cmd_queue):
+    """Thread to handle blocking terminal input."""
+    while True:
+        try:
+            line = input("\nYou: ").strip()
+            if line:
+                cmd_queue.put(line)
+        except EOFError:
+            break
+        except Exception:
+            break
+
 # ============================================================================
 # MAIN
 # ============================================================================
 
 if __name__ == "__main__":
     agent = GeminiAgent()
-    print("VR Agent v2 (Multi-Model) Ready. Type 'quit' to exit.")
+    print("VR Agent v2 (Multi-Model) Ready.")
+    print("Waiting for commands (Terminal or WebSocket UI)...")
+    
+    # Access the shared queue from mcp_server
+    cmd_queue = agent.executor.module.command_queue
+    
+    # Start terminal input thread
+    t = threading.Thread(target=terminal_input_thread, args=(cmd_queue,), daemon=True)
+    t.start()
     
     while True:
         try:
-            user_input = input("\nYou: ").strip()
-            if not user_input: continue
+            # Block until a command arrives from either source
+            try:
+                user_input = cmd_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
             
+            if not user_input: continue
+
             cmd = user_input.lower()
             if cmd in ['quit', 'exit']:
                 break
@@ -1694,5 +1876,9 @@ if __name__ == "__main__":
                 continue
 
             agent.run(user_input)
+            
         except KeyboardInterrupt:
             break
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            traceback.print_exc()

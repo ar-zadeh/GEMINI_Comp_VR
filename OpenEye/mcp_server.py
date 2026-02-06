@@ -12,14 +12,34 @@ Run:
 """
 
 import socket
+import sys
 import json
 import threading
+import queue
 import time
 import math
 import base64
 import io
-from typing import Optional, List, Dict, Any
+import asyncio
+import websockets
+try:
+    import openvr
+except ImportError:
+    openvr = None
+    print("Warning: openvr module not found. Real-time tracking will be disabled.")
+
+from typing import Optional, List, Dict, Any, Set
 from mcp.server.fastmcp import FastMCP
+import logging
+
+# Configure logging
+logger = logging.getLogger("mcp_server")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s | %(name)s | %(levelname)s | %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # Configuration
 HOST = '127.0.0.1'
@@ -27,10 +47,27 @@ PORT = 5555
 VISION_TIMEOUT = 30  # seconds to wait for vision response
 MAX_ARM_REACH = 0.8  # Maximum distance controllers can be from headset (meters)
 
+WS_PORT = 8765
 # Thread-safe state
 state_lock = threading.Lock()
-clients: List[socket.socket] = []
-server_running = False
+
+# Share state across re-imports if they exist in sys.modules
+_existing_mcp = sys.modules.get("mcp_server")
+if _existing_mcp and hasattr(_existing_mcp, "clients"):
+    clients = _existing_mcp.clients
+    ws_clients = _existing_mcp.ws_clients
+    server_running = getattr(_existing_mcp, "server_running", False)
+    vision_broadcast_running = getattr(_existing_mcp, "vision_broadcast_running", False)
+    ws_loop = getattr(_existing_mcp, "ws_loop", None)
+    command_queue = getattr(_existing_mcp, "command_queue", queue.Queue())
+else:
+    clients: List[socket.socket] = []
+    ws_clients: Set[websockets.WebSocketServerProtocol] = set()
+    server_running = False
+    vision_broadcast_running = False
+    ws_loop = None
+    command_queue = queue.Queue()
+
 vision_response: Optional[Dict] = None
 vision_event = threading.Event()
 
@@ -99,18 +136,19 @@ def enforce_controller_tether():
             
             current_poses[ctrl]['pos'] = new_pos
 
+# State tracking for noise reduction
+last_ws_state = None
+
 def broadcast_state():
-    """Thread-safe broadcast of state to all connected drivers."""
+    """Thread-safe broadcast of state to all connected drivers and UI."""
+    global last_ws_state
     with state_lock:
         # Enforce controller tethering before broadcasting
         enforce_controller_tether()
         
         active_clients = []
         
-        # Send individual device updates in the format the C++ driver expects:
-        # {"device":"headset","pos":[x,y,z],"rot":[rx,ry,rz]}
-        # For controllers, also include input state:
-        # {"device":"controller1","pos":[...],"rot":[...],"input":{...}}
+        # Build individual device updates for TCP clients
         messages = []
         for device, pose in current_poses.items():
             msg = {
@@ -118,7 +156,6 @@ def broadcast_state():
                 "pos": pose['pos'],
                 "rot": pose['rot']
             }
-            # Add input state for controllers
             if device in controller_inputs:
                 msg["input"] = controller_inputs[device]
             messages.append(json.dumps(msg, separators=(',', ':')) + '\n')
@@ -126,9 +163,6 @@ def broadcast_state():
         for client in clients:
             try:
                 for msg in messages:
-                    # Debug: Log what we're sending for controllers
-                    if '"input"' in msg:
-                        print(f"[BROADCAST] Sending: {msg.strip()}", flush=True)
                     client.sendall(msg.encode('utf-8'))
                 active_clients.append(client)
             except Exception:
@@ -136,6 +170,234 @@ def broadcast_state():
                 except: pass
         
         clients[:] = active_clients
+        
+        # Broadcast to WebSockets only if state changed
+        if ws_clients:
+            # Create a compact state for comparison
+            current_state_summary = {
+                "poses": current_poses,
+                "inputs": controller_inputs
+            }
+            
+            # Use string representation for simple equality check (robust enough for this scale)
+            state_str = json.dumps(current_state_summary, separators=(',', ':'))
+            
+            if state_str != last_ws_state:
+                last_ws_state = state_str
+                msg_data = {
+                    "type": "state_update",
+                    "poses": current_poses,
+                    "inputs": controller_inputs
+                }
+                asyncio.run_coroutine_threadsafe(
+                    broadcast_ws(json.dumps(msg_data)), 
+                    ws_loop
+                )
+
+async def broadcast_ws(message: str):
+    """Broadcast a message to all connected WebSocket clients."""
+    if not ws_clients:
+        return
+    websockets_to_remove = set()
+    for ws in ws_clients:
+        try:
+            # Only print for state updates or if explicitly requested to avoid log spam
+            # if '"state_update"' in message:
+            #     print(f"[WS] Broadcasting state to {ws.remote_address}", flush=True)
+            await ws.send(message)
+        except Exception as e:
+            print(f"[WS] Send failed to {ws.remote_address}: {e}")
+            websockets_to_remove.add(ws)
+    
+    for ws in websockets_to_remove:
+        if ws in ws_clients:
+            ws_clients.remove(ws)
+
+async def ws_handler(websocket):
+    """Handle individual WebSocket connections."""
+    print(f"[WS] Client connected: {websocket.remote_address}")
+    ws_clients.add(websocket)
+    
+    # Send initial state immediately upon connection
+    try:
+        msg_data = {
+            "type": "state_update",
+            "poses": current_poses,
+            "inputs": controller_inputs
+        }
+        await websocket.send(json.dumps(msg_data))
+    except Exception as e:
+        print(f"[WS] Error sending initial state: {e}")
+        
+    try:
+        async for message in websocket:
+            # Handle incoming messages from UI (decisions/requests)
+            try:
+                data = json.loads(message)
+                # print(f"[WS] Received: {data}")
+                
+                msg_type = data.get('type')
+                
+                if msg_type == 'user_request':
+                    # Put request in queue for Agent to process
+                    content = data.get('content')
+                    if content:
+                        command_queue.put(content)
+                        
+                elif msg_type == 'trigger_action':
+                    device = data.get('device')
+                    action = data.get('action')
+                    if device in ['controller1', 'controller2'] and action == 'click':
+                        click_button(device, 'trigger')
+
+                elif msg_type == 'move_relative':
+                    # Handle direct movement control from UI
+                    device = data.get('device')
+                    dx = float(data.get('dx', 0))
+                    dy = float(data.get('dy', 0))
+                    dz = float(data.get('dz', 0))
+                    
+                    if device in current_poses:
+                        move_relative(device, dx, dy, dz)
+                        
+                elif msg_type == 'rotate_relative':
+                    device = data.get('device')
+                    dp = float(data.get('dp', 0))
+                    dy = float(data.get('dy', 0))
+                    dr = float(data.get('dr', 0))
+                    
+                    if device in current_poses:
+                        rotate_relative(device, dp, dy, dr)
+
+                elif msg_type == 'read_pose':
+                    # Returns current poses for all devices in a unified response
+                    with state_lock:
+                        msg_data = {
+                            "type": "pose_data",
+                            "poses": current_poses,
+                            "timestamp": time.time()
+                        }
+                    await websocket.send(json.dumps(msg_data))
+                        
+            except json.JSONDecodeError:
+                pass
+            except Exception as e:
+                print(f"[WS] Error processing message: {e}")
+                
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        print(f"[WS] Client disconnected: {websocket.remote_address}")
+        if websocket in ws_clients:
+            ws_clients.remove(websocket)
+
+ws_loop = None
+def run_ws_server():
+    global ws_loop
+    ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(ws_loop)
+    
+    # Use a try-except block to handle cases where the event loop might be closed
+    async def _start():
+        try:
+            async with websockets.serve(ws_handler, HOST, WS_PORT):
+                logger.info(f"WebSocket Server listening on {HOST}:{WS_PORT}")
+                await asyncio.Future()  # run forever
+        except Exception as e:
+            logger.error(f"WebSocket Server error: {e}")
+
+    try:
+        ws_loop.run_until_complete(_start())
+    except Exception as e:
+        print(f"WebSocket Server Error: {e}")
+
+def run_tracking_loop():
+    """Periodically poll OpenVR for device poses and update current_poses."""
+    if not openvr:
+        return
+        
+    print("[TRACKING] Initializing OpenVR...")
+    try:
+        vr_system = openvr.init(openvr.VRApplication_Background)
+    except Exception as e:
+        print(f"[TRACKING] Failed to initialize OpenVR: {e}")
+        return
+        
+    print("[TRACKING] Loop started.")
+
+    last_broadcast = time.time()
+    
+    while True:
+        try:
+            poses = vr_system.getDeviceToAbsoluteTrackingPose(
+                openvr.TrackingUniverseStanding, 0, openvr.k_unMaxTrackedDeviceCount
+            )
+            
+            with state_lock:
+                for i in range(openvr.k_unMaxTrackedDeviceCount):
+                    device_class = vr_system.getTrackedDeviceClass(i)
+                    
+                    if device_class in [openvr.TrackedDeviceClass_HMD, openvr.TrackedDeviceClass_Controller]:
+                        pose = poses[i]
+                        if pose.bPoseIsValid:
+                            matrix = pose.mDeviceToAbsoluteTracking
+                            
+                            # Extract Position
+                            x = matrix[0][3]
+                            y = matrix[1][3]
+                            z = matrix[2][3]
+                            
+                            # Extract Rotation
+                            # OpenVR -> Euler conversion
+                            yaw = math.degrees(math.atan2(matrix[0][2], matrix[2][2]))
+                            pitch = math.degrees(math.asin(-matrix[1][2]))
+                            roll = math.degrees(math.atan2(matrix[1][0], matrix[1][1]))
+                            
+                            dev_name = None
+                            if device_class == openvr.TrackedDeviceClass_HMD:
+                                dev_name = 'headset'
+                            else:
+                                role = vr_system.getControllerRoleForTrackedDeviceIndex(i)
+                                if role == openvr.TrackedControllerRole_LeftHand:
+                                    dev_name = 'controller1'
+                                elif role == openvr.TrackedControllerRole_RightHand:
+                                    dev_name = 'controller2'
+                                    
+                            if dev_name:
+                                current_poses[dev_name]['pos'] = [x, y, z]
+                                current_poses[dev_name]['rot'] = [pitch, yaw, roll]
+                                
+            # Broadcast updates at ~30Hz
+            now = time.time()
+            if now - last_broadcast > 0.033:
+                # Debug print occasionally
+                if int(now) % 5 == 0 and int(last_broadcast) % 5 != 0:
+                     print(f"[TRACKING] Valid poses. Headset: {current_poses['headset']['pos']}", flush=True)
+                
+                broadcast_state()
+                last_broadcast = now
+                
+            time.sleep(0.005) # Sleep small amount to not hog CPU
+            
+        except Exception as e:
+            print(f"[TRACKING] Error in loop: {e}")
+            time.sleep(1)
+
+def run_vision_broadcast_loop():
+    """Periodically request vision frames if clients are connected."""
+    global vision_broadcast_running
+    # print("[VISION] Starting periodic broadcast loop...")
+    while vision_broadcast_running:
+        if ws_clients and clients:
+            # Send a vision request
+            # logger.info(f"[VISION] Periodic request. WS: {len(ws_clients)}, TCP: {len(clients)}")
+            request = {
+                "type": "vision_request",
+                "action": "capture_frame"
+            }
+            send_vision_request(request)
+        time.sleep(5.0)
+    print("[VISION] Periodic broadcast loop stopped.")
 
 def send_device_update(device: str):
     """Send update for a single device instead of all devices. Lower latency for targeted updates."""
@@ -224,6 +486,25 @@ def handle_client(client_socket: socket.socket):
                         if msg.get('type') in ['frame', 'video', 'status', 'error']:
                             vision_response = msg
                             vision_event.set()
+                            
+                            # Also broadcast frame to WebSockets for UI
+                            if msg.get('type') == 'frame' and ws_clients:
+                                frames = msg.get('frames', [])
+                                if frames:
+                                    msg_data = {
+                                        "type": "vision_update",
+                                        "frame": frames[0],
+                                        "width": msg.get('width'),
+                                        "height": msg.get('height')
+                                    }
+                                    if ws_loop and ws_loop.is_running():
+                                        # logger.info(f"[VISION] Broadcasting frame ({len(frames[0])} bytes) to {len(ws_clients)} UI clients")
+                                        asyncio.run_coroutine_threadsafe(
+                                            broadcast_ws(json.dumps(msg_data)), 
+                                            ws_loop
+                                        )
+                                    else:
+                                        print("[VISION] Skip broadcast - ws_loop not ready", flush=True)
                     except json.JSONDecodeError:
                         # JSON incomplete - might be a partial vision response
                         # Check if this looks like a vision response (has "frames" field)
@@ -258,7 +539,7 @@ def run_tcp_server():
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         server.bind((HOST, PORT))
         server.listen(5)
-        print(f"TCP Server listening on {HOST}:{PORT}")
+        logger.info(f"TCP Server listening on {HOST}:{PORT}")
         
         while server_running:
             try:
@@ -308,9 +589,25 @@ def start_vr_bridge() -> str:
     if server_running: return "Server already running."
     
     server_running = True
+    
     t = threading.Thread(target=run_tcp_server, daemon=True)
     t.start()
-    return "VR Bridge started. Please launch SteamVR."
+    
+    # Start WebSocket server
+    ws_t = threading.Thread(target=run_ws_server, daemon=True)
+    ws_t.start()
+    
+    # Start Vision Broadcast loop
+    global vision_broadcast_running
+    vision_broadcast_running = True
+    vision_t = threading.Thread(target=run_vision_broadcast_loop, daemon=True)
+    vision_t.start()
+    
+    # Start Tracking Loop (OpenVR)
+    tracking_t = threading.Thread(target=run_tracking_loop, daemon=True)
+    tracking_t.start()
+    
+    return "VR Bridge, WebSocket Server, and Tracking Loop started. Please launch SteamVR."
 
 @mcp.tool()
 def get_connection_status() -> str:
@@ -435,6 +732,20 @@ def move_relative(device: str, dx: float = 0, dy: float = 0, dz: float = 0) -> s
     
     broadcast_state()
     return f"{device} moved to {new_pos}"
+
+def rotate_relative(device: str, dp: float = 0, dy: float = 0, dr: float = 0) -> str:
+    """Rotate a device relative to its current orientation."""
+    if device not in current_poses:
+        return f"Invalid device. Options: {list(current_poses.keys())}"
+    
+    with state_lock:
+        rot = current_poses[device]['rot']
+        dp, dy, dr = float(dp), float(dy), float(dr)
+        current_poses[device]['rot'] = [float(rot[0]) + dp, float(rot[1]) + dy, float(rot[2]) + dr]
+        new_rot = current_poses[device]['rot']
+    
+    broadcast_state()
+    return f"{device} rotated to {new_rot}"
 
 @mcp.tool()
 def position_controller_relative_to_headset(

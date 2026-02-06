@@ -1,0 +1,7 @@
+{
+  "name": "InteractionKit: Gemini-3 VR Interface",
+  "description": "A high-fidelity Generative UI framework for agentic AI systems in spatial computing, featuring real-time intent visualization and spatial grounding.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}

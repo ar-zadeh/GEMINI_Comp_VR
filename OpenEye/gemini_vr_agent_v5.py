@@ -313,7 +313,8 @@ class ActionPlanner:
            - perform_release(controller) -> Release object.
            - release_all_inputs(controller) -> Reset all.
            - get_controller_state(controller) -> Check state.
-           - reset_controller_positions() -> Reset virtual hands.
+           - reset_controller_positions() -> Reset virtual hands (natural).
+           - reset_controller_orientation() -> Reset to Front/Up/Down pose (Left DOWN, Right UP).
            - open_menu_sequence() -> Set positions and open menu.
         
         3. WHITE CANE ACCESSIBILITY (for blind users):
@@ -1841,6 +1842,30 @@ Rules:
         _log_action("reset_controller_positions")
         return _executor.call("reset_controller_positions")
 
+    def reset_controller_orientation():
+        """
+        Put controllers in front of user: Left pointing DOWN, Right pointing UP.
+        """
+        _log_action("reset_controller_orientation")
+        
+        # 1. Try Keyboard Controller (Best for locking offsets)
+        if _agent_ref and hasattr(_agent_ref, 'keyboard_ctrl') and _agent_ref.keyboard_ctrl:
+             _agent_ref.keyboard_ctrl.apply_reset_pose()
+             return "Controllers reset (Left DOWN, Right UP) using keyboard controller."
+        
+        # 2. Fallback: Manual positioning
+        # Left (Controller 1) -> Down
+        _executor.call("position_controller_relative_to_headset", 
+                       controller="controller1", forward=0.3, right=-0.2, up=-0.3)
+        _executor.call("rotate_device", device="controller1", pitch=90, yaw=0, roll=0)
+        
+        # Right (Controller 2) -> Up
+        _executor.call("position_controller_relative_to_headset", 
+                       controller="controller2", forward=0.3, right=0.2, up=-0.3)
+        _executor.call("rotate_device", device="controller2", pitch=45, yaw=0, roll=0)
+        
+        return "Controllers reset (Left DOWN, Right UP) via direct commands."
+
     def open_menu_sequence():
         """
         Sets rigid positions for headset and controllers and opens menu.
@@ -1909,7 +1934,7 @@ Rules:
         # White Cane Accessibility
         white_cane_describe, white_cane_set_goal,
         # Controller Positioning
-        reset_controller_positions, position_controller_relative_to_headset, open_menu_sequence,
+        reset_controller_positions, reset_controller_orientation, position_controller_relative_to_headset, open_menu_sequence,
         # Button/Input Controls
         press_button, release_button, click_button, set_trigger,
         set_joystick, move_joystick_direction, click_trackpad_direction,
@@ -2132,14 +2157,20 @@ if __name__ == "__main__":
     
     while True:
         try:
+            # If keyboard control is active, skip input() — stdin is in cbreak mode.
+            # The background thread handles keys. Sleep briefly and loop back.
+            if hasattr(agent, 'keyboard_ctrl') and agent.keyboard_ctrl and agent.keyboard_ctrl.active:
+                time.sleep(0.1)
+                continue
+
             user_input = input("\nYou: ").strip()
             if not user_input: continue
-            
+
             cmd = user_input.lower()
 
             # --- Keyboard VR toggle (backtick) ---
             if cmd == '`' and hasattr(agent, 'keyboard_ctrl') and agent.keyboard_ctrl:
-                agent.keyboard_ctrl.activate()  # blocks until backtick pressed again
+                agent.keyboard_ctrl.activate()  # non-blocking — returns immediately
                 continue
 
             if cmd in ['quit', 'exit']:

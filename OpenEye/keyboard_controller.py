@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """
-Keyboard-based VR movement controller (WSL/Linux compatible).
+Keyboard-based VR movement controller (WSL/Linux compatible, non-blocking).
 
 Uses termios + select for raw terminal input — no X11/Wayland required.
 Works in WSL, SSH, and any Linux terminal.
 
-Controls:
+Non-blocking: activate() returns immediately, key reading happens in a
+background thread. The main agent loop keeps running (white cane, etc.).
+
+Controls (when active):
     WASD    = headset position (yaw-relative)
     Q/E     = headset up/down
     Arrows  = headset rotation (pitch/yaw)
     `       = toggle keyboard control off (return to normal input)
 
-Controllers maintain fixed relative offsets to the headset.
+Controllers maintain fixed relative offsets to the headset, even when
+the agent (not keyboard) moves/rotates the headset via mcp_server.
 
 Usage:
     from keyboard_controller import KeyboardVRController
     ctrl = KeyboardVRController(mcp_module)
-    ctrl.activate()  # blocks until backtick pressed again
+    ctrl.activate()   # non-blocking — returns immediately
+    # ... later ...
+    ctrl.deactivate()  # or press backtick
 """
 
 import sys
@@ -24,6 +30,7 @@ import os
 import math
 import time
 import select
+import threading
 from typing import Dict
 
 # Terminal control — Unix only (WSL/Linux/macOS)
@@ -45,7 +52,8 @@ class KeyboardVRController:
     Backtick (`) = toggle off, return to normal input.
 
     Controllers maintain fixed relative offsets to headset.
-    Uses termios raw mode — works in WSL, SSH, any terminal.
+    Uses termios cbreak mode — works in WSL, SSH, any terminal.
+    Non-blocking: activate() spawns a background thread.
     """
 
     def __init__(self, mcp_module, move_step: float = 0.05, rotate_step: float = 2.0):
@@ -60,6 +68,8 @@ class KeyboardVRController:
         self.rotate_step = rotate_step
 
         self.active = False
+        self._thread = None
+        self._old_term_settings = None
 
         # Controller offsets relative to headset in headset-local coordinates.
         # forward: +ve = in front of headset (toward -Z at yaw=0)
@@ -82,60 +92,73 @@ class KeyboardVRController:
 
     def activate(self):
         """
-        Enter keyboard VR control mode. Blocks until backtick is pressed.
+        Enter keyboard VR control mode (non-blocking).
 
-        Switches terminal to cbreak mode (char-by-char, no echo),
-        reads keys, dispatches movement/rotation, then restores terminal
-        when backtick is pressed.
+        Switches terminal to cbreak mode, spawns a background thread to
+        read keys, and returns immediately. The main thread keeps running.
+        Press backtick (`) to deactivate.
         """
         if not TERMIOS_AVAILABLE:
             print("[KeyboardVRController] termios not available (Windows?). Use WSL or Linux.")
             return
 
+        if self.active:
+            return
+
         self.active = True
         self.capture_current_offsets()
+
+        # Suppress noisy mcp_server logging during keyboard mode
+        self.mcp.suppress_logging = True
+
+        # Register callback so controllers follow agent-initiated headset changes
+        self.mcp._headset_changed_callback = self._on_headset_changed
+
+        # Save terminal settings and enter cbreak mode
+        fd = sys.stdin.fileno()
+        self._old_term_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+
+        # Spawn background thread for key reading
+        self._thread = threading.Thread(target=self._input_loop, daemon=True)
+        self._thread.start()
 
         print("\n[Keyboard VR Control] ENABLED")
         print("  WASD = move | Q/E = up/down | Arrows = rotate | ` = exit keyboard mode")
 
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
+    def deactivate(self):
+        """
+        Exit keyboard VR control mode.
+        Restores terminal, unregisters callback, re-enables logging.
+        """
+        if not self.active:
+            return
 
-        try:
-            # cbreak mode: char-by-char input, no echo, Ctrl+C still generates SIGINT
-            tty.setcbreak(fd)
+        self.active = False
 
-            while self.active:
-                # select() with 50ms timeout — efficient, no CPU spinning
-                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
-                if not ready:
-                    continue
+        # Wait for background thread to finish
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
 
-                ch = sys.stdin.read(1)
+        # Restore terminal
+        if self._old_term_settings is not None:
+            try:
+                fd = sys.stdin.fileno()
+                termios.tcsetattr(fd, termios.TCSADRAIN, self._old_term_settings)
+            except Exception:
+                pass
+            self._old_term_settings = None
 
-                if ch == '`':
-                    # Toggle off
-                    self.active = False
-                    break
-                elif ch == '\x1b':
-                    # ESC — could be start of arrow key escape sequence
-                    self._handle_escape_sequence()
-                elif ch == '\x03':
-                    # Ctrl+C — respect it even in cbreak mode
-                    self.active = False
-                    raise KeyboardInterrupt
-                else:
-                    self._handle_char(ch)
-
-        finally:
-            # Always restore original terminal settings
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        # Unregister callback and re-enable logging
+        self.mcp._headset_changed_callback = None
+        self.mcp.suppress_logging = False
 
         print("\n[Keyboard VR Control] DISABLED")
 
     def stop(self):
-        """Force-stop keyboard control (e.g., on exit)."""
-        self.active = False
+        """Force-stop keyboard control (e.g., on application exit)."""
+        self.deactivate()
 
     def set_controller_offset(
         self,
@@ -181,7 +204,7 @@ class KeyboardVRController:
         with self.mcp.state_lock:
             headset_pos = self.mcp.current_poses['headset']['pos']
             headset_rot = self.mcp.current_poses['headset']['rot']
-            headset_yaw = math.radians(float(headset_rot[1]))
+            headset_yaw = math.radians(-float(headset_rot[1]))
 
             for ctrl_name in ['controller1', 'controller2']:
                 ctrl_pos = self.mcp.current_poses[ctrl_name]['pos']
@@ -212,6 +235,88 @@ class KeyboardVRController:
             print(f"  {name}: fwd={off['forward']:.3f}, right={off['right']:.3f}, "
                   f"up={off['up']:.3f}, pitch={off['pitch']:.1f}, "
                   f"yaw={off['yaw']:.1f}, roll={off['roll']:.1f}")
+
+    def apply_reset_pose(self):
+        """
+        Reset controllers to a fixed 'holding' pose relative to the headset.
+        Left (controller1): Pointing DOWN (pitch=90), slightly left/front.
+        Right (controller2): Pointing UP (pitch=-90), slightly right/front.
+        """
+        # Define the desired offsets
+        reset_offsets = {
+            'controller1': { # Left: Pointing DOWN
+                'forward': 0.3, 'right': -0.2, 'up': -0.3,
+                'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0
+            },
+            'controller2': { # Right: Pointing UP
+                'forward': 0.3, 'right': 0.2, 'up': -0.3,
+                'pitch': 45.0, 'yaw': 0.0, 'roll': 0.0
+            }
+        }
+
+        # Apply to local state
+        self._controller_offsets = reset_offsets
+        
+        # Apply to world immediately
+        self._update_controllers()
+        self.mcp.broadcast_state()
+        
+        print("[KeyboardVRController] Controllers RESET: Left DOWN, Right UP.")
+
+    # ------------------------------------------------------------------
+    # Background key reading thread
+    # ------------------------------------------------------------------
+
+    def _input_loop(self):
+        """Background thread: poll stdin in cbreak mode, dispatch keys."""
+        try:
+            while self.active:
+                # select() with 50ms timeout — efficient, no CPU spinning
+                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not ready:
+                    continue
+
+                ch = sys.stdin.read(1)
+
+                if ch == '`':
+                    # Toggle off — deactivate from this thread
+                    self.active = False
+                    # Restore terminal and cleanup (in main thread context via deactivate)
+                    # We set active=False first so the main loop can call deactivate
+                    self._restore_terminal()
+                    self.mcp._headset_changed_callback = None
+                    self.mcp.suppress_logging = False
+                    print("\n[Keyboard VR Control] DISABLED")
+                    break
+                elif ch == '\x1b':
+                    # ESC — could be start of arrow key escape sequence
+                    self._handle_escape_sequence()
+                elif ch == '\x03':
+                    # Ctrl+C — exit keyboard mode gracefully
+                    self.active = False
+                    self._restore_terminal()
+                    self.mcp._headset_changed_callback = None
+                    self.mcp.suppress_logging = False
+                    print("\n[Keyboard VR Control] DISABLED (Ctrl+C)")
+                    break
+                else:
+                    self._handle_char(ch)
+        except Exception:
+            # If anything goes wrong, make sure terminal is restored
+            self.active = False
+            self._restore_terminal()
+            self.mcp._headset_changed_callback = None
+            self.mcp.suppress_logging = False
+
+    def _restore_terminal(self):
+        """Restore original terminal settings."""
+        if self._old_term_settings is not None:
+            try:
+                fd = sys.stdin.fileno()
+                termios.tcsetattr(fd, termios.TCSADRAIN, self._old_term_settings)
+            except Exception:
+                pass
+            self._old_term_settings = None
 
     # ------------------------------------------------------------------
     # Key dispatch
@@ -250,13 +355,27 @@ class KeyboardVRController:
 
         ch3 = sys.stdin.read(1)
         if ch3 == 'A':       # Up arrow
-            self._rotate_headset(dpitch=-self.rotate_step)
-        elif ch3 == 'B':     # Down arrow
             self._rotate_headset(dpitch=self.rotate_step)
+        elif ch3 == 'B':     # Down arrow
+            self._rotate_headset(dpitch=-self.rotate_step)
         elif ch3 == 'C':     # Right arrow
-            self._rotate_headset(dyaw=self.rotate_step)
-        elif ch3 == 'D':     # Left arrow
             self._rotate_headset(dyaw=-self.rotate_step)
+        elif ch3 == 'D':     # Left arrow
+            self._rotate_headset(dyaw=self.rotate_step)
+
+    # ------------------------------------------------------------------
+    # Headset change callback (called by mcp_server when agent moves headset)
+    # ------------------------------------------------------------------
+
+    def _on_headset_changed(self):
+        """
+        Called by mcp_server._notify_headset_changed() when the agent
+        (not keyboard) moves or rotates the headset. Repositions controllers
+        to maintain their relative offsets.
+        """
+        with self.mcp.state_lock:
+            self._update_controllers_locked()
+        self.mcp.broadcast_state()
 
     # ------------------------------------------------------------------
     # Internal movement logic
@@ -266,7 +385,7 @@ class KeyboardVRController:
         """Move headset in its local forward/right/up directions, then reposition controllers."""
         with self.mcp.state_lock:
             pos = self.mcp.current_poses['headset']['pos']
-            yaw_rad = math.radians(float(self.mcp.current_poses['headset']['rot'][1]))
+            yaw_rad = math.radians(-float(self.mcp.current_poses['headset']['rot'][1]))
 
             # Transform local movement to world space
             # forward=+ve moves toward -Z at yaw=0 (VR forward)
@@ -310,7 +429,7 @@ class KeyboardVRController:
         """Recalculate controller world poses. Caller MUST hold state_lock."""
         headset_pos = self.mcp.current_poses['headset']['pos']
         headset_rot = self.mcp.current_poses['headset']['rot']
-        headset_yaw = math.radians(float(headset_rot[1]))
+        headset_yaw = math.radians(-float(headset_rot[1]))
 
         for ctrl_name, offsets in self._controller_offsets.items():
             fwd = offsets['forward']

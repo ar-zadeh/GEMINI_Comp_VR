@@ -34,6 +34,18 @@ server_running = False
 vision_response: Optional[Dict] = None
 vision_event = threading.Event()
 
+# Logging suppression (set True during keyboard control to silence broadcast spam)
+suppress_logging = False
+
+# Optional callback invoked after headset pose changes.
+# keyboard_controller registers here so controllers follow the headset.
+_headset_changed_callback = None
+
+def _notify_headset_changed():
+    """Call registered callback (if any) after headset pose change. Must be called WITHOUT state_lock held."""
+    if _headset_changed_callback:
+        _headset_changed_callback()
+
 # Default Poses
 default_poses = {
     'headset': {'pos': [0.0, 1.5, 0.0], 'rot': [0.0, 0.0, 0.0]},
@@ -127,7 +139,7 @@ def broadcast_state():
             try:
                 for msg in messages:
                     # Debug: Log what we're sending for controllers
-                    if '"input"' in msg:
+                    if '"input"' in msg and not suppress_logging:
                         print(f"[BROADCAST] Sending: {msg.strip()}", flush=True)
                     client.sendall(msg.encode('utf-8'))
                 active_clients.append(client)
@@ -158,7 +170,8 @@ def send_device_update(device: str):
         # Add timestamp for latency debugging
         send_ts = datetime.datetime.now()
         msg["send_ts"] = send_ts.strftime("%H:%M:%S.%f")[:-3]  # HH:MM:SS.mmm
-        print(f"[SEND] {device} at {msg['send_ts']}")
+        if not suppress_logging:
+            print(f"[SEND] {device} at {msg['send_ts']}")
         
         payload = json.dumps(msg, separators=(',', ':')) + '\n'
         
@@ -347,6 +360,7 @@ def look_at(target_x: float, target_y: float, target_z: float) -> str:
         current_poses['headset']['rot'] = [-pitch, yaw, 0.0]
     
     broadcast_state()
+    _notify_headset_changed()
     return f"Looking at [{target_x}, {target_y}, {target_z}] (Yaw: {yaw:.1f}, Pitch: {-pitch:.1f})"
 
 @mcp.tool()
@@ -359,6 +373,8 @@ def teleport(device: str, x: float, y: float, z: float) -> str:
         current_poses[device]['pos'] = [float(x), float(y), float(z)]
     
     broadcast_state()
+    if device == 'headset':
+        _notify_headset_changed()
     return f"{device} teleported to [{x}, {y}, {z}]"
 
 @mcp.tool()
@@ -373,7 +389,10 @@ def rotate_device(device: str, pitch: float, yaw: float, roll: float) -> str:
     
     # Use targeted update for lower latency (only sends this device, not all 3)
     send_device_update(device)
-    
+
+    if device == 'headset':
+        _notify_headset_changed()
+
     # Verification: wait 0.1s and check if values match
     time.sleep(0.1)
     with state_lock:
@@ -406,6 +425,7 @@ def walk_path(x: float, z: float, steps: int = 10) -> str:
         with state_lock:
             current_poses['headset']['pos'] = [curr_x, start_y, curr_z]
         broadcast_state()
+        _notify_headset_changed()
         time.sleep(0.1)
         
     return f"Walked to [{x}, {start_y}, {z}]"
@@ -434,6 +454,8 @@ def move_relative(device: str, dx: float = 0, dy: float = 0, dz: float = 0) -> s
         new_pos = current_poses[device]['pos']
     
     broadcast_state()
+    if device == 'headset':
+        _notify_headset_changed()
     return f"{device} moved to {new_pos}"
 
 @mcp.tool()
@@ -461,7 +483,7 @@ def position_controller_relative_to_headset(
     
     with state_lock:
         headset_pos = current_poses['headset']['pos']
-        headset_yaw = math.radians(float(current_poses['headset']['rot'][1]))
+        headset_yaw = math.radians(-float(current_poses['headset']['rot'][1]))
         
         # Calculate world-space offset based on headset orientation
         # Forward is -Z in VR, Right is +X

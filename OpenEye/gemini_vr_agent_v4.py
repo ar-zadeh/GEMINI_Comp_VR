@@ -70,7 +70,11 @@ except ImportError:
 MODEL_PLANNER = "gemini-3-flash-preview"
 MODEL_GROUNDING = "gemini-3-flash-preview"
 MODEL_VERIFICATION = "gemini-2.5-pro" 
+MODEL_PLANNER = "gemini-3-flash-preview"
+MODEL_GROUNDING = "gemini-3-flash-preview"
+MODEL_VERIFICATION = "gemini-2.5-pro" 
 MODEL_DESCRIPTION = "gemini-2.5-flash-lite-preview-09-2025"
+MODEL_WHITE_CANE = "gemini-3-flash-preview"
 
 LOG_DIR = Path("agent_logs_v2")
 SHOW_VISION_PREVIEW = False
@@ -312,6 +316,10 @@ class ActionPlanner:
            - reset_controller_positions() -> Reset virtual hands.
            - open_menu_sequence() -> Set positions and open menu.
         
+        3. WHITE CANE ACCESSIBILITY (for blind users):
+           - white_cane_describe() -> Immediate capture and description for blind user.
+           - white_cane_set_goal(goal) -> Set/update navigation goal for white cane mode.
+        
         CONTROLLER DEFINITIONS:
         - controller1: LEFT
         - controller2: RIGHT
@@ -372,6 +380,318 @@ class ActionPlanner:
             logger.error(f"Planning failed: {e}")
             return []
 
+class WhiteCaneAssistant:
+    """
+    Accessibility assistant for blind users.
+    Captures images with timestamps, describes scenes naturally,
+    and recommends physical actions to navigate toward goals.
+    Uses structured output for clear separation of thought/description/action.
+    """
+    def __init__(self, client, executor, log_dir: Path):
+        self.client = client
+        self.executor = executor
+        self.model_name = MODEL_WHITE_CANE
+        self.log_dir = log_dir / "white_cane"
+        self.log_dir.mkdir(exist_ok=True, parents=True)
+        
+        # State
+        self.active = False
+        self.current_goal = None
+        self.stop_event = threading.Event()
+        self.loop_thread = None
+        
+        # Caching - stores (timestamp_str, image_bytes, file_path)
+        self.cached_images: List[tuple] = []
+        self.conversation_history: List[Dict] = []
+        
+        # Description prompt template
+        self.description_prompt = """
+You are an accessibility assistant helping a blind person navigate a VR environment.
+The user's current goal is: {goal}
+
+You are receiving images captured at different times. Each image has a timestamp.
+The latest image was captured at {timestamp}.
+
+Your task is to:
+1. THINK about what you see and how it relates to the user's goal
+2. DESCRIBE the scene naturally for someone who cannot see (spoken aloud)
+3. RECOMMEND one specific action to take
+4. DETERMINE if the goal has been achieved or if the user wants to change it
+
+IMPORTANT RULES:
+- DO NOT use bullet points or lists in the description - this will be read aloud
+- If you see something that suggests the user has reached their goal, set goal_achieved to true
+- If the user's spoken input suggests they want to change their goal, extract the new_goal
+- Look at previous images to track progress and give context-aware guidance
+"""
+
+    def capture_with_timestamp(self) -> tuple:
+        """
+        Captures an image and saves it with timestamp in filename.
+        Returns (timestamp_str, image_bytes, file_path)
+        """
+        logger = get_logger()
+        timestamp = datetime.now()
+        timestamp_str = timestamp.strftime("%H:%M:%S")
+        filename = f"image_{timestamp_str.replace(':', '_')}.png"
+        file_path = self.log_dir / filename
+        
+        # Capture image
+        res = self.executor.call("inspect_surroundings")
+        try:
+            data = json.loads(res).get("data")
+            img_bytes = base64.b64decode(data)
+            
+            # Save as PNG with timestamp name
+            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            pil_img.save(str(file_path), format="PNG")
+            
+            logger.info(f"White cane capture: {file_path}")
+            return (timestamp_str, img_bytes, str(file_path))
+            
+        except Exception as e:
+            logger.error(f"White cane capture failed: {e}")
+            return (timestamp_str, None, None)
+
+    def describe_and_recommend(self, timestamp_str: str, img_bytes: bytes, user_input: str = None) -> Dict:
+        """
+        Generates a structured response with thought, description, action for a blind user.
+        Returns a dict with keys: thought, description, action, goal_achieved, new_goal
+        """
+        logger = get_logger()
+        
+        if not img_bytes:
+            return {
+                "thought": "Failed to capture image",
+                "description": "I'm sorry, I couldn't capture an image. Please try again.",
+                "action": "Wait a moment and try again",
+                "goal_achieved": False,
+                "new_goal": None
+            }
+        
+        # Define structured output schema
+        class WhiteCaneResponse(BaseModel):
+            thought: str = Field(description="Your internal reasoning about what you see and what to do next. This is NOT read to the user.")
+            description: str = Field(description="Natural, flowing description of the scene for a blind person. NO bullet points or lists. This WILL be read aloud.")
+            action: str = Field(description="One specific physical action recommendation, e.g. 'Turn your head 30 degrees to the right' or 'Take two steps forward'")
+            goal_achieved: bool = Field(description="Set to true if the user's goal has been achieved based on what you see")
+            new_goal: Optional[str] = Field(default=None, description="If the user expressed a desire to change their goal in their input, extract the new goal here")
+        
+        # Build conversation parts with history
+        parts = []
+        
+        # Add prompt with current context
+        prompt = self.description_prompt.format(
+            goal=self.current_goal or "exploring the environment",
+            timestamp=timestamp_str
+        )
+        parts.append(types.Part(text=prompt))
+        
+        # Add user input if provided (for goal change detection)
+        if user_input:
+            parts.append(types.Part(text=f"\n[User just said]: \"{user_input}\"\n"))
+        
+        # Add images in chronological order (limit to 4 previous + 1 current = 5 total)
+        # Get last 4 cached images for history
+        history_images = self.cached_images[-4:]
+        total_images = len(history_images) + 1  # +1 for current image
+        
+        # Ordinal labels for chronological presentation
+        ordinal_labels = ["first", "second", "third", "fourth", "fifth"]
+        
+        parts.append(types.Part(text="\n--- IMAGE TIMELINE (chronological order) ---\n"))
+        
+        # Add historical images in chronological order
+        for idx, (ts, img_data, path) in enumerate(history_images):
+            if img_data:
+                position = idx + 1
+                if idx == 0:
+                    label = f"At the beginning (image 1 of {total_images}), captured at {ts}"
+                else:
+                    ordinal = ordinal_labels[idx] if idx < len(ordinal_labels) else f"{idx+1}th"
+                    label = f"In the {ordinal} capture (image {position} of {total_images}), at {ts}"
+                
+                parts.append(types.Part(text=f"\n[{label}]:"))
+                parts.append(types.Part(inline_data=types.Blob(
+                    mime_type="image/png", data=img_data
+                )))
+        
+        # Add current image as the final/most recent
+        current_position = len(history_images) + 1
+        parts.append(types.Part(text=f"\n[NOW - Current view (image {current_position} of {total_images}), captured at {timestamp_str}]:"))
+        parts.append(types.Part(inline_data=types.Blob(
+            mime_type="image/png", data=img_bytes
+        )))
+        
+        # Add conversation history summary if exists
+        if self.conversation_history:
+            history_text = "\nPrevious observations:\n"
+            for entry in self.conversation_history[-4:]:
+                history_text += f"- At {entry['timestamp']}: {entry['summary']}\n"
+            parts.append(types.Part(text=history_text))
+        
+        try:
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[types.Content(role="user", parts=parts)],
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": WhiteCaneResponse
+                }
+            )
+            
+            # Parse structured response
+            try:
+                parsed = response.parsed
+                if not parsed:
+                    parsed = WhiteCaneResponse.model_validate_json(response.text)
+                
+                result = {
+                    "thought": parsed.thought,
+                    "description": parsed.description,
+                    "action": parsed.action,
+                    "goal_achieved": parsed.goal_achieved,
+                    "new_goal": parsed.new_goal
+                }
+            except Exception as parse_error:
+                logger.warning(f"Structured parse failed, using fallback: {parse_error}")
+                # Fallback to raw text
+                result = {
+                    "thought": "Processing...",
+                    "description": response.text,
+                    "action": "Continue as you were",
+                    "goal_achieved": False,
+                    "new_goal": None
+                }
+            
+            # Cache this interaction
+            self.conversation_history.append({
+                "timestamp": timestamp_str,
+                "summary": result["description"][:80] + "..." if len(result["description"]) > 80 else result["description"]
+            })
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"White cane description failed: {e}")
+            return {
+                "thought": f"Error: {e}",
+                "description": f"I encountered an error while analyzing the scene.",
+                "action": "Please wait while I try again",
+                "goal_achieved": False,
+                "new_goal": None
+            }
+
+    def format_for_speech(self, result: Dict) -> str:
+        """Format the structured result for spoken output to the user."""
+        speech = result["description"]
+        if result["action"]:
+            speech += f" I recommend: {result['action']}"
+        if result["goal_achieved"]:
+            speech += " It looks like you've reached your goal!"
+        return speech
+
+    def activate(self, goal: str = None):
+        """Activate white cane mode with an optional goal."""
+        self.active = True
+        self.current_goal = goal
+        self.stop_event.clear()
+        self.cached_images = []
+        self.conversation_history = []
+        
+        logger = get_logger()
+        logger.info(f"White cane activated. Goal: {goal}")
+        
+        return f"White cane mode activated. {'Goal: ' + goal if goal else 'No specific goal set. I will describe what I see.'}\nSay 'disable white cane' to stop, or tell me your new goal anytime."
+
+    def set_goal(self, goal: str):
+        """Update the current goal."""
+        old_goal = self.current_goal
+        self.current_goal = goal
+        logger = get_logger()
+        logger.info(f"White cane goal changed: '{old_goal}' -> '{goal}'")
+        return f"Goal updated from '{old_goal}' to '{goal}'"
+
+    def deactivate(self):
+        """Deactivate white cane mode."""
+        self.active = False
+        self.stop_event.set()
+        if self.loop_thread and self.loop_thread.is_alive():
+            self.loop_thread.join(timeout=2.0)
+        
+        logger = get_logger()
+        logger.info("White cane deactivated.")
+        
+        return "White cane mode deactivated."
+
+    def get_immediate_help(self, user_input: str = None) -> str:
+        """Capture and describe immediately (when user says 'help')."""
+        timestamp_str, img_bytes, file_path = self.capture_with_timestamp()
+        
+        if img_bytes:
+            self.cached_images.append((timestamp_str, img_bytes, file_path))
+        
+        result = self.describe_and_recommend(timestamp_str, img_bytes, user_input)
+        
+        # Handle goal change if detected
+        if result.get("new_goal"):
+            self.set_goal(result["new_goal"])
+            print(f"[Goal Changed]: {result['new_goal']}")
+        
+        return self.format_for_speech(result)
+
+    def run_loop(self, interval: float = 2.0):
+        """
+        Run the white cane loop in a separate thread.
+        Captures and describes every 'interval' seconds.
+        Auto-deactivates if goal is achieved.
+        """
+        logger = get_logger()
+        
+        while self.active and not self.stop_event.is_set():
+            # Capture and describe
+            timestamp_str, img_bytes, file_path = self.capture_with_timestamp()
+            
+            if img_bytes:
+                self.cached_images.append((timestamp_str, img_bytes, file_path))
+                result = self.describe_and_recommend(timestamp_str, img_bytes)
+                
+                # Print thought (debug) and speech output
+                logger.info(f"[White Cane Thought]: {result['thought']}")
+                speech = self.format_for_speech(result)
+                print(f"\n[White Cane - {timestamp_str}]:\n{speech}\n")
+                
+                # Handle goal change
+                if result.get("new_goal"):
+                    self.set_goal(result["new_goal"])
+                    print(f"[Goal Changed]: {result['new_goal']}")
+                
+                # Check if goal achieved - auto-deactivate
+                if result.get("goal_achieved") and self.current_goal:
+                    print(f"\n[White Cane]: Goal '{self.current_goal}' achieved! Deactivating...")
+                    self.deactivate()
+                    return
+            
+            # Wait for interval or until stopped
+            self.stop_event.wait(timeout=interval)
+        
+        logger.info("White cane loop ended.")
+
+    def start_background_loop(self, interval: float = 2.0):
+        """Start the capture loop in a background thread."""
+        if self.loop_thread and self.loop_thread.is_alive():
+            return "White cane loop is already running."
+        
+        self.stop_event.clear()
+        self.loop_thread = threading.Thread(
+            target=self.run_loop,
+            args=(interval,),
+            daemon=True
+        )
+        self.loop_thread.start()
+        return "White cane background loop started (every 2 seconds)."
+
+
 # ============================================================================
 # VERIFICATION (Gemini 2.5 Pro)
 # ============================================================================
@@ -418,6 +738,27 @@ class Describer:
             ])]
         )
         return response.text
+    
+    def describe_multi(self, labeled_images: list, question: str) -> str:
+        """
+        Describe multiple images with labels (e.g., front/left/right views).
+        
+        Args:
+            labeled_images: List of tuples (label, image_bytes)
+            question: The prompt/question for the model
+        """
+        parts = [types.Part(text=question)]
+        
+        for label, img_data in labeled_images:
+            # Add label for each image
+            parts.append(types.Part(text=f"\n[{label.upper()} VIEW]:"))
+            parts.append(types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=img_data)))
+        
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[types.Content(role="user", parts=parts)]
+        )
+        return response.text
 
 # ============================================================================
 # EXECUTOR
@@ -446,13 +787,19 @@ class DirectMCPExecutor:
 _executor = None
 _grounder = None
 _tracker = None
+_white_cane = None
+_describer = None
+_agent_ref = None # To access history
 
-def _get_tools(executor, grounder, tracker):
+def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
     """Define tools as a list of callables."""
-    global _executor, _grounder, _tracker
+    global _executor, _grounder, _tracker, _white_cane, _describer, _agent_ref
     _executor = executor
     _grounder = grounder
     _tracker = tracker
+    _white_cane = white_cane
+    _describer = describer
+    _agent_ref = agent_ref
     
     def _log_action(tool_name, **kwargs):
         get_logger().info(f"[TOOL] {tool_name}({kwargs})")
@@ -832,6 +1179,7 @@ def _get_tools(executor, grounder, tracker):
             inference_state = _tracker.processor.set_image(pil_img_loop)
             
             points = {}
+            masks_for_viz = {}  # Store masks for visualization
             
             for key, desc in targets.items():
                 if key not in current_boxes: continue # Should not happen unless lost
@@ -844,6 +1192,8 @@ def _get_tools(executor, grounder, tracker):
                 norm_box_cxcywh = _tracker.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
                 
                 _tracker.processor.reset_all_prompts(inference_state)
+                # Set text prompt to help SAM differentiate between similar objects
+                inference_state = _tracker.processor.set_text_prompt(desc, inference_state)
                 inference_state = _tracker.processor.add_geometric_prompt(
                     state=inference_state, box=norm_box_cxcywh, label=True
                 )
@@ -859,6 +1209,9 @@ def _get_tools(executor, grounder, tracker):
                     print(f"[{key}] Lost tracking (no mask).")
                     del current_boxes[key]
                     continue
+                
+                # Store mask for visualization
+                masks_for_viz[key] = mask
                     
                 # Update Box & Extract Point
                 rows = np.any(mask, axis=1)
@@ -888,6 +1241,22 @@ def _get_tools(executor, grounder, tracker):
                 else:
                     print(f"[{key}] Mask empty.")
                     del current_boxes[key]
+            
+            # Apply colored mask overlays for visualization
+            for key, mask in masks_for_viz.items():
+                if key == "ray":
+                    # Blue overlay for ray (BGR: 255, 100, 0)
+                    color = np.array([255, 100, 0], dtype=np.uint8)
+                elif key == "logo":
+                    # Green overlay for target object (BGR: 0, 255, 100)
+                    color = np.array([0, 255, 100], dtype=np.uint8)
+                else:
+                    color = np.array([128, 128, 128], dtype=np.uint8)
+                
+                # Apply semi-transparent overlay
+                overlay = img_cv.copy()
+                overlay[mask] = color
+                cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
             
             # C. PID & Control
             if "ray" in points and "logo" in points:
@@ -1157,6 +1526,7 @@ Rules:
                 points = {}
                 boxes_to_track = {"ray": current_ray_box, "key": target_box}
                 updated_boxes = {}
+                masks_for_viz = {}  # Store masks for visualization
                 
                 for key, box in boxes_to_track.items():
                     box_x, box_y, box_w, box_h = box
@@ -1167,6 +1537,9 @@ Rules:
                     norm_box_cxcywh = _tracker.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
                     
                     _tracker.processor.reset_all_prompts(inference_state)
+                    # Set text prompt to help SAM differentiate between similar objects
+                    text_desc = "VR controller ray" if key == "ray" else f"keyboard key {char}"
+                    inference_state = _tracker.processor.set_text_prompt(text_desc, inference_state)
                     inference_state = _tracker.processor.add_geometric_prompt(
                         state=inference_state, box=norm_box_cxcywh, label=True
                     )
@@ -1181,6 +1554,9 @@ Rules:
                     if mask is None:
                         print(f"[{key}] Lost tracking (no mask).")
                         continue
+                    
+                    # Store mask for visualization
+                    masks_for_viz[key] = mask
                     
                     # Update Box & Extract Point
                     rows = np.any(mask, axis=1)
@@ -1206,6 +1582,22 @@ Rules:
                                 cy = int(M["m01"]/M["m00"])
                                 points[key] = (cx, cy)
                                 cv2.circle(img_cv, (cx, cy), 5, (0, 255, 0), -1)
+                
+                # Apply colored mask overlays for visualization
+                for key, mask in masks_for_viz.items():
+                    if key == "ray":
+                        # Blue overlay for ray (BGR: 255, 100, 0)
+                        color = np.array([255, 100, 0], dtype=np.uint8)
+                    elif key == "key":
+                        # Green overlay for key (BGR: 0, 255, 100)
+                        color = np.array([0, 255, 100], dtype=np.uint8)
+                    else:
+                        color = np.array([128, 128, 128], dtype=np.uint8)
+                    
+                    # Apply semi-transparent overlay
+                    overlay = img_cv.copy()
+                    overlay[mask] = color
+                    cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
                 
                 # Update boxes for next iteration
                 if "ray" in updated_boxes:
@@ -1272,9 +1664,33 @@ Rules:
         logger.info(result)
         return result
 
-    # =========================================================================
-    # CONTROLLER INPUT FUNCTIONS (Buttons, Triggers, Joystick)
-    # =========================================================================
+    def white_cane_describe():
+        """
+        Immediately captures an image and provides a description for a blind user.
+        This is used when white cane mode is active and user says 'help'.
+        """
+        _log_action("white_cane_describe")
+        if not _white_cane:
+            return "Error: White cane assistant not available."
+        
+        if not _white_cane.active:
+            return "White cane mode is not active. Say 'white cane' to activate."
+        
+        return _white_cane.get_immediate_help()
+
+    def white_cane_set_goal(goal: str):
+        """
+        Set or update the goal for white cane navigation.
+        
+        Args:
+            goal: Description of what the user is trying to find/reach.
+        """
+        _log_action("white_cane_set_goal", goal=goal)
+        if not _white_cane:
+            return "Error: White cane assistant not available."
+        
+        _white_cane.current_goal = goal
+        return f"White cane goal updated: {goal}"
     
     def press_button(controller: str, button: str):
         """
@@ -1490,6 +1906,8 @@ Rules:
         inspect_surroundings, locate_object, capture_video, 
         # Tracking
         track_object, track_multiple_items, visual_servo_to_object, create_tracking_video, type_text, 
+        # White Cane Accessibility
+        white_cane_describe, white_cane_set_goal,
         # Controller Positioning
         reset_controller_positions, position_controller_relative_to_headset, open_menu_sequence,
         # Button/Input Controls
@@ -1519,6 +1937,9 @@ class GeminiAgent:
         self.planner = ActionPlanner(self.client)
         self.verifier = Verifier(self.client)
         self.describer = Describer(self.client)
+        self.white_cane = WhiteCaneAssistant(self.client, self.executor, LOG_DIR)
+        
+        self.chat_history = [] # Store conversation
         
         if ObjectTracker:
             self.tracker = ObjectTracker(LOG_DIR)
@@ -1526,7 +1947,7 @@ class GeminiAgent:
             self.tracker = None
         
         # Tools (for execution phase)
-        self.tools = _get_tools(self.executor, self.grounder, self.tracker)
+        self.tools = _get_tools(self.executor, self.grounder, self.tracker, self.white_cane, self.describer, self)
         # Create a mapping for manual execution from plan
         self.tool_map = {t.__name__: t for t in self.tools}
         self.tool_map["describe_view"] = self._describe_view_tool
@@ -1559,6 +1980,7 @@ class GeminiAgent:
 
     def run(self, user_input: str):
         self.logger.info(f"User: {user_input}")
+        self.chat_history.append({"role": "user", "content": user_input})
         print("\nAgent (Planner) is thinking...")
         
         # 1. PLANNING PHASE (Gemini 3 Flash)
@@ -1583,6 +2005,7 @@ class GeminiAgent:
                     # Execute tool
                     result = func(**step.args)
                     print(f"Result: {str(result)[:200]}...")
+                    self.chat_history.append({"role": "agent", "content": f"Executed {step.tool}: {result}"})
                     self.logger.info(f"Step '{step.tool}' Result: {result}")
                 except Exception as e:
                     print(f"Execution Error: {e}")
@@ -1696,7 +2119,8 @@ class GeminiAgent:
 
 if __name__ == "__main__":
     agent = GeminiAgent()
-    print("VR Agent v2 (Multi-Model) Ready. Type 'quit' to exit.")
+    print("VR Agent v4 (Multi-Model) Ready.")
+    print("Commands: 'white cane' to activate accessibility mode, 'quit' to exit.")
     
     while True:
         try:
@@ -1705,10 +2129,44 @@ if __name__ == "__main__":
             
             cmd = user_input.lower()
             if cmd in ['quit', 'exit']:
+                # Deactivate white cane if active
+                if agent.white_cane.active:
+                    agent.white_cane.deactivate()
                 break
 
             elif cmd == 'status':
                 agent.print_status()
+                continue
+            
+            # White Cane Activation
+            elif cmd in ['white cane', 'whitecane', 'enable white cane']:
+                print("\nWhite Cane mode activating...")
+                goal = input("What would you like to find or where do you want to go? (or press Enter to explore): ").strip()
+                result = agent.white_cane.activate(goal if goal else None)
+                print(result)
+                
+                # Start the automatic loop
+                agent.white_cane.start_background_loop(interval=2.0)
+                continue
+            
+            # White Cane Deactivation
+            elif cmd in ['disable white cane', 'stop white cane', 'exit white cane']:
+                result = agent.white_cane.deactivate()
+                print(result)
+                continue
+            
+            # White Cane Help (immediate description)
+            elif agent.white_cane.active and cmd in ['help', 'what do you see', 'describe']:
+                print("\nGetting immediate description...")
+                description = agent.white_cane.get_immediate_help()
+                print(f"\n[White Cane]:\n{description}\n")
+                continue
+            
+            # White Cane Goal Update
+            elif agent.white_cane.active and cmd.startswith('goal '):
+                new_goal = user_input[5:].strip()
+                agent.white_cane.current_goal = new_goal
+                print(f"Goal updated: {new_goal}")
                 continue
                 
             if user_input.startswith("((") and user_input.endswith("))"):
@@ -1717,4 +2175,7 @@ if __name__ == "__main__":
 
             agent.run(user_input)
         except KeyboardInterrupt:
+            # Deactivate white cane if active
+            if agent.white_cane.active:
+                agent.white_cane.deactivate()
             break

@@ -70,7 +70,11 @@ except ImportError:
 MODEL_PLANNER = "gemini-3-flash-preview"
 MODEL_GROUNDING = "gemini-3-flash-preview"
 MODEL_VERIFICATION = "gemini-2.5-pro" 
+MODEL_PLANNER = "gemini-3-flash-preview"
+MODEL_GROUNDING = "gemini-3-flash-preview"
+MODEL_VERIFICATION = "gemini-2.5-pro" 
 MODEL_DESCRIPTION = "gemini-2.5-flash-lite-preview-09-2025"
+MODEL_NAVIGATION = "gemini-3-flash-preview"
 
 LOG_DIR = Path("agent_logs_v2")
 SHOW_VISION_PREVIEW = False
@@ -312,6 +316,10 @@ class ActionPlanner:
            - reset_controller_positions() -> Reset virtual hands.
            - open_menu_sequence() -> Set positions and open menu.
         
+        3. HIGH-LEVEL NAVIGATION & LOCALIZATION:
+           - navigate_to_location(location_name, goal_description) -> Autonomous navigation loop. make sure it is very detailed.
+           - where_am_i() -> Describe current location using 360 view and chat history.
+        
         CONTROLLER DEFINITIONS:
         - controller1: LEFT
         - controller2: RIGHT
@@ -372,6 +380,98 @@ class ActionPlanner:
             logger.error(f"Planning failed: {e}")
             return []
 
+class NavigationPlanner:
+    """Uses Gemini 3 Flash to decide next navigation step."""
+    def __init__(self, client):
+        self.client = client
+        self.model_name = MODEL_NAVIGATION
+
+    def decide_next_step(self, current_desc: str, prev_desc: str, goal: str) -> Dict[str, Any]:
+        logger = get_logger()
+        logger.info(f"Planning navigation step. Goal: {goal}")
+        
+        prompt = f"""
+        You are a VR Navigation Agent.
+        Goal: "{goal}"
+        
+        Current View Description:
+        {current_desc}
+        
+        Previous View Description:
+        {prev_desc}
+        
+        Decide the next action to take to reach the goal.
+        
+        CONTROL SCHEME RULES:
+        1. TO MOVE FORWARD: You MUST use `click_trackpad_direction("controller1", "up", duration=1.0)`.
+           - This simulates pressing the top of the left trackpad.
+        2. TO MOVE Backward: You MUST use `click_trackpad_direction("controller1", "down", duration=1.0)`.
+           - This simulates pressing the bottom of the left trackpad.
+        3. TO STRAFE LEFT: You MUST use `click_trackpad_direction("controller1", "left", duration=1.0)`.
+           - This simulates pressing the left of the left trackpad.
+        4. TO STRAFE RIGHT: You MUST use `click_trackpad_direction("controller1", "right", duration=1.0)`.
+           - This simulates pressing the right of the left trackpad.
+        5. TO ROTATE/TURN: Use `rotate_device("headset", pitch=0, yaw=45, roll=0)` for turning.
+           - Positive yaw rotates right, negative yaw rotates left.
+        
+        The available actions are:
+        - click_trackpad_direction(device, direction, duration) -> Move headset in 3D space.
+        - rotate_device(device, pitch, yaw, roll) -> Rotate headset to turn.
+        - check_goal_reached() -> If the goal is reached.
+        
+        Return STRICT JSON format:
+        {{
+            "tool": "tool_name",
+            "args": {{ "arg1": "val1" }},
+            "reasoning": "Why this action?"
+        }}
+        """
+        
+        class NavStep(BaseModel):
+            tool: str = Field(description="The name of the tool to call.")
+            device: Optional[str] = Field(default="headset", description="Device: 'headset', 'controller1', or 'controller2'")
+            dx: Optional[float] = Field(default=0.0, description="X movement (negative=left, positive=right)")
+            dy: Optional[float] = Field(default=0.0, description="Y movement (negative=down, positive=up)")
+            dz: Optional[float] = Field(default=0.0, description="Z movement (negative=forward, positive=backward)")
+            pitch: Optional[float] = Field(default=0.0, description="Pitch rotation in degrees")
+            yaw: Optional[float] = Field(default=0.0, description="Yaw rotation in degrees (positive=right, negative=left)")
+            roll: Optional[float] = Field(default=0.0, description="Roll rotation in degrees")
+            reasoning: str = Field(description="Reasoning for this step.")
+
+        try:
+             response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": NavStep
+                }
+            )
+             if response.parsed:
+                 parsed = response.parsed
+                 # Build args dict from individual fields
+                 args = {}
+                 if parsed.device is not None:
+                     args["device"] = parsed.device
+                 if parsed.dx is not None:
+                     args["dx"] = parsed.dx
+                 if parsed.dy is not None:
+                     args["dy"] = parsed.dy
+                 if parsed.dz is not None:
+                     args["dz"] = parsed.dz
+                 if parsed.pitch is not None:
+                     args["pitch"] = parsed.pitch
+                 if parsed.yaw is not None:
+                     args["yaw"] = parsed.yaw
+                 if parsed.roll is not None:
+                     args["roll"] = parsed.roll
+                 return {"tool": parsed.tool, "args": args, "reasoning": parsed.reasoning}
+             else:
+                 return json.loads(response.text)
+        except Exception as e:
+            logger.error(f"Navigation planning failed: {e}")
+            return {"tool": "wait", "args": {}, "reasoning": "Error in planning"}
+
 # ============================================================================
 # VERIFICATION (Gemini 2.5 Pro)
 # ============================================================================
@@ -418,6 +518,27 @@ class Describer:
             ])]
         )
         return response.text
+    
+    def describe_multi(self, labeled_images: list, question: str) -> str:
+        """
+        Describe multiple images with labels (e.g., front/left/right views).
+        
+        Args:
+            labeled_images: List of tuples (label, image_bytes)
+            question: The prompt/question for the model
+        """
+        parts = [types.Part(text=question)]
+        
+        for label, img_data in labeled_images:
+            # Add label for each image
+            parts.append(types.Part(text=f"\n[{label.upper()} VIEW]:"))
+            parts.append(types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=img_data)))
+        
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=[types.Content(role="user", parts=parts)]
+        )
+        return response.text
 
 # ============================================================================
 # EXECUTOR
@@ -446,13 +567,19 @@ class DirectMCPExecutor:
 _executor = None
 _grounder = None
 _tracker = None
+_nav_planner = None
+_describer = None
+_agent_ref = None # To access history
 
-def _get_tools(executor, grounder, tracker):
+def _get_tools(executor, grounder, tracker, nav_planner, describer, agent_ref):
     """Define tools as a list of callables."""
-    global _executor, _grounder, _tracker
+    global _executor, _grounder, _tracker, _nav_planner, _describer, _agent_ref
     _executor = executor
     _grounder = grounder
     _tracker = tracker
+    _nav_planner = nav_planner
+    _describer = describer
+    _agent_ref = agent_ref
     
     def _log_action(tool_name, **kwargs):
         get_logger().info(f"[TOOL] {tool_name}({kwargs})")
@@ -832,6 +959,7 @@ def _get_tools(executor, grounder, tracker):
             inference_state = _tracker.processor.set_image(pil_img_loop)
             
             points = {}
+            masks_for_viz = {}  # Store masks for visualization
             
             for key, desc in targets.items():
                 if key not in current_boxes: continue # Should not happen unless lost
@@ -844,6 +972,8 @@ def _get_tools(executor, grounder, tracker):
                 norm_box_cxcywh = _tracker.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
                 
                 _tracker.processor.reset_all_prompts(inference_state)
+                # Set text prompt to help SAM differentiate between similar objects
+                inference_state = _tracker.processor.set_text_prompt(desc, inference_state)
                 inference_state = _tracker.processor.add_geometric_prompt(
                     state=inference_state, box=norm_box_cxcywh, label=True
                 )
@@ -859,6 +989,9 @@ def _get_tools(executor, grounder, tracker):
                     print(f"[{key}] Lost tracking (no mask).")
                     del current_boxes[key]
                     continue
+                
+                # Store mask for visualization
+                masks_for_viz[key] = mask
                     
                 # Update Box & Extract Point
                 rows = np.any(mask, axis=1)
@@ -888,6 +1021,22 @@ def _get_tools(executor, grounder, tracker):
                 else:
                     print(f"[{key}] Mask empty.")
                     del current_boxes[key]
+            
+            # Apply colored mask overlays for visualization
+            for key, mask in masks_for_viz.items():
+                if key == "ray":
+                    # Blue overlay for ray (BGR: 255, 100, 0)
+                    color = np.array([255, 100, 0], dtype=np.uint8)
+                elif key == "logo":
+                    # Green overlay for target object (BGR: 0, 255, 100)
+                    color = np.array([0, 255, 100], dtype=np.uint8)
+                else:
+                    color = np.array([128, 128, 128], dtype=np.uint8)
+                
+                # Apply semi-transparent overlay
+                overlay = img_cv.copy()
+                overlay[mask] = color
+                cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
             
             # C. PID & Control
             if "ray" in points and "logo" in points:
@@ -1157,6 +1306,7 @@ Rules:
                 points = {}
                 boxes_to_track = {"ray": current_ray_box, "key": target_box}
                 updated_boxes = {}
+                masks_for_viz = {}  # Store masks for visualization
                 
                 for key, box in boxes_to_track.items():
                     box_x, box_y, box_w, box_h = box
@@ -1167,6 +1317,9 @@ Rules:
                     norm_box_cxcywh = _tracker.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
                     
                     _tracker.processor.reset_all_prompts(inference_state)
+                    # Set text prompt to help SAM differentiate between similar objects
+                    text_desc = "VR controller ray" if key == "ray" else f"keyboard key {char}"
+                    inference_state = _tracker.processor.set_text_prompt(text_desc, inference_state)
                     inference_state = _tracker.processor.add_geometric_prompt(
                         state=inference_state, box=norm_box_cxcywh, label=True
                     )
@@ -1181,6 +1334,9 @@ Rules:
                     if mask is None:
                         print(f"[{key}] Lost tracking (no mask).")
                         continue
+                    
+                    # Store mask for visualization
+                    masks_for_viz[key] = mask
                     
                     # Update Box & Extract Point
                     rows = np.any(mask, axis=1)
@@ -1206,6 +1362,22 @@ Rules:
                                 cy = int(M["m01"]/M["m00"])
                                 points[key] = (cx, cy)
                                 cv2.circle(img_cv, (cx, cy), 5, (0, 255, 0), -1)
+                
+                # Apply colored mask overlays for visualization
+                for key, mask in masks_for_viz.items():
+                    if key == "ray":
+                        # Blue overlay for ray (BGR: 255, 100, 0)
+                        color = np.array([255, 100, 0], dtype=np.uint8)
+                    elif key == "key":
+                        # Green overlay for key (BGR: 0, 255, 100)
+                        color = np.array([0, 255, 100], dtype=np.uint8)
+                    else:
+                        color = np.array([128, 128, 128], dtype=np.uint8)
+                    
+                    # Apply semi-transparent overlay
+                    overlay = img_cv.copy()
+                    overlay[mask] = color
+                    cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
                 
                 # Update boxes for next iteration
                 if "ray" in updated_boxes:
@@ -1272,9 +1444,165 @@ Rules:
         logger.info(result)
         return result
 
-    # =========================================================================
-    # CONTROLLER INPUT FUNCTIONS (Buttons, Triggers, Joystick)
-    # =========================================================================
+    def navigate_to_location(location_name: str, goal_description: str):
+        """
+        Navigates the agent to a specific location using a visual feedback loop.
+        
+        Args:
+            location_name: Name of the destination (e.g., "kitchen").
+            goal_description: Detailed visual description of the goal state or object to find.
+        """
+        _log_action("navigate_to_location", location=location_name, goal=goal_description)
+        logger = get_logger()
+        
+        print(f"Starting navigation to: {location_name}...")
+        print("Press Ctrl+C to stop navigation manually.")
+        
+        prev_desc = "None (Started navigation)"
+        
+        try:
+            while True:
+                # A. Capture Multiple Views (front, left, right) for panoramic awareness
+                images = []
+                view_angles = [("front", 0), ("left", -45), ("right", 45)]
+                
+                # Store original headset rotation to restore later
+                original_pose = _executor.call("get_current_pose", device="headset")
+                
+                for view_name, angle_offset in view_angles:
+                    if angle_offset != 0:
+                        # Rotate headset to capture side view
+                        rotate_device("headset", 0, angle_offset, 0)
+                        time.sleep(0.15)
+                    
+                    res = _executor.call("inspect_surroundings")
+                    if isinstance(res, str) and res.startswith("Error"):
+                        print(f"Capture failed for {view_name} view.")
+                        continue
+                    
+                    data = json.loads(res).get("data")
+                    img_bytes = base64.b64decode(data)
+                    images.append((view_name, img_bytes))
+                    
+                    if angle_offset != 0:
+                        # Rotate back to original
+                        rotate_device("headset", 0, -angle_offset, 0)
+                        time.sleep(0.15)
+                
+                if not images:
+                    print("All captures failed.")
+                    time.sleep(1)
+                    continue
+                
+                # B. Describe Multi-View with spatial directions (Gemini 2.5 Flash Lite)
+                prompt = f"""
+                You are describing the surroundings from 3 camera angles for a VR navigation agent.
+                The images show: FRONT view, LEFT view (-45°), and RIGHT view (+45°).
+                
+                Previous description was: "{prev_desc}"
+                Final goal: {goal_description}
+                
+                IMPORTANT: Describe what's visible in each direction:
+                - FRONT: What's directly ahead?
+                - LEFT: What's to the left?
+                - RIGHT: What's to the right?
+                
+                Then recommend which direction to go (FORWARD, TURN LEFT, or TURN RIGHT) to reach the goal.
+                Be specific about obstacles, paths, and the goal's location relative to current position.
+                """
+                
+                curr_desc = _describer.describe_multi(images, prompt)
+                print(f"\n[View]: {curr_desc[:200]}...")
+                
+                # C. Decide Next Action (Gemini 3 Flash - NavigationPlanner)
+                plan = _nav_planner.decide_next_step(curr_desc, prev_desc, goal_description)
+                tool = plan.get("tool")
+                args = plan.get("args")
+                reasoning = plan.get("reasoning")
+                
+                print(f"[Plan]: {tool} ({reasoning})")
+                
+                if tool == "check_goal_reached" or tool == "finish_task":
+                    return f"Navigation to {location_name} completed."
+                
+                # D. Execute Action
+                # We map a few allowed tools for safety in this loop
+                if tool == "move_relative":
+                    move_relative(**args)
+                elif tool == "rotate_device":
+                    rotate_device(**args)
+                elif tool == "wait":
+                    time.sleep(1.0)
+                else:
+                    print(f"Unknown navigation tool: {tool}")
+                
+                prev_desc = curr_desc
+                time.sleep(1.0)
+                
+        except KeyboardInterrupt:
+            return "Navigation stopped by user."
+        except Exception as e:
+            logger.error(f"Navigation loop error: {e}")
+            return f"Navigation failed: {e}"
+
+    def where_am_i():
+        """
+        Rotates the agent to different angles to capture a full view of the surroundings,
+        then analyzes the images along with chat history to describe the current location.
+        """
+        _log_action("where_am_i")
+        logger = get_logger()
+        
+        # 1. Capture 4 angles
+        images = []
+        angles = [0, 90, 180, 270]
+        
+        print("Looking around (0, 90, 180, 270 degrees)...")
+        
+        # Store initial pose to restore later if needed, though we just rotate relative usually.
+        # Let's assume we reset or just rotate relative. 
+        # For simplicity and robustness, we'll just rotate relative 90 degrees 4 times.
+        
+        for i in range(4):
+            # Capture
+            res = _executor.call("inspect_surroundings")
+            try:
+                data = json.loads(res).get("data")
+                img_bytes = base64.b64decode(data)
+                images.append(img_bytes)
+            except:
+                print(f"Failed to capture at step {i}")
+            
+            # Rotate 90 deg right
+            rotate_device("headset", 0, 90, 0)
+            time.sleep(0.5)
+            
+        # 2. Prepare Prompt with History
+        history_text = "\n".join([f"{msg['role']}: {msg['content']}" for msg in _agent_ref.chat_history[-10:]])
+        
+        prompt = f"""
+        You are a VR Agent.
+        Here are 4 views of your current surroundings (0, 90, 180, 270 degrees).
+        
+        Chat History:
+        {history_text}
+        
+        Based on these views and the history, describe EXACTLY where you are within the environment.
+        """
+        
+        # 3. Call Gemini (Multi-image)
+        try:
+            contents = [types.Part(text=prompt)]
+            for img_data in images:
+                contents.append(types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=img_data)))
+                
+            response = _describer.client.models.generate_content(
+                model=MODEL_DESCRIPTION,
+                contents=[types.Content(role="user", parts=contents)]
+            )
+            return response.text
+        except Exception as e:
+            return f"Localization failed: {e}"
     
     def press_button(controller: str, button: str):
         """
@@ -1490,6 +1818,8 @@ Rules:
         inspect_surroundings, locate_object, capture_video, 
         # Tracking
         track_object, track_multiple_items, visual_servo_to_object, create_tracking_video, type_text, 
+        # Navigation & Localization
+        navigate_to_location, where_am_i,
         # Controller Positioning
         reset_controller_positions, position_controller_relative_to_headset, open_menu_sequence,
         # Button/Input Controls
@@ -1519,6 +1849,9 @@ class GeminiAgent:
         self.planner = ActionPlanner(self.client)
         self.verifier = Verifier(self.client)
         self.describer = Describer(self.client)
+        self.nav_planner = NavigationPlanner(self.client)
+        
+        self.chat_history = [] # Store conversation
         
         if ObjectTracker:
             self.tracker = ObjectTracker(LOG_DIR)
@@ -1526,7 +1859,7 @@ class GeminiAgent:
             self.tracker = None
         
         # Tools (for execution phase)
-        self.tools = _get_tools(self.executor, self.grounder, self.tracker)
+        self.tools = _get_tools(self.executor, self.grounder, self.tracker, self.nav_planner, self.describer, self)
         # Create a mapping for manual execution from plan
         self.tool_map = {t.__name__: t for t in self.tools}
         self.tool_map["describe_view"] = self._describe_view_tool
@@ -1559,6 +1892,7 @@ class GeminiAgent:
 
     def run(self, user_input: str):
         self.logger.info(f"User: {user_input}")
+        self.chat_history.append({"role": "user", "content": user_input})
         print("\nAgent (Planner) is thinking...")
         
         # 1. PLANNING PHASE (Gemini 3 Flash)
@@ -1583,6 +1917,7 @@ class GeminiAgent:
                     # Execute tool
                     result = func(**step.args)
                     print(f"Result: {str(result)[:200]}...")
+                    self.chat_history.append({"role": "agent", "content": f"Executed {step.tool}: {result}"})
                     self.logger.info(f"Step '{step.tool}' Result: {result}")
                 except Exception as e:
                     print(f"Execution Error: {e}")

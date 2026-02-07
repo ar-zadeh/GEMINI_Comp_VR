@@ -201,6 +201,13 @@ class Sam3Processor:
         out_probs = out_probs[keep]
         out_masks = out_masks[keep]
         out_bbox = out_bbox[keep]
+        
+        # Select only the highest confidence object among those that pass the threshold
+        if out_probs.numel() > 0:
+            best_idx = out_probs.argmax()
+            out_probs = out_probs[best_idx:best_idx+1]
+            out_masks = out_masks[best_idx:best_idx+1]
+            out_bbox = out_bbox[best_idx:best_idx+1]
 
         # convert to [x0, y0, x1, y1] format
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)

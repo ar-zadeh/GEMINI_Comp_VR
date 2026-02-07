@@ -55,8 +55,8 @@ class ObjectTracker:
                 # Build model and processor
                 self.model = build_sam3_image_model(bpe_path=bpe_path)
                 # User requested higher confidence to prevent tracking swaps
-                self.processor = Sam3Processor(self.model, confidence_threshold=0.92)
-                logger.info("SAM 3 Model initialized with confidence 0.92.")
+                self.processor = Sam3Processor(self.model, confidence_threshold=0.87)
+                logger.info("SAM 3 Model initialized with confidence 0.87.")
             except Exception as e:
                 logger.error(f"Failed to init SAM 3: {e}")
                 self.available = False

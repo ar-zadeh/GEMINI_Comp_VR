@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""
+Keyboard-based VR movement controller (WSL/Linux compatible).
+
+Uses termios + select for raw terminal input — no X11/Wayland required.
+Works in WSL, SSH, and any Linux terminal.
+
+Controls:
+    WASD    = headset position (yaw-relative)
+    Q/E     = headset up/down
+    Arrows  = headset rotation (pitch/yaw)
+    `       = toggle keyboard control off (return to normal input)
+
+Controllers maintain fixed relative offsets to the headset.
+
+Usage:
+    from keyboard_controller import KeyboardVRController
+    ctrl = KeyboardVRController(mcp_module)
+    ctrl.activate()  # blocks until backtick pressed again
+"""
+
+import sys
+import os
+import math
+import time
+import select
+from typing import Dict
+
+# Terminal control — Unix only (WSL/Linux/macOS)
+try:
+    import termios
+    import tty
+    TERMIOS_AVAILABLE = True
+except ImportError:
+    TERMIOS_AVAILABLE = False
+
+
+class KeyboardVRController:
+    """
+    Keyboard-based VR movement controller.
+
+    WASD = headset position (yaw-relative)
+    Q/E  = headset up/down
+    Arrow keys = headset rotation (pitch/yaw)
+    Backtick (`) = toggle off, return to normal input.
+
+    Controllers maintain fixed relative offsets to headset.
+    Uses termios raw mode — works in WSL, SSH, any terminal.
+    """
+
+    def __init__(self, mcp_module, move_step: float = 0.05, rotate_step: float = 2.0):
+        """
+        Args:
+            mcp_module: The live mcp_server module (provides current_poses, state_lock, broadcast_state).
+            move_step: Meters per keypress for WASD/QE (default 0.05m = 5cm).
+            rotate_step: Degrees per keypress for arrow keys (default 2.0 degrees).
+        """
+        self.mcp = mcp_module
+        self.move_step = move_step
+        self.rotate_step = rotate_step
+
+        self.active = False
+
+        # Controller offsets relative to headset in headset-local coordinates.
+        # forward: +ve = in front of headset (toward -Z at yaw=0)
+        # right:   +ve = to the right of headset (+X at yaw=0)
+        # up:      +ve = above headset, -ve = below
+        self._controller_offsets: Dict[str, Dict[str, float]] = {
+            'controller1': {
+                'forward': 0.3, 'right': -0.3, 'up': -0.5,
+                'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0
+            },
+            'controller2': {
+                'forward': 0.3, 'right': 0.3, 'up': -0.5,
+                'pitch': 0.0, 'yaw': 0.0, 'roll': 0.0
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def activate(self):
+        """
+        Enter keyboard VR control mode. Blocks until backtick is pressed.
+
+        Switches terminal to cbreak mode (char-by-char, no echo),
+        reads keys, dispatches movement/rotation, then restores terminal
+        when backtick is pressed.
+        """
+        if not TERMIOS_AVAILABLE:
+            print("[KeyboardVRController] termios not available (Windows?). Use WSL or Linux.")
+            return
+
+        self.active = True
+        self.capture_current_offsets()
+
+        print("\n[Keyboard VR Control] ENABLED")
+        print("  WASD = move | Q/E = up/down | Arrows = rotate | ` = exit keyboard mode")
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+
+        try:
+            # cbreak mode: char-by-char input, no echo, Ctrl+C still generates SIGINT
+            tty.setcbreak(fd)
+
+            while self.active:
+                # select() with 50ms timeout — efficient, no CPU spinning
+                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not ready:
+                    continue
+
+                ch = sys.stdin.read(1)
+
+                if ch == '`':
+                    # Toggle off
+                    self.active = False
+                    break
+                elif ch == '\x1b':
+                    # ESC — could be start of arrow key escape sequence
+                    self._handle_escape_sequence()
+                elif ch == '\x03':
+                    # Ctrl+C — respect it even in cbreak mode
+                    self.active = False
+                    raise KeyboardInterrupt
+                else:
+                    self._handle_char(ch)
+
+        finally:
+            # Always restore original terminal settings
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        print("\n[Keyboard VR Control] DISABLED")
+
+    def stop(self):
+        """Force-stop keyboard control (e.g., on exit)."""
+        self.active = False
+
+    def set_controller_offset(
+        self,
+        controller: str,
+        forward: float = 0.3,
+        right: float = 0.0,
+        up: float = -0.5,
+        pitch: float = 0.0,
+        yaw: float = 0.0,
+        roll: float = 0.0,
+    ):
+        """
+        Manually set a controller's position/rotation offset relative to the headset.
+
+        Args:
+            controller: "controller1" or "controller2"
+            forward: Distance in front of headset (+ve = in front).
+            right: Distance to the right (+ve = right, -ve = left).
+            up: Distance above headset (+ve = above, -ve = below).
+            pitch/yaw/roll: Rotation offset in degrees added to headset rotation.
+        """
+        if controller not in self._controller_offsets:
+            print(f"[KeyboardVRController] Invalid controller: {controller}")
+            return
+
+        self._controller_offsets[controller] = {
+            'forward': forward, 'right': right, 'up': up,
+            'pitch': pitch, 'yaw': yaw, 'roll': roll,
+        }
+
+        self._update_controllers()
+        self.mcp.broadcast_state()
+        print(f"[KeyboardVRController] {controller} offset set: "
+              f"fwd={forward}, right={right}, up={up}, "
+              f"pitch={pitch}, yaw={yaw}, roll={roll}")
+
+    def capture_current_offsets(self):
+        """
+        Compute controller offsets from current world poses.
+        Call this to snapshot whatever positions the controllers are currently at
+        so they stay locked there relative to the headset.
+        """
+        with self.mcp.state_lock:
+            headset_pos = self.mcp.current_poses['headset']['pos']
+            headset_rot = self.mcp.current_poses['headset']['rot']
+            headset_yaw = math.radians(float(headset_rot[1]))
+
+            for ctrl_name in ['controller1', 'controller2']:
+                ctrl_pos = self.mcp.current_poses[ctrl_name]['pos']
+                ctrl_rot = self.mcp.current_poses[ctrl_name]['rot']
+
+                # World-space delta from headset to controller
+                wx = float(ctrl_pos[0]) - float(headset_pos[0])
+                wy = float(ctrl_pos[1]) - float(headset_pos[1])
+                wz = float(ctrl_pos[2]) - float(headset_pos[2])
+
+                # Inverse yaw rotation: world -> headset-local
+                forward = wx * math.sin(headset_yaw) - wz * math.cos(headset_yaw)
+                right = wx * math.cos(headset_yaw) + wz * math.sin(headset_yaw)
+                up = wy
+
+                # Rotation offset = controller rotation - headset rotation
+                pitch_off = float(ctrl_rot[0]) - float(headset_rot[0])
+                yaw_off = float(ctrl_rot[1]) - float(headset_rot[1])
+                roll_off = float(ctrl_rot[2]) - float(headset_rot[2])
+
+                self._controller_offsets[ctrl_name] = {
+                    'forward': forward, 'right': right, 'up': up,
+                    'pitch': pitch_off, 'yaw': yaw_off, 'roll': roll_off,
+                }
+
+        print("[KeyboardVRController] Controller offsets captured from current poses.")
+        for name, off in self._controller_offsets.items():
+            print(f"  {name}: fwd={off['forward']:.3f}, right={off['right']:.3f}, "
+                  f"up={off['up']:.3f}, pitch={off['pitch']:.1f}, "
+                  f"yaw={off['yaw']:.1f}, roll={off['roll']:.1f}")
+
+    # ------------------------------------------------------------------
+    # Key dispatch
+    # ------------------------------------------------------------------
+
+    def _handle_char(self, ch: str):
+        """Handle a single character keypress (WASD, QE)."""
+        ch = ch.lower()
+        if ch == 'w':
+            self._move_headset(forward=self.move_step)
+        elif ch == 's':
+            self._move_headset(forward=-self.move_step)
+        elif ch == 'a':
+            self._move_headset(right=-self.move_step)
+        elif ch == 'd':
+            self._move_headset(right=self.move_step)
+        elif ch == 'q':
+            self._move_headset(up=self.move_step)
+        elif ch == 'e':
+            self._move_headset(up=-self.move_step)
+
+    def _handle_escape_sequence(self):
+        """Parse an escape sequence (arrow keys: ESC [ A/B/C/D)."""
+        # Wait briefly for the rest of the sequence
+        ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not ready:
+            return  # Bare ESC press — ignore
+
+        ch2 = sys.stdin.read(1)
+        if ch2 != '[':
+            return  # Not a CSI sequence — ignore
+
+        ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not ready:
+            return
+
+        ch3 = sys.stdin.read(1)
+        if ch3 == 'A':       # Up arrow
+            self._rotate_headset(dpitch=-self.rotate_step)
+        elif ch3 == 'B':     # Down arrow
+            self._rotate_headset(dpitch=self.rotate_step)
+        elif ch3 == 'C':     # Right arrow
+            self._rotate_headset(dyaw=self.rotate_step)
+        elif ch3 == 'D':     # Left arrow
+            self._rotate_headset(dyaw=-self.rotate_step)
+
+    # ------------------------------------------------------------------
+    # Internal movement logic
+    # ------------------------------------------------------------------
+
+    def _move_headset(self, forward: float = 0.0, right: float = 0.0, up: float = 0.0):
+        """Move headset in its local forward/right/up directions, then reposition controllers."""
+        with self.mcp.state_lock:
+            pos = self.mcp.current_poses['headset']['pos']
+            yaw_rad = math.radians(float(self.mcp.current_poses['headset']['rot'][1]))
+
+            # Transform local movement to world space
+            # forward=+ve moves toward -Z at yaw=0 (VR forward)
+            dx = forward * math.sin(yaw_rad) + right * math.cos(yaw_rad)
+            dz = forward * (-math.cos(yaw_rad)) + right * math.sin(yaw_rad)
+            dy = up
+
+            self.mcp.current_poses['headset']['pos'] = [
+                float(pos[0]) + dx,
+                float(pos[1]) + dy,
+                float(pos[2]) + dz,
+            ]
+
+            # Update controllers while we still hold the lock
+            self._update_controllers_locked()
+
+        # broadcast_state acquires its own lock
+        self.mcp.broadcast_state()
+
+    def _rotate_headset(self, dpitch: float = 0.0, dyaw: float = 0.0, droll: float = 0.0):
+        """Incrementally rotate headset, then reposition controllers."""
+        with self.mcp.state_lock:
+            rot = self.mcp.current_poses['headset']['rot']
+            self.mcp.current_poses['headset']['rot'] = [
+                float(rot[0]) + dpitch,
+                float(rot[1]) + dyaw,
+                float(rot[2]) + droll,
+            ]
+
+            # Update controllers while we still hold the lock
+            self._update_controllers_locked()
+
+        self.mcp.broadcast_state()
+
+    def _update_controllers(self):
+        """Recalculate controller world poses from headset pose + stored offsets (acquires lock)."""
+        with self.mcp.state_lock:
+            self._update_controllers_locked()
+
+    def _update_controllers_locked(self):
+        """Recalculate controller world poses. Caller MUST hold state_lock."""
+        headset_pos = self.mcp.current_poses['headset']['pos']
+        headset_rot = self.mcp.current_poses['headset']['rot']
+        headset_yaw = math.radians(float(headset_rot[1]))
+
+        for ctrl_name, offsets in self._controller_offsets.items():
+            fwd = offsets['forward']
+            rgt = offsets['right']
+            up = offsets['up']
+
+            # World position from headset-local offsets (same formula as mcp_server)
+            world_x = float(headset_pos[0]) + fwd * math.sin(headset_yaw) + rgt * math.cos(headset_yaw)
+            world_y = float(headset_pos[1]) + up
+            world_z = float(headset_pos[2]) + fwd * (-math.cos(headset_yaw)) + rgt * math.sin(headset_yaw)
+
+            self.mcp.current_poses[ctrl_name]['pos'] = [world_x, world_y, world_z]
+
+            # Controller rotation = headset rotation + offset
+            self.mcp.current_poses[ctrl_name]['rot'] = [
+                float(headset_rot[0]) + offsets['pitch'],
+                float(headset_rot[1]) + offsets['yaw'],
+                float(headset_rot[2]) + offsets['roll'],
+            ]

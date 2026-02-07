@@ -618,7 +618,8 @@ IMPORTANT RULES:
         self.active = False
         self.stop_event.set()
         if self.loop_thread and self.loop_thread.is_alive():
-            self.loop_thread.join(timeout=2.0)
+            if threading.current_thread() != self.loop_thread:
+                self.loop_thread.join(timeout=2.0)
         
         logger = get_logger()
         logger.info("White cane deactivated.")
@@ -2193,7 +2194,7 @@ if __name__ == "__main__":
                 print(result)
                 
                 # Start the automatic loop
-                agent.white_cane.start_background_loop(interval=2.0)
+                agent.white_cane.start_background_loop(interval=10.0)
                 continue
             
             # White Cane Deactivation
@@ -2203,7 +2204,7 @@ if __name__ == "__main__":
                 continue
             
             # White Cane Help (immediate description)
-            elif agent.white_cane.active and cmd in ['help', 'what do you see', 'describe']:
+            elif agent.white_cane.active and cmd in ['help', 'what do you see', 'describe', "what's next", 'whats next']:
                 print("\nGetting immediate description...")
                 description = agent.white_cane.get_immediate_help()
                 print(f"\n[White Cane]:\n{description}\n")

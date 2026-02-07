@@ -71,6 +71,10 @@ class KeyboardVRController:
         self._thread = None
         self._old_term_settings = None
 
+        # Modes: 'trackpad' (default) or 'headset'
+        self.mode = 'trackpad' 
+        self.target_controller = 'controller1' # Right controller for trackpad
+
         # Controller offsets relative to headset in headset-local coordinates.
         # forward: +ve = in front of headset (toward -Z at yaw=0)
         # right:   +ve = to the right of headset (+X at yaw=0)
@@ -124,7 +128,13 @@ class KeyboardVRController:
         self._thread.start()
 
         print("\n[Keyboard VR Control] ENABLED")
-        print("  WASD = move | Q/E = up/down | Arrows = rotate | ` = exit keyboard mode")
+        print(f"  Current Mode: {self.mode.upper()}")
+        print("  Controls:")
+        print("    WASD    = Move Headset OR Trackpad (Top/Left/Down/Right)")
+        print("    Q/E     = Up/Down (Headset)")
+        print("    Arrows  = Rotate (Headset)")
+        print("    m       = Toggle Mode (Trackpad <-> Headset)")
+        print("    `       = Exit Keyboard Mode")
 
     def deactivate(self):
         """
@@ -323,20 +333,65 @@ class KeyboardVRController:
     # ------------------------------------------------------------------
 
     def _handle_char(self, ch: str):
-        """Handle a single character keypress (WASD, QE)."""
+        """Handle a single character keypress (WASD, QE, m)."""
         ch = ch.lower()
-        if ch == 'w':
-            self._move_headset(forward=self.move_step)
-        elif ch == 's':
-            self._move_headset(forward=-self.move_step)
-        elif ch == 'a':
-            self._move_headset(right=-self.move_step)
-        elif ch == 'd':
-            self._move_headset(right=self.move_step)
-        elif ch == 'q':
-            self._move_headset(up=self.move_step)
-        elif ch == 'e':
-            self._move_headset(up=-self.move_step)
+
+        # Mode Toggle
+        if ch == 'm':
+            self.mode = 'headset' if self.mode == 'trackpad' else 'trackpad'
+            print(f"\n[Keyboard] Switched to {self.mode.upper()} mode.")
+            return
+
+        # TRACKPAD MODE (Default)
+        if self.mode == 'trackpad':
+            # WASD maps to trackpad directions on right controller
+            direction = None
+            if ch == 'w': direction = 'up'     # Top
+            elif ch == 's': direction = 'down' # Bottom
+            elif ch == 'a': direction = 'left' # Left
+            elif ch == 'd': direction = 'right'# Right
+            
+            if direction:
+                # Use primitives from mcp_server directly since click_trackpad_direction is not available there
+                try:
+                    # 1. Move Joystick/Trackpad to direction
+                    if hasattr(self.mcp, 'move_joystick_direction'):
+                        self.mcp.move_joystick_direction(self.target_controller, direction, magnitude=1.0)
+                    
+                    # Wait briefly for move to register
+                    # time.sleep(0.001)
+                    
+                    # 2. Click Trackpad
+                    if hasattr(self.mcp, 'click_button'):
+                        self.mcp.click_button(self.target_controller, 'trackpad', duration=0.02)
+                        
+                except Exception as e:
+                    print(f"[Keyboard] Error triggering trackpad: {e}")
+            
+            # Allow Q/E/Arrows to still work for headset even in trackpad mode?
+            # User said "create two modes with the default being this".
+            # Usually users want to move their head too. 
+            # I will allow Q/E and Arrows for headset movement in BOTH modes, 
+            # as they don't conflict with WASD trackpad usage.
+            if ch == 'q':
+                self._move_headset(up=self.move_step)
+            elif ch == 'e':
+                self._move_headset(up=-self.move_step)
+
+        # HEADSET MODE (Legacy)
+        elif self.mode == 'headset':
+            if ch == 'w':
+                self._move_headset(forward=self.move_step)
+            elif ch == 's':
+                self._move_headset(forward=-self.move_step)
+            elif ch == 'a':
+                self._move_headset(right=-self.move_step)
+            elif ch == 'd':
+                self._move_headset(right=self.move_step)
+            elif ch == 'q':
+                self._move_headset(up=self.move_step)
+            elif ch == 'e':
+                self._move_headset(up=-self.move_step)
 
     def _handle_escape_sequence(self):
         """Parse an escape sequence (arrow keys: ESC [ A/B/C/D)."""

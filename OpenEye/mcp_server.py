@@ -61,7 +61,7 @@ default_input = {
     'grip': False,
     'triggerClick': False,
     'trackpadClick': False,
-    'trackpadTouch': False,
+    'trackpadTouch': True,
     'buttonA': False,
     'buttonB': False,
     'triggerValue': 0.0,

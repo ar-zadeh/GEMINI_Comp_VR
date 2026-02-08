@@ -92,6 +92,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
 from PIL import Image
+import queue
 
 # Remaining original imports
 import shlex
@@ -105,10 +106,7 @@ import shutil
 # --- CONFIG ---
 MODEL_PLANNER = "gemini-3-flash-preview"
 MODEL_GROUNDING = "gemini-3-flash-preview"
-MODEL_VERIFICATION = "gemini-2.5-pro" 
-MODEL_PLANNER = "gemini-3-flash-preview"
-MODEL_GROUNDING = "gemini-3-flash-preview"
-MODEL_VERIFICATION = "gemini-2.5-pro" 
+MODEL_VERIFICATION = "gemini-2.5-flash" 
 MODEL_DESCRIPTION = "gemini-2.5-flash-lite-preview-09-2025"
 MODEL_WHITE_CANE = "gemini-3-flash-preview"
 
@@ -308,11 +306,17 @@ class VisualGrounder:
 class AudioAssistant:
     """
     Handles Text-to-Speech (gTTS) and Speech-to-Text (Whisper).
+    Uses a queue to ensure TTS messages are played sequentially.
     """
-    def __init__(self, log_dir: Path):
+    def __init__(self, log_dir: Path, executor=None):
         self.log_dir = log_dir / "audio"
         self.log_dir.mkdir(exist_ok=True, parents=True)
         self.whisper_model = None
+        self.executor = executor
+        
+        # TTS Queue
+        self.speech_queue = queue.Queue()
+        threading.Thread(target=self._speech_worker, daemon=True).start()
         
         if AUDIO_AVAILABLE:
             try:
@@ -322,49 +326,77 @@ class AudioAssistant:
             except Exception as e:
                 print(f"Failed to load Whisper model: {e}")
 
-    def speak(self, text: str):
-        """Convert text to speech and play it."""
-        if not text or not AUDIO_AVAILABLE: return
-        
-        def _speak_thread():
+    def _speech_worker(self):
+        """Worker thread that processes the speech queue sequentially."""
+        while True:
+            text = self.speech_queue.get()
+            if text is None: break # Sentinel to stop if needed
+            
             try:
-                # Create temp file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-                    temp_path = fp.name
-                
-                # Generate speech
-                tts = gTTS(text=text, lang='en')
-                tts.save(temp_path)
-                
-                # Speed up audio 1.5x using ffmpeg if available
-                if subprocess.call(["which", "ffmpeg"], stdout=subprocess.DEVNULL) == 0:
+                if not AUDIO_AVAILABLE:
+                    self.speech_queue.task_done()
+                    continue
+
+                # Mute mic while speaking
+                if self.executor:
                     try:
-                        fast_path = temp_path.replace(".mp3", "_fast.mp3")
-                        subprocess.run([
-                            "ffmpeg", "-y", "-i", temp_path, "-filter:a", "atempo=1.5", "-vn", fast_path
-                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                        os.replace(fast_path, temp_path)
+                        self.executor.call("mute_microphone")
                     except Exception as e:
-                        print(f"Audio speed adjustment failed: {e}")
+                        print(f"Failed to mute mic: {e}")
 
-                # Play audio (try mpg123 first, then ffplay)
-                if subprocess.call(["which", "mpg123"], stdout=subprocess.DEVNULL) == 0:
-                     subprocess.run(["mpg123", "-q", temp_path], check=False, stdin=subprocess.DEVNULL)
-                elif subprocess.call(["which", "ffplay"], stdout=subprocess.DEVNULL) == 0:
-                     subprocess.run(["ffplay", "-nodisp", "-autoexit", "-hide_banner", temp_path], check=False, stdin=subprocess.DEVNULL)
-                elif subprocess.call(["which", "aplay"], stdout=subprocess.DEVNULL) == 0:
-                     # gTTS saves as mp3, aplay plays wav. Needs conversion or just fail.
-                     print("Warning: Only 'aplay' found, but gTTS outputs MP3. Please install mpg123 or ffmpeg.")
-                else:
-                    print("Error: No audio player found (install mpg123 or ffmpeg).")
-                
-                # Cleanup
-                os.remove(temp_path)
+                try:
+                    # Create temp file
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+                        temp_path = fp.name
+                    
+                    # Generate speech
+                    tts = gTTS(text=text, lang='en')
+                    tts.save(temp_path)
+                    
+                    # Speed up audio 1.5x using ffmpeg if available
+                    if subprocess.call(["which", "ffmpeg"], stdout=subprocess.DEVNULL) == 0:
+                        try:
+                            fast_path = temp_path.replace(".mp3", "_fast.mp3")
+                            subprocess.run([
+                                "ffmpeg", "-y", "-i", temp_path, "-filter:a", "atempo=1.5", "-vn", fast_path
+                            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                            os.replace(fast_path, temp_path)
+                        except Exception as e:
+                            print(f"Audio speed adjustment failed: {e}")
+
+                    # Play audio (try mpg123 first, then ffplay)
+                    if subprocess.call(["which", "mpg123"], stdout=subprocess.DEVNULL) == 0:
+                         subprocess.run(["mpg123", "-q", temp_path], check=False, stdin=subprocess.DEVNULL)
+                    elif subprocess.call(["which", "ffplay"], stdout=subprocess.DEVNULL) == 0:
+                         subprocess.run(["ffplay", "-nodisp", "-autoexit", "-hide_banner", temp_path], check=False, stdin=subprocess.DEVNULL)
+                    elif subprocess.call(["which", "aplay"], stdout=subprocess.DEVNULL) == 0:
+                         # gTTS saves as mp3, aplay plays wav. Needs conversion or just fail.
+                         print("Warning: Only 'aplay' found, but gTTS outputs MP3. Please install mpg123 or ffmpeg.")
+                    else:
+                        print("Error: No audio player found (install mpg123 or ffmpeg).")
+                    
+                    # Cleanup
+                    os.remove(temp_path)
+
+                except Exception as e:
+                    print(f"TTS Error: {e}")
+                finally:
+                    # Unmute mic after speaking
+                    if self.executor:
+                        try:
+                            self.executor.call("unmute_microphone")
+                        except Exception as e:
+                            print(f"Failed to unmute mic: {e}")
+
             except Exception as e:
-                print(f"TTS Error: {e}")
+                print(f"Speech worker error: {e}")
+            finally:
+                self.speech_queue.task_done()
 
-        # Run in non-blocking thread
-        threading.Thread(target=_speak_thread, daemon=True).start()
+    def speak(self, text: str):
+        """Add text to the speech queue."""
+        if not text: return
+        self.speech_queue.put(text)
 
     def listen(self, duration: int = 5) -> Optional[str]:
         """
@@ -419,6 +451,16 @@ class AudioAssistant:
         # 1. Start Recording (Non-blocking)
         print(f"\n[Recording started] Speak now... (Press Enter to stop)")
         
+        # Mute mic while recording? Wait, user wants to TALK.
+        # "whenever the user presses enter to talk, it mutes the SteamVR mic, and once they press enter again, unmutes it."
+        # This means while RECORDING for the Agent, the user should be MUTED in SteamVR (so they don't broadcast to the game).
+        
+        if self.executor:
+            try:
+                self.executor.call("mute_microphone")
+            except Exception as e:
+                print(f"Failed to mute mic: {e}")
+
         try:
             # -f cd sets 16bit little endian, 44100Hz, stereo
             cmd = ["arecord", "-f", "cd", str(wav_path)]
@@ -426,7 +468,10 @@ class AudioAssistant:
             process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
             # 2. Wait for User Input to Stop
-            input() 
+            try:
+                input() 
+            except EOFError:
+                pass # Handle cases where stdin is closed
             
             # 3. Stop Recording
             process.terminate()
@@ -440,7 +485,13 @@ class AudioAssistant:
         except Exception as e:
             print(f"Recording failed: {e}")
             return None
-            
+        finally:
+            # Unmute mic after recording
+            if self.executor:
+                try:
+                    self.executor.call("unmute_microphone")
+                except Exception as e:
+                    print(f"Failed to unmute mic: {e}")
         if not wav_path.exists() or wav_path.stat().st_size < 100:
             print("Recording failed or empty.")
             return None
@@ -592,7 +643,8 @@ class WhiteCaneAssistant:
         self.current_goal = None
         self.stop_event = threading.Event()
         self.loop_thread = None
-        self.audio = AudioAssistant(log_dir)
+        self.loop_thread = None
+        self.audio = AudioAssistant(log_dir, executor)
         
         # Caching - stores (timestamp_str, image_bytes, file_path)
         self.cached_images: List[tuple] = []
@@ -899,6 +951,7 @@ class Verifier:
         Action: "{action_description}"
         
         Be critical. If you see failure, explain why. If success, confirm it.
+        Use one sentence maximum as this will be read back to the user as a TTS feedback.
         """
         
         response = self.client.models.generate_content(
@@ -921,10 +974,22 @@ class Describer:
         self.model_name = MODEL_DESCRIPTION
         
     def describe(self, image_data: bytes, question: str) -> str:
+        # Add accessibility context for blind users
+        accessibility_prompt = (
+            "IMPORTANT: This response is for a blind user and will be read aloud. "
+            "Please provide a very detailed but succinct description. "
+            "Specifically mention important items users might need, especially buttons or texts on the screen and their locations. "
+            "CRITICAL: Do NOT use bullet points, lists, or multi-paragraph structured text. "
+            "Output a single continuous paragraph. "
+            "Ensure the description is fully detailed regardless of length so the user receives all necessary information."
+        )
+        
+        full_query = f"{accessibility_prompt}\n\nQuestion: {question}"
+
         response = self.client.models.generate_content(
             model=self.model_name,
             contents=[types.Content(role="user", parts=[
-                types.Part(text=question),
+                types.Part(text=full_query),
                 types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=image_data))
             ])]
         )
@@ -2254,6 +2319,40 @@ class GeminiAgent:
         except Exception as e:
             return f"Verification failed: {e}"
 
+    def _get_spoken_action_name(self, tool: str, args: dict) -> str:
+        """Helper to get a natural language description of the action."""
+        if tool == "locate_object":
+            return f"Locating {args.get('object_description', 'object')}"
+        elif tool == "visual_servo_to_object":
+            return f"Aligning with {args.get('object_description', 'target')}"
+        elif tool == "type_text":
+            return f"Typing {args.get('text', 'text')}"
+        elif tool == "click_button":
+            return f"Clicking {args.get('button', 'button')}"
+        elif tool == "press_button":
+            return f"Pressing {args.get('button', 'button')}"
+        elif tool == "release_button":
+            return f"Releasing {args.get('button', 'button')}"
+        elif tool == "move_joystick_direction":
+            return f"Moving {args.get('direction', 'direction')}"
+        elif tool == "inspect_surroundings":
+            return "Inspecting surroundings"
+        elif tool == "describe_view":
+            return "Describing view"
+        elif tool == "verify_action":
+            return "Verifying action"
+        elif tool == "track_object":
+            return f"Tracking {args.get('object_description', 'object')}"
+        elif tool == "track_multiple_items":
+            return f"Tracking multiple items"
+        elif tool == "white_cane_describe":
+            return "Describing scene"
+        elif tool == "white_cane_set_goal":
+            return f"Setting goal to {args.get('goal', 'unknown')}"
+        else:
+            return f"Running {tool.replace('_', ' ')}"
+
+
     def run_task(self, user_input: str):
         """Runs the agent task in a separate thread (target for threading)."""
         self.stop_execution.clear()
@@ -2289,17 +2388,43 @@ class GeminiAgent:
             
             if func:
                 try:
+                    # Speak Action
+                    action_desc = self._get_spoken_action_name(step.tool, step.args)
+                    print(f"Speaking: {action_desc}...")
+                    self.white_cane.audio.speak(action_desc)
+                    
                     # Execute tool
                     result = func(**step.args)
                     print(f"Result: {str(result)[:200]}...")
                     self.chat_history.append({"role": "agent", "content": f"Executed {step.tool}: {result}"})
                     self.logger.info(f"Step '{step.tool}' Result: {result}")
+                    
+                    # Speak Result
+                    if isinstance(result, str):
+                        if result.lower().startswith("error") or "fail" in result.lower():
+                             self.white_cane.audio.speak("Action failed.")
+                        else:
+                             # For very short results, maybe speak them? For now, just "Done" or "Success" to be succinct.
+                             # If it's a description/verification, we might want to speak the result if it's short.
+                             if step.tool in ["describe_view", "verify_action", "locate_object"]:
+                                 # Speak the actual result for these information tools if short enough
+                                 if len(result) < 100:
+                                     self.white_cane.audio.speak(result)
+                                 else:
+                                     self.white_cane.audio.speak("Done. Content is long.")
+                             else:
+                                 self.white_cane.audio.speak("Success.")
+                    else:
+                        self.white_cane.audio.speak("Success.")
+
                 except Exception as e:
                     print(f"Execution Error: {e}")
                     self.logger.error(f"Execution Error in {step.tool}: {e}")
+                    self.white_cane.audio.speak("Error executing action.")
                     break
             else:
                 print(f"Error: Unknown tool '{step.tool}'")
+                self.white_cane.audio.speak(f"Unknown tool {step.tool}")
 
 
 

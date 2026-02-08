@@ -12,6 +12,8 @@ Changes from v1:
 """
 
 import os
+import sys
+import asyncio
 import shlex
 import json
 import time
@@ -30,6 +32,12 @@ import shutil
 import cv2
 import numpy as np
 from pydantic import BaseModel, Field
+
+if sys.version_info < (3, 11, 0):
+    import taskgroup, exceptiongroup
+
+    asyncio.TaskGroup = taskgroup.TaskGroup
+    asyncio.ExceptionGroup = exceptiongroup.ExceptionGroup
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -58,49 +66,26 @@ except ImportError:
     print("Please install google-genai: pip install google-genai")
     exit(1)
 
+# Audio & Speech Imports
+try:
+    import pyaudio
+    import wave
+    import tempfile
+    from gtts import gTTS
+    from openai import OpenAI
+    # Initialize OpenAI client (API key must be in env: OPENAI_API_KEY)
+    openai_client = OpenAI()
+except ImportError:
+    print("Missing audio dependencies. Please run: pip install openai gTTS pyaudio")
+    # We continue to allow non-audio parts to init, but agents will fail if used.
+
 # OpenCV availability
 try:
     import cv2
     import numpy as np
     CV2_AVAILABLE = True
 except ImportError:
-    print("Please install opencv-python and numpy")
-    exit(1)
-
-# Audio availability
-try:
-    from gtts import gTTS
-    import whisper
-    AUDIO_AVAILABLE = True
-except ImportError:
-    AUDIO_AVAILABLE = False
-    print("Warning: gTTS or openai-whisper not found. Audio features disabled.")
-
-# Standard Library
-import os
-import time
-import json
-import base64
-import threading
-import logging
-import traceback
-import io
-import subprocess
-import tempfile
-from pathlib import Path
-from typing import List, Dict, Any, Optional
-from datetime import datetime
-from pydantic import BaseModel, Field
-from PIL import Image
-
-# Remaining original imports
-import shlex
-from typing import Union
-from dataclasses import dataclass, field
-from PIL import ImageDraw, ImageFont, ImageFile
-import math
-import shutil
-
+    CV2_AVAILABLE = False
 
 # --- CONFIG ---
 MODEL_PLANNER = "gemini-3-flash-preview"
@@ -147,6 +132,113 @@ def get_logger():
     global _logger
     if not _logger: _logger = AgentLogger(LOG_DIR)
     return _logger
+
+# ============================================================================
+# AUDIO UTILS (Whisper & TTS)
+# ============================================================================
+
+class AudioUtils:
+    """Handles audio recording (for Whisper) and playback (for TTS)."""
+    
+    def __init__(self):
+        self.chunk = 1024
+        self.format = pyaudio.paInt16
+        self.channels = 1
+        self.rate = 16000 # Whisper likes 16k
+        self.p = pyaudio.PyAudio()
+
+    def record_audio(self, duration=5, silence_threshold=500, silence_duration=1.5):
+        """
+        Record audio from microphone.
+        Simple logic: Record for roughly 'duration' seconds, OR stop if silence is detected.
+        Returns: Path to temporary .wav file
+        """
+        print(f"\\n[Audio] Listening... (Max {duration}s)")
+        stream = self.p.open(format=self.format,
+                             channels=self.channels,
+                             rate=self.rate,
+                             input=True,
+                             frames_per_buffer=self.chunk)
+
+        frames = []
+        silent_chunks = 0
+        silence_chunk_limit = int(silence_duration * self.rate / self.chunk)
+        
+        # Max chunks
+        total_chunks = int(self.rate * duration / self.chunk)
+
+        try:
+            for i in range(0, total_chunks):
+                data = stream.read(self.chunk)
+                frames.append(data)
+                
+                # Simple silence detection
+                # Convert data to integers to check amplitude
+                audio_data = np.frombuffer(data, dtype=np.int16)
+                if np.abs(audio_data).mean() < silence_threshold:
+                    silent_chunks += 1
+                else:
+                    silent_chunks = 0
+                
+                if silent_chunks > silence_chunk_limit:
+                    print("[Audio] Silence detected, stopping recording.")
+                    break
+                    
+        except Exception as e:
+            print(f"[Audio] Recording error: {e}")
+        finally:
+            stream.stop_stream()
+            stream.close()
+
+        # Save to temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_wav:
+            wf = wave.open(tmp_wav.name, 'wb')
+            wf.setnchannels(self.channels)
+            wf.setsampwidth(self.p.get_sample_size(self.format))
+            wf.setframerate(self.rate)
+            wf.writeframes(b''.join(frames))
+            wf.close()
+            return tmp_wav.name
+
+    def play_text(self, text):
+        """Convert text to speech (gTTS) and play it."""
+        if not text: return
+        print(f"[Agent Speaking]: {text}")
+        
+        try:
+            # unique filename to avoid locks
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+                tts = gTTS(text=text, lang='en')
+                tts.save(fp.name)
+                tmp_mp3 = fp.name
+                
+            # Play options (Linux/WSL specific)
+            if shutil.which("mpg123"):
+                os.system(f"mpg123 -q {tmp_mp3}")
+            elif shutil.which("ffplay"):
+                os.system(f"ffplay -nodisp -autoexit -hide_banner {tmp_mp3} >/dev/null 2>&1")
+            else:
+                print("[Audio] No mp3 player found (mpg123/ffplay). Text was: " + text)
+                
+            os.remove(tmp_mp3)
+            
+        except Exception as e:
+            print(f"[Audio] TTS Error: {e}")
+
+    def play_wav(self, file_path):
+        """Play a wav file."""
+        wf = wave.open(file_path, 'rb')
+        stream = self.p.open(format=self.p.get_format_from_width(wf.getsampwidth()),
+                             channels=wf.getnchannels(),
+                             rate=wf.getframerate(),
+                             output=True)
+        data = wf.readframes(self.chunk)
+        while data:
+            stream.write(data)
+            data = wf.readframes(self.chunk)
+        stream.stop_stream()
+        stream.close()
+        wf.close()
 
 # ============================================================================
 # VISUAL GROUNDING (Gemini 3 Flash)
@@ -302,162 +394,6 @@ class VisualGrounder:
                 logger.error(f"CV2 draw failed: {e}")
 
 # ============================================================================
-# AUDIO (TTS & STT)
-# ============================================================================
-
-class AudioAssistant:
-    """
-    Handles Text-to-Speech (gTTS) and Speech-to-Text (Whisper).
-    """
-    def __init__(self, log_dir: Path):
-        self.log_dir = log_dir / "audio"
-        self.log_dir.mkdir(exist_ok=True, parents=True)
-        self.whisper_model = None
-        
-        if AUDIO_AVAILABLE:
-            try:
-                print("Loading Whisper model (base.en)... this may take a moment.")
-                self.whisper_model = whisper.load_model("base.en")
-                print("Whisper model loaded.")
-            except Exception as e:
-                print(f"Failed to load Whisper model: {e}")
-
-    def speak(self, text: str):
-        """Convert text to speech and play it."""
-        if not text or not AUDIO_AVAILABLE: return
-        
-        def _speak_thread():
-            try:
-                # Create temp file
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
-                    temp_path = fp.name
-                
-                # Generate speech
-                tts = gTTS(text=text, lang='en')
-                tts.save(temp_path)
-                
-                # Speed up audio 1.5x using ffmpeg if available
-                if subprocess.call(["which", "ffmpeg"], stdout=subprocess.DEVNULL) == 0:
-                    try:
-                        fast_path = temp_path.replace(".mp3", "_fast.mp3")
-                        subprocess.run([
-                            "ffmpeg", "-y", "-i", temp_path, "-filter:a", "atempo=1.5", "-vn", fast_path
-                        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
-                        os.replace(fast_path, temp_path)
-                    except Exception as e:
-                        print(f"Audio speed adjustment failed: {e}")
-
-                # Play audio (try mpg123 first, then ffplay)
-                if subprocess.call(["which", "mpg123"], stdout=subprocess.DEVNULL) == 0:
-                     subprocess.run(["mpg123", "-q", temp_path], check=False, stdin=subprocess.DEVNULL)
-                elif subprocess.call(["which", "ffplay"], stdout=subprocess.DEVNULL) == 0:
-                     subprocess.run(["ffplay", "-nodisp", "-autoexit", "-hide_banner", temp_path], check=False, stdin=subprocess.DEVNULL)
-                elif subprocess.call(["which", "aplay"], stdout=subprocess.DEVNULL) == 0:
-                     # gTTS saves as mp3, aplay plays wav. Needs conversion or just fail.
-                     print("Warning: Only 'aplay' found, but gTTS outputs MP3. Please install mpg123 or ffmpeg.")
-                else:
-                    print("Error: No audio player found (install mpg123 or ffmpeg).")
-                
-                # Cleanup
-                os.remove(temp_path)
-            except Exception as e:
-                print(f"TTS Error: {e}")
-
-        # Run in non-blocking thread
-        threading.Thread(target=_speak_thread, daemon=True).start()
-
-    def listen(self, duration: int = 5) -> Optional[str]:
-        """
-        Record audio for `duration` seconds and transcribe.
-        Returns transcribed text or None.
-        """
-        if not AUDIO_AVAILABLE or not self.whisper_model:
-            print("Audio tools not available.")
-            return None
-            
-        print(f"Listening for {duration} seconds... (Speak now)")
-        
-        timestamp = datetime.now().strftime("%H%M%S")
-        wav_path = self.log_dir / f"rec_{timestamp}.wav"
-        
-        # 1. Record with arecord
-        try:
-            # -f cd sets 16bit little endian, 44100Hz, stereo
-            # -d duration
-            cmd = ["arecord", "-f", "cd", "-d", str(duration), str(wav_path)]
-            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            print(f"Recording check failed (arecord): {e}")
-            return None
-            
-        if not wav_path.exists() or wav_path.stat().st_size < 100:
-            print("Recording failed or empty.")
-            return None
-            
-        # 2. Transcribe
-        print("Transcribing...")
-        try:
-            result = self.whisper_model.transcribe(str(wav_path))
-            text = result["text"].strip()
-            print(f"You said: {text}")
-            return text
-        except Exception as e:
-            print(f"Transcription failed: {e}")
-            return None
-    def listen_manual_stop(self) -> Optional[str]:
-        """
-        Starts recording audio and waits for the user to press Enter to stop.
-        Returns transcribed text or None.
-        """
-        if not AUDIO_AVAILABLE or not self.whisper_model:
-            print("Audio tools not available.")
-            return None
-        
-        timestamp = datetime.now().strftime("%H%M%S")
-        wav_path = self.log_dir / f"rec_{timestamp}.wav"
-        
-        # 1. Start Recording (Non-blocking)
-        print(f"\n[Recording started] Speak now... (Press Enter to stop)")
-        
-        try:
-            # -f cd sets 16bit little endian, 44100Hz, stereo
-            cmd = ["arecord", "-f", "cd", str(wav_path)]
-            # Start process
-            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            
-            # 2. Wait for User Input to Stop
-            input() 
-            
-            # 3. Stop Recording
-            process.terminate()
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                
-            print("[Recording stopped]")
-            
-        except Exception as e:
-            print(f"Recording failed: {e}")
-            return None
-            
-        if not wav_path.exists() or wav_path.stat().st_size < 100:
-            print("Recording failed or empty.")
-            return None
-            
-        # 4. Transcribe
-        print("Transcribing...")
-        try:
-            result = self.whisper_model.transcribe(str(wav_path))
-            text = result["text"].strip()
-            print(f"You said: {text}")
-            return text
-        except Exception as e:
-            print(f"Transcription failed: {e}")
-            return None
-
-
-# ============================================================================
 # PLANNING (Gemini 3 Flash)
 # ============================================================================
 
@@ -592,7 +528,6 @@ class WhiteCaneAssistant:
         self.current_goal = None
         self.stop_event = threading.Event()
         self.loop_thread = None
-        self.audio = AudioAssistant(log_dir)
         
         # Caching - stores (timestamp_str, image_bytes, file_path)
         self.cached_images: List[tuple] = []
@@ -608,16 +543,15 @@ The latest image was captured at {timestamp}.
 
 Your task is to:
 1. THINK about what you see and how it relates to the user's goal
-2. DESCRIBE the scene VERY CONCISELY (max 1-2 sentences) for someone who cannot see (spoken aloud)
-3. RECOMMEND one specific action to take. The actions should be "move forward", "move backward", "rotate X degrees", "turn left", "turn right", or "stop"
+2. DESCRIBE the scene naturally for someone who cannot see (spoken aloud)
+3. RECOMMEND one specific action to take
 4. DETERMINE if the goal has been achieved or if the user wants to change it
 
 IMPORTANT RULES:
-- Descriptions MUST be under 20 words. Be super clear and concise. DO NOT use bullet points.
+- DO NOT use bullet points or lists in the description - this will be read aloud
 - If you see something that suggests the user has reached their goal, set goal_achieved to true
 - If the user's spoken input suggests they want to change their goal, extract the new_goal
 - Look at previous images to track progress and give context-aware guidance
-- Remember you need to help user avoid obstacles, hitting the wall, glasses, etc. User should always have a clear path. Help user to have the clear path DIRECTLY INFRONT OF THEM. Anything other than direct path should be avoided.
 """
 
     def capture_with_timestamp(self) -> tuple:
@@ -667,7 +601,7 @@ IMPORTANT RULES:
         # Define structured output schema
         class WhiteCaneResponse(BaseModel):
             thought: str = Field(description="Your internal reasoning about what you see and what to do next. This is NOT read to the user.")
-            description: str = Field(description="Natural, extremely concise description (max 20 words). NO bullet points. This WILL be read aloud.")
+            description: str = Field(description="Natural, flowing description of the scene for a blind person. NO bullet points or lists. This WILL be read aloud.")
             action: str = Field(description="One specific physical action recommendation, e.g. 'Turn your head 30 degrees to the right' or 'Take two steps forward'")
             goal_achieved: bool = Field(description="Set to true if the user's goal has been achieved based on what you see")
             new_goal: Optional[str] = Field(default=None, description="If the user expressed a desire to change their goal in their input, extract the new goal here")
@@ -797,9 +731,7 @@ IMPORTANT RULES:
         logger = get_logger()
         logger.info(f"White cane activated. Goal: {goal}")
         
-        response = f"White cane mode activated. {'Goal: ' + goal if goal else 'No specific goal set. I will describe what I see.'}\nSay 'disable white cane' to stop, or tell me your new goal anytime."
-        self.audio.speak(response)
-        return response
+        return f"White cane mode activated. {'Goal: ' + goal if goal else 'No specific goal set. I will describe what I see.'}\nSay 'disable white cane' to stop, or tell me your new goal anytime."
 
     def set_goal(self, goal: str):
         """Update the current goal."""
@@ -838,30 +770,37 @@ IMPORTANT RULES:
         
         return self.format_for_speech(result)
 
-    def listen_command(self) -> Optional[str]:
-        """Listen for a voice command (manual start/stop)."""
-        return self.audio.listen_manual_stop()
-
     def run_loop(self, interval: float = 2.0):
         """
         Run the white cane loop in a separate thread.
-        Captures every 'interval' seconds to build history, but DOES NOT describe automatically.
+        Captures and describes every 'interval' seconds.
+        Auto-deactivates if goal is achieved.
         """
         logger = get_logger()
         
         while self.active and not self.stop_event.is_set():
-            # Capture (Silent Monitoring)
+            # Capture and describe
             timestamp_str, img_bytes, file_path = self.capture_with_timestamp()
             
             if img_bytes:
                 self.cached_images.append((timestamp_str, img_bytes, file_path))
-                # Prune cache if it gets too large (optional, but good practice)
-                if len(self.cached_images) > 20: 
-                    self.cached_images.pop(0)
-
-                # Log only, no speech/description
-                logger.info(f"[White Cane] Silent Monitor: Captured {timestamp_str}")
-                print(f"[White Cane] Monitoring... ({timestamp_str})", end='\r')
+                result = self.describe_and_recommend(timestamp_str, img_bytes)
+                
+                # Print thought (debug) and speech output
+                logger.info(f"[White Cane Thought]: {result['thought']}")
+                speech = self.format_for_speech(result)
+                print(f"\n[White Cane - {timestamp_str}]:\n{speech}\n")
+                
+                # Handle goal change
+                if result.get("new_goal"):
+                    self.set_goal(result["new_goal"])
+                    print(f"[Goal Changed]: {result['new_goal']}")
+                
+                # Check if goal achieved - auto-deactivate
+                if result.get("goal_achieved") and self.current_goal:
+                    print(f"\n[White Cane]: Goal '{self.current_goal}' achieved! Deactivating...")
+                    self.deactivate()
+                    return
             
             # Wait for interval or until stopped
             self.stop_event.wait(timeout=interval)
@@ -967,6 +906,8 @@ class DirectMCPExecutor:
         spec.loader.exec_module(self.module)
         
     def call(self, tool: str, **kwargs):
+        if not hasattr(self.module, tool):
+            return f"Error: Tool '{tool}' not found in mcp_server."
         func = getattr(self.module, tool)
         return func(**kwargs)
 
@@ -1350,11 +1291,6 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         for i in range(MAX_ITER):
             print(f"\n--- Servo Iteration {i+1}/{MAX_ITER} ---")
             
-            # Check for stop signal
-            if _agent_ref and _agent_ref.stop_execution.is_set():
-                print(f"Visual Servoing Stopped by User.")
-                return "Visual Servoing Stopped by User."
-
             # A. Capture New Image
             res = _executor.call("inspect_surroundings")
             if isinstance(res, str) and res.startswith("Error"):
@@ -1402,27 +1338,9 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                     elif m.ndim == 3: mask = m[0]
                 
                 if mask is None:
-                    print(f"[{key}] Lost tracking (no mask). Attempting to reground...")
-                    try:
-                        # Retry logic: Reground using Gemini on the current frame
-                        reground_res = _grounder.ground_multiple_objects(img_bytes_loop, [desc])
-                        if desc in reground_res:
-                            ymin, xmin, ymax, xmax = reground_res[desc]
-                            # Update current_boxes
-                            box_x, box_y = xmin * w, ymin * h
-                            box_w, box_h = (xmax - xmin) * w, (ymax - ymin) * h
-                            current_boxes[key] = [box_x, box_y, box_w, box_h]
-                            print(f"[{key}] Reground Successful: {current_boxes[key]}")
-                            # Skip this key for this frame (no points generated yet)
-                            continue 
-                        else:
-                            print(f"[{key}] Reground Failed (Gemini could not find it).")
-                            del current_boxes[key]
-                            continue
-                    except Exception as e:
-                        print(f"[{key}] Reground Error: {e}")
-                        del current_boxes[key]
-                        continue
+                    print(f"[{key}] Lost tracking (no mask).")
+                    del current_boxes[key]
+                    continue
                 
                 # Store mask for visualization
                 masks_for_viz[key] = mask
@@ -1453,27 +1371,8 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                             points[key] = (cx, cy)
                             cv2.circle(img_cv, (cx, cy), 5, (0, 255, 0), -1) # Green center
                 else:
-                    print(f"[{key}] Mask empty. Attempting to reground...")
-                    try:
-                        # Retry logic: Reground using Gemini on the current frame
-                        reground_res = _grounder.ground_multiple_objects(img_bytes_loop, [desc])
-                        if desc in reground_res:
-                            ymin, xmin, ymax, xmax = reground_res[desc]
-                            # Update current_boxes
-                            box_x, box_y = xmin * w, ymin * h
-                            box_w, box_h = (xmax - xmin) * w, (ymax - ymin) * h
-                            current_boxes[key] = [box_x, box_y, box_w, box_h]
-                            print(f"[{key}] Reground Successful: {current_boxes[key]}")
-                            # Skip this key for this frame (no points generated yet)
-                            continue 
-                        else:
-                            print(f"[{key}] Reground Failed (Gemini could not find it).")
-                            del current_boxes[key]
-                            continue
-                    except Exception as e:
-                        print(f"[{key}] Reground Error: {e}")
-                        del current_boxes[key]
-                        continue
+                    print(f"[{key}] Mask empty.")
+                    del current_boxes[key]
             
             # Apply colored mask overlays for visualization
             for key, mask in masks_for_viz.items():
@@ -1553,10 +1452,7 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                                
                 # Short wait for physical movement                
             else:
-                if "ray" in current_boxes and "logo" in current_boxes:
-                     print("Tracking recovering... skipping control updates this frame.")
-                     continue
-                return f"Lost tracking of one or both objects during loop. Stopping."
+                 return f"Lost tracking of one or both objects during loop. Stopping."
 
         final_dist = dist if 'dist' in locals() else float('inf')
         if final_dist < 50.0:
@@ -1741,11 +1637,6 @@ Rules:
             final_dist = 0
             
             for i in range(MAX_ITER_PER_CHAR):
-                # Check for stop signal
-                if _agent_ref and _agent_ref.stop_execution.is_set():
-                    print(f"Typing Stopped by User.")
-                    return "Typing Stopped by User."
-
                 # A. Capture New Image
                 res = _executor.call("inspect_surroundings")
                 if isinstance(res, str) and res.startswith("Error"):
@@ -2183,403 +2074,3 @@ Rules:
         # Utility
         finish_task, get_connection_status, kill_address
     ]
-# ============================================================================
-# AGENT (Multi-Model Orchestrator)
-# ============================================================================
-
-class GeminiAgent:
-    def __init__(self):
-        self.api_key = os.environ.get("GEMINI_API_KEY")
-        if not self.api_key: raise ValueError("GEMINI_API_KEY not set")
-        
-        # Clients for different models
-        self.client = genai.Client(api_key=self.api_key, http_options={'api_version': 'v1alpha'})
-        self.logger = get_logger()
-        
-        # Initialize Core Components
-        self.executor = DirectMCPExecutor()
-        self.grounder = VisualGrounder(self.client, LOG_DIR)
-        self.planner = ActionPlanner(self.client)
-        self.verifier = Verifier(self.client)
-        self.describer = Describer(self.client)
-        self.white_cane = WhiteCaneAssistant(self.client, self.executor, LOG_DIR)
-        
-        self.chat_history = [] # Store conversation
-        
-        if ObjectTracker:
-            self.tracker = ObjectTracker(LOG_DIR)
-        else:
-            self.tracker = None
-        
-        # Threading control
-        self.stop_execution = threading.Event()
-        
-        # Tools (for execution phase)
-        self.tools = _get_tools(self.executor, self.grounder, self.tracker, self.white_cane, self.describer, self)
-        # Create a mapping for manual execution from plan
-        self.tool_map = {t.__name__: t for t in self.tools}
-        self.tool_map["describe_view"] = self._describe_view_tool
-        self.tool_map["verify_action"] = self._verify_action_tool
-        
-        # Start bridge immediately
-        self.executor.call("start_vr_bridge")
-
-        # Initialize keyboard controller (uses termios — works in WSL/Linux)
-        try:
-            from keyboard_controller import KeyboardVRController
-            self.keyboard_ctrl = KeyboardVRController(self.executor.module)
-            print("Keyboard VR control available (Default: Trackpad Mode). Type ` (backtick) at the prompt to toggle.")
-        except ImportError:
-            self.keyboard_ctrl = None
-        
-    def _describe_view_tool(self, question: str):
-        """Tool wrapper for description model."""
-        print("Capturing image for description...")
-        res = self.executor.call("inspect_surroundings")
-        try:
-            data = json.loads(res).get("data")
-            img_bytes = base64.b64decode(data)
-            return self.describer.describe(img_bytes, question)
-        except Exception as e:
-            return f"Description failed: {e}"
-
-    def _verify_action_tool(self, action_description: str):
-        """Tool wrapper for verification model."""
-        print("Capturing image for verification...")
-        res = self.executor.call("inspect_surroundings")
-        try:
-            data = json.loads(res).get("data")
-            img_bytes = base64.b64decode(data)
-            return self.verifier.verify(img_bytes, action_description)
-        except Exception as e:
-            return f"Verification failed: {e}"
-
-    def run_task(self, user_input: str):
-        """Runs the agent task in a separate thread (target for threading)."""
-        self.stop_execution.clear()
-        
-        self.logger.info(f"User: {user_input}")
-        self.chat_history.append({"role": "user", "content": user_input})
-        print(f"\nAgent (Planner) is thinking about: '{user_input}'...")
-        
-        # 1. PLANNING PHASE (Gemini 3 Flash)
-        if self.stop_execution.is_set(): return
-        
-        plan = self.planner.create_plan(user_input)
-        
-        if not plan:
-            print("Failed to generate a plan.")
-            return
-
-        print(f"\nGenerated Plan ({len(plan)} steps):")
-        for i, step in enumerate(plan):
-            print(f"{i+1}. {step.tool}: {step.description}")
-
-        # 2. EXECUTION PHASE
-        print("\nExecuting Plan...")
-        for step in plan:
-            # Check stop before each step
-            if self.stop_execution.is_set():
-                print("\n[Execution Stopped by User]")
-                self.chat_history.append({"role": "agent", "content": "Execution stopped by user."})
-                return
-
-            print(f"\n>> Step: {step.tool}({step.args})")
-            func = self.tool_map.get(step.tool)
-            
-            if func:
-                try:
-                    # Execute tool
-                    result = func(**step.args)
-                    print(f"Result: {str(result)[:200]}...")
-                    self.chat_history.append({"role": "agent", "content": f"Executed {step.tool}: {result}"})
-                    self.logger.info(f"Step '{step.tool}' Result: {result}")
-                except Exception as e:
-                    print(f"Execution Error: {e}")
-                    self.logger.error(f"Execution Error in {step.tool}: {e}")
-                    break
-            else:
-                print(f"Error: Unknown tool '{step.tool}'")
-
-
-
-    def print_status(self):
-        """Print current agent status."""
-        print(f"\n--- Status (v2 Multi-Model) ---")
-        print(f"Planner: {MODEL_PLANNER}")
-        print(f"Grounding: {MODEL_GROUNDING}")
-        print(f"Verification: {MODEL_VERIFICATION}")
-        print(f"Description: {MODEL_DESCRIPTION}")
-        print(f"Log Dir: {LOG_DIR}")        
-        try:
-            status = self.executor.call("get_connection_status")
-            print(f"VR Bridge: {status}")
-        except Exception as e:
-            print(f"VR Bridge: Error getting status ({e})")
-        print("--------------")
-
-
-
-    def handle_direct_command(self, user_input: str):
-        """
-        Parses and executes a direct command in the format ((function arg1 arg2 ...))
-        Arguments are automatically converted to int/float/bool/None if possible.
-        """
-        try:
-            # Strip (( and ))
-            content = user_input[2:-2].strip()
-            if not content:
-                print("Empty direct command.")
-                return
-
-            # Parse with shlex (handles quoted strings)
-            parts = shlex.split(content)
-            func_name = parts[0]
-            raw_args = parts[1:]
-            
-            # Convert args
-            args = []
-            for arg in raw_args:
-                if arg.lower() == 'true':
-                    args.append(True)
-                elif arg.lower() == 'false':
-                    args.append(False)
-                elif arg.lower() == 'none':
-                    args.append(None)
-                else:
-                    try:
-                        if '.' in arg:
-                            args.append(float(arg))
-                        else:
-                            args.append(int(arg))
-                    except ValueError:
-                        args.append(arg) # Keep as string
-            
-            print(f"Direct Execution: {func_name}({args})")
-            self.logger.info(f"Direct Execution: {func_name}({args})")
-
-            # 1. Check Agent Tools (Wrapped functions)
-            # self.tools is a list of callables
-            tool_func = next((t for t in self.tools if t.__name__ == func_name), None)
-            
-            if tool_func:
-                # Introspect to map args if needed, or just pass *args
-                # Since our tools are simple python functions, *args usually works 
-                # if the user provided them in order.
-                import inspect
-                sig = inspect.signature(tool_func)
-                
-                # Simple binding attempt
-                try:
-                    bound_args = sig.bind(*args)
-                    bound_args.apply_defaults()
-                    res = tool_func(*bound_args.args, **bound_args.kwargs)
-                    print(f"Result: {res}")
-                    self.logger.info(f"Result: {res}")
-                    return
-                except TypeError as e:
-                    print(f"Argument mismatch for tool '{func_name}': {e}")
-                    return
-
-            # 2. Check MCP Server directly (underlying functions)
-            # This allows calling functions not exposed as agent tools
-                if hasattr(self.executor.module, func_name):
-                    func = getattr(self.executor.module, func_name)
-                    try:
-                        res = func(*args)
-                        print(f"Result: {res}")
-                        self.logger.info(f"Result: {res}")
-                        return
-                    except Exception as e:
-                         print(f"Error executing MCP function '{func_name}': {e}")
-                         return
-
-            print(f"Error: Function '{func_name}' not found in Agent Tools or MCP Server.")
-
-        except Exception as e:
-            print(f"Failed to execute direct command: {e}")
-            traceback.print_exc()
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
-if __name__ == "__main__":
-    agent = GeminiAgent()
-    print("VR Agent v4 (Multi-Model) Ready.")
-    print("Commands: 'white cane' to activate accessibility mode, 'quit' to exit.")
-    
-    # Execution Thread
-    execution_thread = None
-
-    while True:
-        try:
-            # If keyboard control is active, skip input() — stdin is in cbreak mode.
-            # The background thread handles keys. Sleep briefly and loop back.
-            if hasattr(agent, 'keyboard_ctrl') and agent.keyboard_ctrl and agent.keyboard_ctrl.active:
-                time.sleep(0.1)
-                continue
-            
-            # Non-blocking check for thread status
-            if execution_thread and execution_thread.is_alive():
-                 # We need to allow user to interrupt. 
-                 # Since input() is blocking, we rely on the user seeing the prompt.
-                 # But if the thread is printing a lot, the prompt might get buried.
-                 # Python's input() might fight with print() from thread. 
-                 # For a simple console app, we just accept that input() holds the prompt.
-                 pass
-
-            user_input = input("\nYou (Type 'stop' to abort): ").strip()
-            if not user_input:
-                cmd = ""
-            else:
-                cmd = user_input.lower()
-
-            # --- KEYBOARD VR TOGGLE ---
-            if cmd == '`' and hasattr(agent, 'keyboard_ctrl') and agent.keyboard_ctrl:
-                agent.keyboard_ctrl.activate()
-                continue
-            
-            # --- STOP COMMAND ---
-            if cmd == 'stop':
-                if execution_thread and execution_thread.is_alive():
-                    print("\n[Stopping Agent Execution...]")
-                    agent.stop_execution.set()
-                    execution_thread.join(timeout=2.0)
-                    if execution_thread.is_alive():
-                        print("Warning: Agent did not stop immediately. It may finish the current step first.")
-                    else:
-                        print("Agent stopped.")
-                else: 
-                    print("Agent is not running.")
-                continue
-
-            # --- QUIT/EXIT ---
-            if cmd in ['quit', 'exit']:
-                # Deactivate white cane if active
-                if agent.white_cane.active:
-                    agent.white_cane.deactivate()
-                if hasattr(agent, 'keyboard_ctrl') and agent.keyboard_ctrl:
-                    agent.keyboard_ctrl.stop()
-                
-                # Stop any running agent task
-                if execution_thread and execution_thread.is_alive():
-                    agent.stop_execution.set()
-                    execution_thread.join(timeout=1.0)
-                break
-
-            elif cmd == 'status':
-                agent.print_status()
-                continue
-            
-            # --- WHITE CANE COMMANDS ---
-            elif cmd in ['white cane', 'whitecane', 'enable white cane']:
-                print("\nWhite Cane mode activating...")
-                goal = input("What would you like to find or where do you want to go? (or press Enter to explore): ").strip()
-                result = agent.white_cane.activate(goal if goal else None)
-                print(result)
-                
-                # Start the automatic loop
-                agent.white_cane.start_background_loop(interval=10.0)
-                
-                # Auto-activate keyboard controller
-                if hasattr(agent, 'keyboard_ctrl') and agent.keyboard_ctrl:
-                    print("Auto-activating Keyboard Controller for navigation...")
-                    
-                    # Define callback for Enter key
-                    def on_enter_callback():
-                        print("\n[Paused Keyboard] Listening for command...")
-                        # Reuse the existing voice command logic
-                        voice_cmd = agent.white_cane.listen_command()
-                        if voice_cmd:
-                            if any(x in voice_cmd.lower() for x in ['stop', 'exit', 'disable', 'quit']):
-                                print(f"Voice Command: {voice_cmd} -> Stopping White Cane")
-                                agent.white_cane.deactivate()
-                                # Also stop keyboard if white cane stops? Maybe not.
-                                # But we need to return to break the loop or update state
-                            else:
-                                # Always use get_immediate_help to engage LLM and potentially update goal
-                                description = agent.white_cane.get_immediate_help(voice_cmd)
-                                print(f"\n[White Cane]:\n{description}\n")
-                                agent.white_cane.audio.speak(description)
-                        print("[Resuming Keyboard]...")
-
-                    agent.keyboard_ctrl.on_trigger_callback = on_enter_callback
-                    agent.keyboard_ctrl.activate()
-                
-                continue
- 
-            # Normal Voice Input Trigger (White Cane INACTIVE)
-            elif cmd == '' and not agent.white_cane.active:
-                if execution_thread and execution_thread.is_alive():
-                     print("Agent is busy. Type 'stop' to interrupt.")
-                     continue
-                     
-                voice_cmd = agent.white_cane.listen_command()
-                if voice_cmd:
-                    print(f"Voice Command: {voice_cmd}")
-                    execution_thread = threading.Thread(target=agent.run_task, args=(voice_cmd,), daemon=True)
-                    execution_thread.start()
-                continue
-
-            # White Cane Voice Input Trigger
-            elif cmd == '' and agent.white_cane.active:
-                # If user presses Enter while white cane is active, trigger listening
-                voice_cmd = agent.white_cane.listen_command()
-                if voice_cmd:
-                    # Feed back into the loop as if typed
-                    # Check for exit commands first
-                    if any(x in voice_cmd.lower() for x in ['stop', 'exit', 'disable', 'quit']):
-                        print(f"Voice Command: {voice_cmd} -> Stopping White Cane")
-                        agent.white_cane.deactivate()
-                    else:
-                        print(f"Voice Command: {voice_cmd} -> Updating goal/help")
-                        # Treat as new goal or help request
-                        # Always use get_immediate_help to engage LLM and potentially update goal
-                        description = agent.white_cane.get_immediate_help(voice_cmd)
-                        print(f"\n[White Cane]:\n{description}\n")
-                        agent.white_cane.audio.speak(description)
-                continue
-
-            # White Cane Deactivation
-            elif cmd in ['disable white cane', 'stop white cane', 'exit white cane']:
-                result = agent.white_cane.deactivate()
-                print(result)
-                continue
-            
-            # White Cane Help
-            elif agent.white_cane.active and cmd in ['help', 'what do you see', 'describe', "what's next", 'whats next']:
-                print("\nGetting immediate description...")
-                description = agent.white_cane.get_immediate_help()
-                print(f"\n[White Cane]:\n{description}\n")
-                agent.white_cane.audio.speak(description)
-                continue
-            
-            # White Cane Goal Update
-            elif agent.white_cane.active and cmd.startswith('goal '):
-                new_goal = user_input[5:].strip()
-                agent.white_cane.current_goal = new_goal
-                print(f"Goal updated: {new_goal}")
-                continue
-                
-            if user_input.startswith("((") and user_input.endswith("))"):
-                agent.handle_direct_command(user_input)
-                continue
-
-            # --- RUN AGENT TASK (Threaded) ---
-            if execution_thread and execution_thread.is_alive():
-                print("Agent is busy! Type 'stop' to interrupt current task.")
-            else:
-                execution_thread = threading.Thread(target=agent.run_task, args=(user_input,), daemon=True)
-                execution_thread.start()
-
-        except KeyboardInterrupt:
-            # Deactivate white cane if active
-            if agent.white_cane.active:
-                agent.white_cane.deactivate()
-            if hasattr(agent, 'keyboard_ctrl') and agent.keyboard_ctrl:
-                agent.keyboard_ctrl.stop()
-            # Stop any running task
-            if execution_thread and execution_thread.is_alive():
-                agent.stop_execution.set()
-            break

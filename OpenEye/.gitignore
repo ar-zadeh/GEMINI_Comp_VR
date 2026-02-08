@@ -22,3 +22,4 @@ OpenEye/checkpoints/
 *.pt
 *.pth
 *.onnx
+*.jpg

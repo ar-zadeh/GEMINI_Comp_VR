@@ -74,6 +74,9 @@ class KeyboardVRController:
         # Modes: 'trackpad' (default) or 'headset'
         self.mode = 'trackpad' 
         self.target_controller = 'controller1' # Right controller for trackpad
+        
+        # Callback for Enter key (voice trigger)
+        self.on_trigger_callback = None
 
         # Controller offsets relative to headset in headset-local coordinates.
         # forward: +ve = in front of headset (toward -Z at yaw=0)
@@ -309,6 +312,21 @@ class KeyboardVRController:
                     self.mcp.suppress_logging = False
                     print("\n[Keyboard VR Control] DISABLED (Ctrl+C)")
                     break
+                elif ch in ['\n', '\r']:
+                    # Enter key — trigger callback (e.g., voice command) if set
+                    if self.on_trigger_callback:
+                        # Temporarily restore terminal for blocking input() in callback
+                        self._restore_terminal()
+                        try:
+                            self.on_trigger_callback()
+                        except Exception as e:
+                            print(f"[Keyboard] Callback error: {e}")
+                        
+                        # Re-enable cbreak mode after callback returns
+                        if self.active and TERMIOS_AVAILABLE:
+                             fd = sys.stdin.fileno()
+                             tty.setcbreak(fd)
+                             
                 else:
                     self._handle_char(ch)
         except Exception:

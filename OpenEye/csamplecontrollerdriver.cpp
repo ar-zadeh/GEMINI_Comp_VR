@@ -153,8 +153,8 @@ vr::EVRInitError CSampleControllerDriver::Activate(vr::TrackedDeviceIndex_t unOb
     // Create our haptic component
     vr::VRDriverInput()->CreateHapticComponent(m_ulPropertyContainer, "/output/haptic", &m_compHaptic);
 
-    // Prevent standby
-    vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DeviceCanStandby_Bool, false);
+    // Prevent standby (Prop_DeviceCanStandby_Bool not available, using Prop_DeviceCanPowerOff_Bool)
+    vr::VRProperties()->SetBoolProperty(m_ulPropertyContainer, vr::Prop_DeviceCanPowerOff_Bool, false);
 
     return VRInitError_None;
 }

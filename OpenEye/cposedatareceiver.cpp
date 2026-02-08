@@ -9,6 +9,12 @@
 #include <atomic>
 #include <chrono>
 
+// Windows Audio API for mute/unmute
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <functiondiscoverykeys_devpkey.h>
+#include <combaseapi.h>
+
 CPoseDataReceiver* g_pPoseDataReceiver = nullptr;
 
 CPoseDataReceiver::CPoseDataReceiver()
@@ -112,6 +118,13 @@ void CPoseDataReceiver::OnMessageReceived(const std::string& message)
     if (IsVisionRequest(message))
     {
         HandleVisionRequest(message);
+        return;
+    }
+
+    // Check if this is an audio command (mute/unmute)
+    if (IsAudioCommand(message))
+    {
+        HandleAudioCommand(message);
         return;
     }
 
@@ -384,5 +397,191 @@ void CPoseDataReceiver::HandleVisionRequest(const std::string& json)
     else
     {
         DriverLog("CPoseDataReceiver: ERROR - No send callback, cannot send response!\n");
+    }
+}
+
+bool CPoseDataReceiver::IsAudioCommand(const std::string& json)
+{
+    size_t typePos = json.find("\"type\"");
+    if (typePos == std::string::npos) return false;
+
+    size_t colonPos = json.find(':', typePos);
+    if (colonPos == std::string::npos) return false;
+
+    size_t valuePos = json.find("\"audio_command\"", colonPos);
+    return valuePos != std::string::npos;
+}
+
+void CPoseDataReceiver::HandleAudioCommand(const std::string& json)
+{
+    DriverLog("CPoseDataReceiver: Handling audio command: %s\n", json.c_str());
+
+    // Parse the action field: "mute", "unmute", or "toggle"
+    std::string action;
+    size_t actionPos = json.find("\"action\"");
+    if (actionPos != std::string::npos)
+    {
+        size_t colonPos = json.find(':', actionPos);
+        if (colonPos != std::string::npos)
+        {
+            size_t valStart = json.find('"', colonPos + 1);
+            if (valStart != std::string::npos)
+            {
+                valStart++;
+                size_t valEnd = json.find('"', valStart);
+                if (valEnd != std::string::npos)
+                {
+                    action = json.substr(valStart, valEnd - valStart);
+                }
+            }
+        }
+    }
+
+    if (action.empty())
+    {
+        DriverLog("CPoseDataReceiver: Audio command missing action field\n");
+        if (m_sendCallback)
+        {
+            m_sendCallback("{\"type\":\"audio_response\",\"success\":false,\"message\":\"Missing action field\"}\n");
+        }
+        return;
+    }
+
+    // Parse the target field: "microphone" or "system" (default: "microphone")
+    std::string target = "microphone";
+    size_t targetPos = json.find("\"target\"");
+    if (targetPos != std::string::npos)
+    {
+        size_t colonPos = json.find(':', targetPos);
+        if (colonPos != std::string::npos)
+        {
+            size_t valStart = json.find('"', colonPos + 1);
+            if (valStart != std::string::npos)
+            {
+                valStart++;
+                size_t valEnd = json.find('"', valStart);
+                if (valEnd != std::string::npos)
+                {
+                    target = json.substr(valStart, valEnd - valStart);
+                }
+            }
+        }
+    }
+
+    // Use Windows Core Audio API to mute/unmute
+    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    bool comInitialized = SUCCEEDED(hr) || hr == S_FALSE; // S_FALSE means already initialized
+
+    IMMDeviceEnumerator* pEnumerator = nullptr;
+    IMMDevice* pDevice = nullptr;
+    IAudioEndpointVolume* pVolume = nullptr;
+    bool success = false;
+    std::string message;
+    bool newMuteState = false;
+
+    do
+    {
+        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), (void**)&pEnumerator);
+        if (FAILED(hr))
+        {
+            message = "Failed to create device enumerator";
+            DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
+            break;
+        }
+
+        // Choose endpoint based on target
+        EDataFlow dataFlow = (target == "system") ? eRender : eCapture;
+        hr = pEnumerator->GetDefaultAudioEndpoint(dataFlow, eConsole, &pDevice);
+        if (FAILED(hr))
+        {
+            message = (target == "system") ? "No default audio output device" : "No default microphone device";
+            DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
+            break;
+        }
+
+        hr = pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&pVolume);
+        if (FAILED(hr))
+        {
+            message = "Failed to activate audio endpoint volume";
+            DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
+            break;
+        }
+
+        if (action == "toggle")
+        {
+            BOOL currentMute = FALSE;
+            pVolume->GetMute(&currentMute);
+            newMuteState = !currentMute;
+            hr = pVolume->SetMute(!currentMute, NULL);
+        }
+        else if (action == "mute")
+        {
+            newMuteState = true;
+            hr = pVolume->SetMute(TRUE, NULL);
+        }
+        else if (action == "unmute")
+        {
+            newMuteState = false;
+            hr = pVolume->SetMute(FALSE, NULL);
+        }
+        else if (action == "get_state")
+        {
+            BOOL currentMute = FALSE;
+            hr = pVolume->GetMute(&currentMute);
+            newMuteState = currentMute != FALSE;
+        }
+        else
+        {
+            message = "Unknown action: " + action;
+            break;
+        }
+
+        if (FAILED(hr))
+        {
+            message = "Failed to set mute state";
+            DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
+            break;
+        }
+
+        success = true;
+        if (action == "get_state")
+        {
+            message = newMuteState ? "muted" : "unmuted";
+        }
+        else
+        {
+            message = newMuteState ? "muted" : "unmuted";
+        }
+        DriverLog("CPoseDataReceiver: Audio %s %s successfully\n", target.c_str(), message.c_str());
+
+    } while (false);
+
+    // Cleanup COM objects
+    if (pVolume) pVolume->Release();
+    if (pDevice) pDevice->Release();
+    if (pEnumerator) pEnumerator->Release();
+    if (comInitialized) CoUninitialize();
+
+    // Send response back
+    if (m_sendCallback)
+    {
+        char resp[512];
+#if defined(_WIN32)
+        sprintf_s(resp, sizeof(resp),
+            "{\"type\":\"audio_response\",\"success\":%s,\"muted\":%s,\"target\":\"%s\",\"message\":\"%s\"}\n",
+            success ? "true" : "false",
+            newMuteState ? "true" : "false",
+            target.c_str(),
+            message.c_str());
+#else
+        sprintf(resp,
+            "{\"type\":\"audio_response\",\"success\":%s,\"muted\":%s,\"target\":\"%s\",\"message\":\"%s\"}\n",
+            success ? "true" : "false",
+            newMuteState ? "true" : "false",
+            target.c_str(),
+            message.c_str());
+#endif
+        m_sendCallback(std::string(resp));
     }
 }

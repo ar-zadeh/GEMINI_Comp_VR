@@ -33,6 +33,8 @@ clients: List[socket.socket] = []
 server_running = False
 vision_response: Optional[Dict] = None
 vision_event = threading.Event()
+audio_response: Optional[Dict] = None
+audio_event = threading.Event()
 
 # Logging suppression (set True during keyboard control to silence broadcast spam)
 suppress_logging = False
@@ -202,8 +204,8 @@ def send_vision_request(request: Dict) -> bool:
     return False
 
 def handle_client(client_socket: socket.socket):
-    """Handle incoming data from driver (poses and vision responses)."""
-    global vision_response
+    """Handle incoming data from driver (poses, vision responses, and audio responses)."""
+    global vision_response, audio_response
     
     with state_lock:
         clients.append(client_socket)
@@ -237,6 +239,10 @@ def handle_client(client_socket: socket.socket):
                         if msg.get('type') in ['frame', 'video', 'status', 'error']:
                             vision_response = msg
                             vision_event.set()
+                        # Check if this is an audio response
+                        elif msg.get('type') == 'audio_response':
+                            audio_response = msg
+                            audio_event.set()
                     except json.JSONDecodeError:
                         # JSON incomplete - might be a partial vision response
                         # Check if this looks like a vision response (has "frames" field)
@@ -989,6 +995,158 @@ def navigate_to_object(description: str) -> str:
 Current headset position: {current_poses['headset']['pos']}
 Current headset rotation: {current_poses['headset']['rot']}"""
 
+# --- MCP TOOLS: Audio Control (Mute/Unmute) ---
+
+def send_audio_command(request: Dict) -> bool:
+    """Send an audio command to the driver."""
+    with state_lock:
+        if not clients:
+            return False
+        payload = json.dumps(request) + '\n'
+        for client in clients:
+            try:
+                client.sendall(payload.encode('utf-8'))
+                return True
+            except Exception:
+                pass
+    return False
+
+@mcp.tool()
+def mute_microphone() -> str:
+    """
+    Mute the system microphone.
+    The microphone will be silenced until unmute_microphone() is called.
+    """
+    global audio_response
+    audio_response = None
+    audio_event.clear()
+
+    request = {
+        "type": "audio_command",
+        "action": "mute",
+        "target": "microphone"
+    }
+
+    if not send_audio_command(request):
+        return "Error: No VR driver connected. Cannot send mute command."
+
+    if not audio_event.wait(timeout=5):
+        return "Error: Timeout waiting for audio response."
+
+    if audio_response is None:
+        return "Error: No response received from driver."
+
+    if not audio_response.get('success', False):
+        return f"Error: {audio_response.get('message', 'Unknown error')}"
+
+    return "Microphone muted."
+
+@mcp.tool()
+def unmute_microphone() -> str:
+    """
+    Unmute the system microphone.
+    Restores microphone input after a previous mute.
+    """
+    global audio_response
+    audio_response = None
+    audio_event.clear()
+
+    request = {
+        "type": "audio_command",
+        "action": "unmute",
+        "target": "microphone"
+    }
+
+    if not send_audio_command(request):
+        return "Error: No VR driver connected. Cannot send unmute command."
+
+    if not audio_event.wait(timeout=5):
+        return "Error: Timeout waiting for audio response."
+
+    if audio_response is None:
+        return "Error: No response received from driver."
+
+    if not audio_response.get('success', False):
+        return f"Error: {audio_response.get('message', 'Unknown error')}"
+
+    return "Microphone unmuted."
+
+@mcp.tool()
+def toggle_mute(target: str = "microphone") -> str:
+    """
+    Toggle mute state of an audio device.
+
+    Args:
+        target: "microphone" (default) or "system" (speakers/headphones)
+
+    Returns the new mute state.
+    """
+    global audio_response
+    audio_response = None
+    audio_event.clear()
+
+    if target not in ("microphone", "system"):
+        return "Invalid target. Use 'microphone' or 'system'."
+
+    request = {
+        "type": "audio_command",
+        "action": "toggle",
+        "target": target
+    }
+
+    if not send_audio_command(request):
+        return "Error: No VR driver connected. Cannot send toggle command."
+
+    if not audio_event.wait(timeout=5):
+        return "Error: Timeout waiting for audio response."
+
+    if audio_response is None:
+        return "Error: No response received from driver."
+
+    if not audio_response.get('success', False):
+        return f"Error: {audio_response.get('message', 'Unknown error')}"
+
+    muted = audio_response.get('muted', False)
+    return f"{target.capitalize()} is now {'muted' if muted else 'unmuted'}."
+
+@mcp.tool()
+def get_mute_state(target: str = "microphone") -> str:
+    """
+    Get the current mute state of an audio device.
+
+    Args:
+        target: "microphone" (default) or "system" (speakers/headphones)
+
+    Returns whether the device is currently muted or unmuted.
+    """
+    global audio_response
+    audio_response = None
+    audio_event.clear()
+
+    if target not in ("microphone", "system"):
+        return "Invalid target. Use 'microphone' or 'system'."
+
+    request = {
+        "type": "audio_command",
+        "action": "get_state",
+        "target": target
+    }
+
+    if not send_audio_command(request):
+        return "Error: No VR driver connected. Cannot query mute state."
+
+    if not audio_event.wait(timeout=5):
+        return "Error: Timeout waiting for audio response."
+
+    if audio_response is None:
+        return "Error: No response received from driver."
+
+    if not audio_response.get('success', False):
+        return f"Error: {audio_response.get('message', 'Unknown error')}"
+
+    muted = audio_response.get('muted', False)
+    return f"{target.capitalize()} is currently {'muted' if muted else 'unmuted'}."
+
 # --- Entry Point ---
 
 if __name__ == '__main__':
@@ -1002,5 +1160,6 @@ if __name__ == '__main__':
     print("  Joystick: set_joystick, move_joystick_direction")
     print("  Actions: perform_grab, perform_release, release_all_inputs")
     print("  Vision: inspect_surroundings, capture_video, look_around_and_observe")
+    print("  Audio: mute_microphone, unmute_microphone, toggle_mute, get_mute_state")
     print("")
     mcp.run()

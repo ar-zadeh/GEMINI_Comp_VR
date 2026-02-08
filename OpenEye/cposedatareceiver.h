@@ -70,6 +70,8 @@ private:
     bool ParseJson(const std::string& json, std::string& device, PoseData& pose);
     bool IsVisionRequest(const std::string& json);
     void HandleVisionRequest(const std::string& json);
+    bool IsAudioCommand(const std::string& json);
+    void HandleAudioCommand(const std::string& json);
 
     void MonitorConnectionThread();
     

@@ -12,6 +12,7 @@ Changes from v1:
 """
 
 import os
+import re
 import shlex
 import json
 import time
@@ -538,6 +539,9 @@ class ActionPlanner:
            - inspect_surroundings() -> Take a picture.
            - describe_view(question) -> Describe what is seen.
            - verify_action(action_description) -> Check if action succeeded.
+           - provide_help() -> Provide context-aware help (Use this for 'help', 'help me', 'I need help', etc.).
+           - provide_tutorial() -> Provide a tutorial/introduction.
+           - provide_options() -> List available options/commands.
         
         2. CONTROLLER INPUTS (Low-level interaction):
            - click_button(controller, button) -> Quick press & release.
@@ -1095,6 +1099,74 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         """Take a picture."""
         _log_action("inspect_surroundings")
         return _executor.call("inspect_surroundings")
+
+    def provide_help():
+        """
+        Provide context-aware help to the user using hard-coded messages.
+        Use this when the user asks for help, says they are lost, or needs assistance.
+        """
+        _log_action("provide_help")
+        if not _agent_ref:
+            return "Agent reference not available."
+            
+        current_state = _agent_ref.menu_state
+        
+        # Original Hard-Coded Logic
+        if current_state == VoiceMenuState.MAIN_MENU:
+            msg = "You are in the main menu. You can ask me to navigate, describe surroundings, identify objects, or click on different objects in the scene."
+        elif current_state == VoiceMenuState.WHITE_CANE_MENU:
+            msg = "White cane mode. You can update your goal, ask for a description, or say stop to exit."
+        elif current_state == VoiceMenuState.CONFIRMATION:
+            msg = f"I need you to confirm if you want to {_agent_ref.pending_action['description']}. Say confirm or cancel."
+        else:
+             msg = "I am ready. Say menu for options, or just tell me what to do."
+             
+        if _white_cane and hasattr(_white_cane, 'audio'):
+            _white_cane.audio.speak(msg)
+            return f"Provided Help: {msg}"
+        else:
+            print(f"Help: {msg}")
+            return f"Provided Help (Printed): {msg}"
+
+    def provide_tutorial():
+        """
+        Provide a tutorial to the user.
+        """
+        _log_action("provide_tutorial")
+        msg = "I am your VR assistant. You can give me commands like 'find the keys' or 'describe the room'. Say 'menu' to see structured options. If you get lost, say 'help'."
+        if _white_cane and hasattr(_white_cane, 'audio'):
+            _white_cane.audio.speak(msg)
+            return f"Provided Tutorial: {msg}"
+        else:
+            print(f"Tutorial: {msg}")
+            return f"Provided Tutorial (Printed): {msg}"
+
+    def provide_options():
+        """
+        List available options based on current menu state.
+        """
+        _log_action("provide_options")
+        if not _agent_ref:
+            return "Agent reference not available."
+            
+        current_state = _agent_ref.menu_state
+        
+        if current_state == VoiceMenuState.MAIN_MENU:
+            msg = "Options: Navigate, Describe, Identify, Repeat, Help."
+        elif current_state == VoiceMenuState.WHITE_CANE_MENU:
+            msg = "Options: Goal, Help, Stop, Disable."
+        elif current_state == VoiceMenuState.CONFIRMATION:
+            msg = "Options: Confirm, Cancel."
+        else:
+            msg = "Options: Menu, White Cane, Stop, Help."
+             
+        if _white_cane and hasattr(_white_cane, 'audio'):
+            _white_cane.audio.speak(msg)
+            return f"Provided Options: {msg}"
+        else:
+            print(f"Options: {msg}")
+            return f"Provided Options (Printed): {msg}"
+
         
     def locate_object(object_description: str):
         """Find an object and return its center coordinates."""
@@ -2251,7 +2323,7 @@ Rules:
         perform_grab, perform_release, release_all_inputs,
         get_controller_state,
         # Utility
-        finish_task, get_connection_status, kill_address
+        finish_task, get_connection_status, kill_address, speak_message, provide_help, provide_tutorial, provide_options
     ]
 # ============================================================================
 # AGENT (Multi-Model Orchestrator)
@@ -2266,6 +2338,10 @@ class GeminiAgent:
         self.client = genai.Client(api_key=self.api_key, http_options={'api_version': 'v1alpha'})
         self.logger = get_logger()
         
+        # Config
+        self.config_file = LOG_DIR / "agent_config.json"
+        self.config = self.load_config()
+
         # Initialize Core Components
         self.executor = DirectMCPExecutor()
         self.grounder = VisualGrounder(self.client, LOG_DIR)
@@ -2306,6 +2382,24 @@ class GeminiAgent:
         self.menu_state = VoiceMenuState.IDLE
         self.pending_action = None # { "tool": str, "args": dict, "description": str }
 
+    def load_config(self) -> Dict[str, Any]:
+        """Load configuration from file."""
+        try:
+            if self.config_file.exists():
+                with open(self.config_file, 'r') as f:
+                    return json.load(f)
+        except Exception as e:
+            self.logger.error(f"Failed to load config: {e}")
+        return {"startup_message": True} # Default config
+
+    def save_config(self):
+        """Save configuration to file."""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=4)
+        except Exception as e:
+            self.logger.error(f"Failed to save config: {e}")
+
     def trigger_main_menu(self):
         """Activates the main menu."""
         self.menu_state = VoiceMenuState.MAIN_MENU
@@ -2322,6 +2416,18 @@ class GeminiAgent:
         if cmd in ["repeat", "say that again", "what did you say"]:
             self.white_cane.audio.repeat_last()
             return
+
+        if "enable startup message" in cmd:
+            self.config["startup_message"] = True
+            self.save_config()
+            self.white_cane.audio.speak("Startup message enabled.")
+            return
+
+        if "disable startup message" in cmd:
+            self.config["startup_message"] = False
+            self.save_config()
+            self.white_cane.audio.speak("Startup message disabled.")
+            return
         
         if cmd in ["stop", "exit", "quit", "cancel"]:
             if self.menu_state != VoiceMenuState.IDLE:
@@ -2333,7 +2439,7 @@ class GeminiAgent:
         if cmd == "menu":
             self.trigger_main_menu()
             return
-
+            
         if cmd == "help":
             # Context-aware help
             if self.menu_state == VoiceMenuState.MAIN_MENU:
@@ -2511,6 +2617,14 @@ class GeminiAgent:
             return "Describing scene"
         elif tool == "white_cane_set_goal":
             return f"Setting goal to {args.get('goal', 'unknown')}"
+        elif tool == "speak_message":
+            return "Answering"
+        elif tool == "provide_help":
+            return "Providing help"
+        elif tool == "provide_tutorial":
+            return "Title: Tutorial"
+        elif tool == "provide_options":
+            return "Listing options"
         else:
             return f"Running {tool.replace('_', ' ')}"
 
@@ -2695,6 +2809,8 @@ if __name__ == "__main__":
     agent = GeminiAgent()
     print("VR Agent v4 (Multi-Model) Ready.")
     print("Commands: 'white cane' to activate accessibility mode, 'quit' to exit.")
+    if agent.config.get("startup_message", True):
+        agent.white_cane.audio.speak("VR Agent initialized. I am your VR assistant. You can give me commands like 'find the keys' or 'describe the room'. Say 'menu' to see structured options. If you get lost, say 'help'.")
     
     # Execution Thread
     execution_thread = None

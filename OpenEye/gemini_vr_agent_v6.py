@@ -2895,7 +2895,36 @@ if __name__ == "__main__":
                 agent.white_cane.current_goal = new_goal
                 print(f"Goal updated: {new_goal}")
                 continue
+            
+            # --- PUSH TO TALK (Hold Grip) ---
+            elif cmd == 'f':
+                def hold_grip_loop(stop_event):
+                    while not stop_event.is_set():
+                        # Hold the grip
+                        agent.executor.call("press_button", controller="controller1", button="grip")
+                        # Wait 1s before re-asserting (or simpler: just hold it once? 
+                        # User asked for "keep holding... for 1 seconds interval")
+                        # Interpreting as: re-send press every 1s to ensure it stays down / prevents timeout
+                        if stop_event.wait(timeout=1.0):
+                            break
+                    
+                    # Release when loop ends
+                    agent.executor.call("release_button", controller="controller1", button="grip")
+                    print("\n[Push to Talk] Grip released.")
+
+                # Start the thread
+                ptt_stop_event = threading.Event()
+                ptt_thread = threading.Thread(target=hold_grip_loop, args=(ptt_stop_event,), daemon=True)
+                ptt_thread.start()
                 
+                print("\n[Push to Talk] Holding Grip (Controller 1)... Press ENTER to release.")
+                input() # Wait for user to press Enter
+                
+                # Stop the loop
+                ptt_stop_event.set()
+                ptt_thread.join()
+                continue
+
             if user_input.startswith("((") and user_input.endswith("))"):
                 agent.handle_direct_command(user_input)
                 continue

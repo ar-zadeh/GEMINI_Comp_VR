@@ -9,11 +9,15 @@
 #include <atomic>
 #include <chrono>
 
-// Windows Audio API for mute/unmute
+// Windows Audio API for per-process mute/unmute (SteamVR sessions)
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
+#include <audiopolicy.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <combaseapi.h>
+#include <Psapi.h>
+#include <algorithm>
+#include <cctype>
 
 CPoseDataReceiver* g_pPoseDataReceiver = nullptr;
 
@@ -412,11 +416,58 @@ bool CPoseDataReceiver::IsAudioCommand(const std::string& json)
     return valuePos != std::string::npos;
 }
 
+// Helper: get lowercase executable name from a process ID
+static std::string GetProcessName(DWORD pid)
+{
+    std::string name;
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (hProcess)
+    {
+        char buf[MAX_PATH];
+        DWORD size = MAX_PATH;
+        if (QueryFullProcessImageNameA(hProcess, 0, buf, &size))
+        {
+            // Extract filename from full path
+            std::string fullPath(buf);
+            size_t pos = fullPath.find_last_of("\\/");
+            name = (pos != std::string::npos) ? fullPath.substr(pos + 1) : fullPath;
+            // Lowercase
+            std::transform(name.begin(), name.end(), name.begin(),
+                [](unsigned char c) { return (char)std::tolower(c); });
+        }
+        CloseHandle(hProcess);
+    }
+    return name;
+}
+
+// Helper: check if a process name belongs to SteamVR or VR apps
+// NOTE: processName is already lowercased by GetProcessName(), so all entries here must be lowercase
+static bool IsSteamVRProcess(const std::string& processName)
+{
+    static const char* steamvrNames[] = {
+        "vrserver.exe",
+        "vrcompositor.exe",
+        "vrdashboard.exe",
+        "vrmonitor.exe",
+        "vrwebhelper.exe",
+        "steamvr_vrcompositor.exe",
+        "vrstartup.exe",
+        "steamwebhelper.exe",
+        "vrchat.exe",
+    };
+    for (const char* name : steamvrNames)
+    {
+        if (processName == name)
+            return true;
+    }
+    return false;
+}
+
 void CPoseDataReceiver::HandleAudioCommand(const std::string& json)
 {
     DriverLog("CPoseDataReceiver: Handling audio command: %s\n", json.c_str());
 
-    // Parse the action field: "mute", "unmute", or "toggle"
+    // Parse the action field: "mute", "unmute", "toggle", or "get_state"
     std::string action;
     size_t actionPos = json.find("\"action\"");
     if (actionPos != std::string::npos)
@@ -447,37 +498,18 @@ void CPoseDataReceiver::HandleAudioCommand(const std::string& json)
         return;
     }
 
-    // Parse the target field: "microphone" or "system" (default: "microphone")
-    std::string target = "microphone";
-    size_t targetPos = json.find("\"target\"");
-    if (targetPos != std::string::npos)
-    {
-        size_t colonPos = json.find(':', targetPos);
-        if (colonPos != std::string::npos)
-        {
-            size_t valStart = json.find('"', colonPos + 1);
-            if (valStart != std::string::npos)
-            {
-                valStart++;
-                size_t valEnd = json.find('"', valStart);
-                if (valEnd != std::string::npos)
-                {
-                    target = json.substr(valStart, valEnd - valStart);
-                }
-            }
-        }
-    }
-
-    // Use Windows Core Audio API to mute/unmute
+    // Use Windows Core Audio Session API to mute only SteamVR processes
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    bool comInitialized = SUCCEEDED(hr) || hr == S_FALSE; // S_FALSE means already initialized
+    bool comInitialized = SUCCEEDED(hr) || hr == S_FALSE;
 
     IMMDeviceEnumerator* pEnumerator = nullptr;
     IMMDevice* pDevice = nullptr;
-    IAudioEndpointVolume* pVolume = nullptr;
+    IAudioSessionManager2* pSessionManager = nullptr;
+    IAudioSessionEnumerator* pSessionEnum = nullptr;
     bool success = false;
     std::string message;
     bool newMuteState = false;
+    int sessionsAffected = 0;
 
     do
     {
@@ -490,75 +522,121 @@ void CPoseDataReceiver::HandleAudioCommand(const std::string& json)
             break;
         }
 
-        // Choose endpoint based on target
-        EDataFlow dataFlow = (target == "system") ? eRender : eCapture;
-        hr = pEnumerator->GetDefaultAudioEndpoint(dataFlow, eConsole, &pDevice);
+        // Get the default audio render device (speakers/headphones — where SteamVR outputs)
+        hr = pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice);
         if (FAILED(hr))
         {
-            message = (target == "system") ? "No default audio output device" : "No default microphone device";
+            message = "No default audio output device";
             DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
             break;
         }
 
-        hr = pDevice->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, NULL, (void**)&pVolume);
+        // Get the session manager to enumerate per-process audio sessions
+        hr = pDevice->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, NULL, (void**)&pSessionManager);
         if (FAILED(hr))
         {
-            message = "Failed to activate audio endpoint volume";
+            message = "Failed to activate session manager";
             DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
             break;
         }
 
-        if (action == "toggle")
+        hr = pSessionManager->GetSessionEnumerator(&pSessionEnum);
+        if (FAILED(hr))
         {
-            BOOL currentMute = FALSE;
-            pVolume->GetMute(&currentMute);
-            newMuteState = !currentMute;
-            hr = pVolume->SetMute(!currentMute, NULL);
+            message = "Failed to get session enumerator";
+            DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
+            break;
         }
-        else if (action == "mute")
+
+        int sessionCount = 0;
+        pSessionEnum->GetCount(&sessionCount);
+        DriverLog("CPoseDataReceiver: Found %d audio sessions, scanning for SteamVR...\n", sessionCount);
+
+        for (int i = 0; i < sessionCount; i++)
         {
-            newMuteState = true;
-            hr = pVolume->SetMute(TRUE, NULL);
+            IAudioSessionControl* pSessionControl = nullptr;
+            IAudioSessionControl2* pSessionControl2 = nullptr;
+            ISimpleAudioVolume* pSimpleVolume = nullptr;
+
+            hr = pSessionEnum->GetSession(i, &pSessionControl);
+            if (FAILED(hr) || !pSessionControl) continue;
+
+            hr = pSessionControl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&pSessionControl2);
+            if (FAILED(hr) || !pSessionControl2)
+            {
+                pSessionControl->Release();
+                continue;
+            }
+
+            // Get the process ID that owns this audio session
+            DWORD pid = 0;
+            pSessionControl2->GetProcessId(&pid);
+
+            std::string procName = GetProcessName(pid);
+
+            if (IsSteamVRProcess(procName))
+            {
+                DriverLog("CPoseDataReceiver: Found SteamVR session: %s (pid=%lu)\n", procName.c_str(), pid);
+
+                hr = pSessionControl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&pSimpleVolume);
+                if (SUCCEEDED(hr) && pSimpleVolume)
+                {
+                    if (action == "mute")
+                    {
+                        pSimpleVolume->SetMute(TRUE, NULL);
+                        newMuteState = true;
+                        sessionsAffected++;
+                    }
+                    else if (action == "unmute")
+                    {
+                        pSimpleVolume->SetMute(FALSE, NULL);
+                        newMuteState = false;
+                        sessionsAffected++;
+                    }
+                    else if (action == "toggle")
+                    {
+                        BOOL currentMute = FALSE;
+                        pSimpleVolume->GetMute(&currentMute);
+                        newMuteState = !currentMute;
+                        pSimpleVolume->SetMute(!currentMute, NULL);
+                        sessionsAffected++;
+                    }
+                    else if (action == "get_state")
+                    {
+                        BOOL currentMute = FALSE;
+                        pSimpleVolume->GetMute(&currentMute);
+                        newMuteState = currentMute != FALSE;
+                        sessionsAffected++;
+                    }
+
+                    pSimpleVolume->Release();
+                }
+            }
+
+            pSessionControl2->Release();
+            pSessionControl->Release();
         }
-        else if (action == "unmute")
+
+        if (sessionsAffected > 0)
         {
-            newMuteState = false;
-            hr = pVolume->SetMute(FALSE, NULL);
-        }
-        else if (action == "get_state")
-        {
-            BOOL currentMute = FALSE;
-            hr = pVolume->GetMute(&currentMute);
-            newMuteState = currentMute != FALSE;
+            success = true;
+            char buf[128];
+            sprintf_s(buf, sizeof(buf), "%s (%d SteamVR sessions)",
+                newMuteState ? "muted" : "unmuted", sessionsAffected);
+            message = buf;
+            DriverLog("CPoseDataReceiver: SteamVR audio %s\n", message.c_str());
         }
         else
         {
-            message = "Unknown action: " + action;
-            break;
+            message = "No active SteamVR audio sessions found";
+            DriverLog("CPoseDataReceiver: %s\n", message.c_str());
         }
-
-        if (FAILED(hr))
-        {
-            message = "Failed to set mute state";
-            DriverLog("CPoseDataReceiver: %s (hr=0x%08lx)\n", message.c_str(), hr);
-            break;
-        }
-
-        success = true;
-        if (action == "get_state")
-        {
-            message = newMuteState ? "muted" : "unmuted";
-        }
-        else
-        {
-            message = newMuteState ? "muted" : "unmuted";
-        }
-        DriverLog("CPoseDataReceiver: Audio %s %s successfully\n", target.c_str(), message.c_str());
 
     } while (false);
 
     // Cleanup COM objects
-    if (pVolume) pVolume->Release();
+    if (pSessionEnum) pSessionEnum->Release();
+    if (pSessionManager) pSessionManager->Release();
     if (pDevice) pDevice->Release();
     if (pEnumerator) pEnumerator->Release();
     if (comInitialized) CoUninitialize();
@@ -567,21 +645,12 @@ void CPoseDataReceiver::HandleAudioCommand(const std::string& json)
     if (m_sendCallback)
     {
         char resp[512];
-#if defined(_WIN32)
         sprintf_s(resp, sizeof(resp),
-            "{\"type\":\"audio_response\",\"success\":%s,\"muted\":%s,\"target\":\"%s\",\"message\":\"%s\"}\n",
+            "{\"type\":\"audio_response\",\"success\":%s,\"muted\":%s,\"target\":\"steamvr\",\"sessions\":%d,\"message\":\"%s\"}\n",
             success ? "true" : "false",
             newMuteState ? "true" : "false",
-            target.c_str(),
+            sessionsAffected,
             message.c_str());
-#else
-        sprintf(resp,
-            "{\"type\":\"audio_response\",\"success\":%s,\"muted\":%s,\"target\":\"%s\",\"message\":\"%s\"}\n",
-            success ? "true" : "false",
-            newMuteState ? "true" : "false",
-            target.c_str(),
-            message.c_str());
-#endif
         m_sendCallback(std::string(resp));
     }
 }

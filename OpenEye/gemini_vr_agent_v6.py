@@ -2362,7 +2362,7 @@ class GeminiAgent:
         if cmd == "help":
             # Context-aware help
             if self.menu_state == VoiceMenuState.MAIN_MENU:
-                self.white_cane.audio.speak("You are in the main menu. You can ask me to navigate, describe surroundings, or identify objects.")
+                self.white_cane.audio.speak("You are in the main menu. You can ask me to navigate, describe surroundings, identify objects, or click on different objects in the scene.")
             elif self.menu_state == VoiceMenuState.WHITE_CANE_MENU:
                 self.white_cane.audio.speak("White cane mode. You can update your goal, ask for a description, or say stop to exit.")
             elif self.menu_state == VoiceMenuState.CONFIRMATION:

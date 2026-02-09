@@ -109,9 +109,20 @@ MODEL_GROUNDING = "gemini-3-flash-preview"
 MODEL_VERIFICATION = "gemini-2.5-flash" 
 MODEL_DESCRIPTION = "gemini-2.5-flash-lite-preview-09-2025"
 MODEL_WHITE_CANE = "gemini-3-flash-preview"
+WHISPER_MODEL = "small.en"
 
 LOG_DIR = Path("agent_logs_v2")
 SHOW_VISION_PREVIEW = False
+
+# ============================================================================
+# UX CONSTANTS
+# ============================================================================
+
+class VoiceMenuState:
+    IDLE = "idle"
+    MAIN_MENU = "main_menu"
+    WHITE_CANE_MENU = "white_cane_menu"
+    CONFIRMATION = "confirmation"
 
 # ============================================================================
 # UTILS
@@ -320,11 +331,13 @@ class AudioAssistant:
         
         if AUDIO_AVAILABLE:
             try:
-                print("Loading Whisper model (base.en)... this may take a moment.")
-                self.whisper_model = whisper.load_model("base.en")
+                print(f"Loading Whisper model ({WHISPER_MODEL})... this may take a moment.")
+                self.whisper_model = whisper.load_model(WHISPER_MODEL)
                 print("Whisper model loaded.")
             except Exception as e:
                 print(f"Failed to load Whisper model: {e}")
+
+        self.last_spoken = None
 
     def _speech_worker(self):
         """Worker thread that processes the speech queue sequentially."""
@@ -396,7 +409,15 @@ class AudioAssistant:
     def speak(self, text: str):
         """Add text to the speech queue."""
         if not text: return
+        self.last_spoken = text
         self.speech_queue.put(text)
+
+    def repeat_last(self):
+        """Repeat the last spoken text."""
+        if hasattr(self, 'last_spoken') and self.last_spoken:
+            self.speak(self.last_spoken)
+        else:
+            self.speak("I haven't said anything yet.")
 
     def listen(self, duration: int = 5) -> Optional[str]:
         """
@@ -894,14 +915,23 @@ IMPORTANT RULES:
         """Listen for a voice command (manual start/stop)."""
         return self.audio.listen_manual_stop()
 
-    def run_loop(self, interval: float = 2.0):
+    def run_loop(self, interval: float = 2.0, status_interval: float = 30.0):
         """
         Run the white cane loop in a separate thread.
-        Captures every 'interval' seconds to build history, but DOES NOT describe automatically.
+        Captures every 'interval' seconds to build history.
+        Announces status every 'status_interval' seconds.
         """
         logger = get_logger()
+        import time
+        last_announcement_time = time.time()
         
         while self.active and not self.stop_event.is_set():
+            # Status Announcement
+            if time.time() - last_announcement_time > status_interval:
+                goal_msg = f"Goal: {self.current_goal}." if self.current_goal else "No specific goal."
+                self.audio.speak(f"White cane active. {goal_msg} Say 'help' for details.")
+                last_announcement_time = time.time()
+
             # Capture (Silent Monitoring)
             timestamp_str, img_bytes, file_path = self.capture_with_timestamp()
             
@@ -2296,6 +2326,163 @@ class GeminiAgent:
             print("Keyboard VR control available (Default: Trackpad Mode). Type ` (backtick) at the prompt to toggle.")
         except ImportError:
             self.keyboard_ctrl = None
+            
+        # Voice Menu State
+        self.menu_state = VoiceMenuState.IDLE
+        self.pending_action = None # { "tool": str, "args": dict, "description": str }
+
+    def trigger_main_menu(self):
+        """Activates the main menu."""
+        self.menu_state = VoiceMenuState.MAIN_MENU
+        self.white_cane.audio.speak("Main menu. Say: Navigate, Describe, Identify, Repeat, or Help.")
+
+    def handle_voice_input(self, user_input: str):
+        """
+        Central handler for voice commands.
+        Routes based on current menu state.
+        """
+        cmd = user_input.lower().strip()
+        
+        # 1. Global Commands
+        if cmd in ["repeat", "say that again", "what did you say"]:
+            self.white_cane.audio.repeat_last()
+            return
+        
+        if cmd in ["stop", "exit", "quit", "cancel"]:
+            if self.menu_state != VoiceMenuState.IDLE:
+                self.menu_state = VoiceMenuState.IDLE
+                self.white_cane.audio.speak("Menu closed.")
+                return
+            # If idle, let it fall through to normal stop logic or do nothing
+        
+        if cmd == "menu":
+            self.trigger_main_menu()
+            return
+
+        if cmd == "help":
+            # Context-aware help
+            if self.menu_state == VoiceMenuState.MAIN_MENU:
+                self.white_cane.audio.speak("You are in the main menu. You can ask me to navigate, describe surroundings, or identify objects.")
+            elif self.menu_state == VoiceMenuState.WHITE_CANE_MENU:
+                self.white_cane.audio.speak("White cane mode. You can update your goal, ask for a description, or say stop to exit.")
+            elif self.menu_state == VoiceMenuState.CONFIRMATION:
+                self.white_cane.audio.speak(f"I need you to confirm if you want to {self.pending_action['description']}. Say confirm or cancel.")
+            else:
+                 self.white_cane.audio.speak("I am ready. Say menu for options, or just tell me what to do.")
+            return
+
+        if cmd == "options":
+            # List available commands
+            if self.menu_state == VoiceMenuState.MAIN_MENU:
+                self.white_cane.audio.speak("Options: Navigate, Describe, Identify, Repeat, Help.")
+            elif self.menu_state == VoiceMenuState.WHITE_CANE_MENU:
+                self.white_cane.audio.speak("Options: Goal, Help, Stop, Disable.")
+            elif self.menu_state == VoiceMenuState.CONFIRMATION:
+                self.white_cane.audio.speak("Options: Confirm, Cancel.")
+            else:
+                self.white_cane.audio.speak("Options: Menu, White Cane, Stop, Help.")
+            return
+            
+        if cmd == "tutorial":
+             self.white_cane.audio.speak("I am your VR assistant. You can give me commands like 'find the keys' or 'describe the room'. Say 'menu' to see structured options. If you get lost, say 'help'.")
+             return
+
+        # 2. State-Based Routing
+        if self.menu_state == VoiceMenuState.MAIN_MENU:
+            self.handle_main_menu(cmd)
+        elif self.menu_state == VoiceMenuState.WHITE_CANE_MENU:
+            self.handle_white_cane_menu(cmd)
+        elif self.menu_state == VoiceMenuState.CONFIRMATION:
+            self.handle_confirmation(cmd)
+        else:
+            # IDLE state - Normal Agent Execution
+            # Check for White Cane activation specifically here or in main loop?
+            # The main loop currently handles "white cane" checks. 
+            # We can leave IDLE to return False/None and let main loop handle it, 
+            # OR we can return the command to be executed.
+            return cmd # Return to main loop for execution processing
+
+    def handle_main_menu(self, cmd: str):
+        """Handle commands within the Main Menu."""
+        if "navigate" in cmd:
+            self.menu_state = VoiceMenuState.IDLE # Exit menu to execute
+            self.white_cane.audio.speak("Navigation. Where do you want to go?")
+            # We could enter a sub-state, but simple prompt is often enough. 
+            # For now, let's just prompt and rely on next input.
+            # But wait, if we return, the main loop process it. 
+            # If we want to capture the NEXT input as the destination, we might need a state.
+            # Simpler: Just guide them.
+            return 
+            
+        elif "describe" in cmd:
+            self.menu_state = VoiceMenuState.IDLE
+            self.white_cane.audio.speak("Describing surroundings...")
+            self._describe_view_tool("What do you see?")
+            return
+
+        elif "identify" in cmd:
+            self.menu_state = VoiceMenuState.IDLE
+            self.white_cane.audio.speak("What object should I look for?")
+            return
+
+        else:
+            # Fallback to normal planner if it sounds like a command
+            self.menu_state = VoiceMenuState.IDLE
+            return cmd
+
+    def handle_white_cane_menu(self, cmd: str):
+        """Handle commands within White Cane Menu."""
+        # This might be redundant if White Cane logic is separate, 
+        # but good for unification.
+        if "goal" in cmd:
+            new_goal = cmd.replace("goal", "").strip()
+            if new_goal:
+                self.white_cane.current_goal = new_goal
+                self.white_cane.audio.speak(f"Goal updated to: {new_goal}")
+            else:
+                self.white_cane.audio.speak("What is your new goal?")
+        elif "stop" in cmd or "disable" in cmd:
+            self.white_cane.deactivate()
+            self.menu_state = VoiceMenuState.IDLE
+            self.white_cane.audio.speak("White cane mode deactivated.")
+
+    def handle_confirmation(self, cmd: str):
+        """Handle confirmation for dangerous/long actions."""
+        if "confirm" in cmd or "yes" in cmd or "do it" in cmd:
+            if self.pending_action:
+                action = self.pending_action
+                self.pending_action = None
+                self.menu_state = VoiceMenuState.IDLE
+                self.white_cane.audio.speak("Confirmed. Executing.")
+                # Execute the pending tool
+                # We need to find the specific tool function and call it
+                # This logic depends on how we stored it.
+                # If we stored tool name and args:
+                tool_name = action["tool"]
+                args = action["args"]
+                func = self.tool_map.get(tool_name)
+                if func:
+                     try:
+                        res = func(**args)
+                        # We should log/speak result here or return it?
+                        # Since this is async/inside a handler, we should probably output directly.
+                        if isinstance(res, str) and len(res) < 100:
+                             self.white_cane.audio.speak(res)
+                        else:
+                             self.white_cane.audio.speak("Action completed.")
+                     except Exception as e:
+                         self.white_cane.audio.speak("Error executing action.")
+                         print(e)
+            else:
+                 self.menu_state = VoiceMenuState.IDLE
+                 self.white_cane.audio.speak("No pending action.")
+        
+        elif "cancel" in cmd or "no" in cmd:
+            self.pending_action = None
+            self.menu_state = VoiceMenuState.IDLE
+            self.white_cane.audio.speak("Action cancelled.")
+        else:
+            self.white_cane.audio.speak("Please say confirm or cancel.")
         
     def _describe_view_tool(self, question: str):
         """Tool wrapper for description model."""
@@ -2643,8 +2830,11 @@ if __name__ == "__main__":
                 voice_cmd = agent.white_cane.listen_command()
                 if voice_cmd:
                     print(f"Voice Command: {voice_cmd}")
-                    execution_thread = threading.Thread(target=agent.run_task, args=(voice_cmd,), daemon=True)
-                    execution_thread.start()
+                    # Use central handler
+                    res = agent.handle_voice_input(voice_cmd)
+                    if res: # If it returns a string, it's a command for the planner
+                        execution_thread = threading.Thread(target=agent.run_task, args=(res,), daemon=True)
+                        execution_thread.start()
                 continue
 
             # White Cane Voice Input Trigger
@@ -2652,18 +2842,37 @@ if __name__ == "__main__":
                 # If user presses Enter while white cane is active, trigger listening
                 voice_cmd = agent.white_cane.listen_command()
                 if voice_cmd:
-                    # Feed back into the loop as if typed
-                    # Check for exit commands first
-                    if any(x in voice_cmd.lower() for x in ['stop', 'exit', 'disable', 'quit']):
-                        print(f"Voice Command: {voice_cmd} -> Stopping White Cane")
-                        agent.white_cane.deactivate()
-                    else:
-                        print(f"Voice Command: {voice_cmd} -> Updating goal/help")
-                        # Treat as new goal or help request
-                        # Always use get_immediate_help to engage LLM and potentially update goal
-                        description = agent.white_cane.get_immediate_help(voice_cmd)
-                        print(f"\n[White Cane]:\n{description}\n")
-                        agent.white_cane.audio.speak(description)
+                    print(f"Voice Command: {voice_cmd}") 
+                    # Use central handler first to check for menus/globals
+                    # If handle_voice_input returns None, it handled it (e.g. menu, stop)
+                    # If it returns string, it means "execute this" -> which for white cane might mean "update goal" or "describe"
+                    
+                    # We need to temporarily set state to WHITE_CANE_MENU if it's not already?
+                    # agent.handle_voice_input checks menu_state. 
+                    # If state is IDLE, it returns cmd.
+                    # If state is WHITE_CANE_MENU, it handles it.
+                    
+                    # Problem: We want to support "menu" command even here.
+                    # Agent state is likely IDLE unless we are in a specific menu.
+                    # But White Cane is a "mode" not just a menu state.
+                    
+                    # Let's route through handle_voice_input
+                    res = agent.handle_voice_input(voice_cmd)
+                    
+                    if res:
+                        # If we got a result back, it wasn't a menu command.
+                        # It's likely a goal update or help request.
+                        if any(x in res.lower() for x in ['stop', 'exit', 'disable', 'quit']):
+                             # Redundant check? handle_voice_input might have handled 'stop' if it was global.
+                             # But 'stop' in IDLE returns 'stop'.
+                             print(f"Voice Command: {res} -> Stopping White Cane")
+                             agent.white_cane.deactivate()
+                        else:
+                             # Default White Cane behavior: Treat as help/goal
+                             print(f"Processing White Cane Context: {res}")
+                             description = agent.white_cane.get_immediate_help(res) # Pass user input as context
+                             print(f"\n[White Cane]:\n{description}\n")
+                             agent.white_cane.audio.speak(description)
                 continue
 
             # White Cane Deactivation

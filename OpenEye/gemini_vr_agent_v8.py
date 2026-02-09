@@ -537,7 +537,7 @@ class ActionPlanner:
            - track_multiple_items(object_names) -> Use when specific multiple items are requested.
            - type_text(text, controller) -> Use to type on virtual keyboard.
            - inspect_surroundings() -> Take a picture.
-           - describe_view(question) -> Describe what is seen.
+           - describe_view(question) -> Describe what is seen. AT MOST 3 sentences. Only the essential details. Do not describe the background unless it is relevant to the user request.
            - verify_action(action_description) -> Check if action succeeded.
            - provide_help() -> Provide context-aware help (Use this for 'help', 'help me', 'I need help', etc.).
            - provide_tutorial() -> Provide a tutorial/introduction.
@@ -874,6 +874,137 @@ IMPORTANT RULES:
         
         return "White cane mode deactivated."
 
+    def cleanup_old_images(self, max_age_seconds: int = 10):
+        """Delete images in log_dir older than max_age_seconds."""
+        logger = get_logger()
+        now = time.time()
+        count = 0
+        try:
+            for file_path in self.log_dir.glob("*.png"):
+                if file_path.is_file():
+                    stat = file_path.stat()
+                    # Check modification time
+                    if now - stat.st_mtime > max_age_seconds:
+                        file_path.unlink()
+                        count += 1
+            if count > 0:
+                logger.info(f"Cleaned up {count} old white cane images (> {max_age_seconds}s).")
+        except Exception as e:
+            logger.error(f"Error cleaning up old images: {e}")
+
+    def get_headset_rotation(self) -> tuple:
+        """Get current headset rotation (pitch, yaw, roll)."""
+        logger = get_logger()
+        try:
+            # Re-using the parsing logic from visual_servo_to_object or similar
+            res = self.executor.call("get_current_pose", device="headset")
+            if "Rotation: [" in res:
+                rot_str = res.split("Rotation: [")[1].split("]")[0]
+                rot_str = rot_str.replace("np.float64(", "").replace(")", "")
+                pitch, yaw, roll = map(float, rot_str.split(","))
+                return pitch, yaw, roll
+        except Exception as e:
+            logger.error(f"Failed to get headset rotation: {e}")
+        return 0.0, 0.0, 0.0
+
+    def perform_360_scan(self, user_input: str = None) -> str:
+        """
+        Rotates headset 0, 90, 180, 270, captures images, and analyzes them.
+        Returns a description and recommendation.
+        """
+        logger = get_logger()
+        logger.info(f"Starting 360 scan for request: {user_input}")
+        self.audio.speak("Scanning surroundings...")
+        
+        # 1. Cleanup old images first
+        self.cleanup_old_images(max_age_seconds=10)
+
+        # 2. Save start rotation
+        start_pitch, start_yaw, start_roll = self.get_headset_rotation()
+        
+        # 3. Scan Loop
+        # Directions: Front (current), Right (+90), Back (+180), Left (+270)
+        # We will use relative offsets from current yaw? 
+        # Or absolute 0, 90, 180, 270? 
+        # Absolute might be disorienting if user was facing 45.
+        # Relative is better.
+        
+        captured_images = [] # List of (label, bytes)
+        offsets = [0, -90, -180, -270] # Rotating RIGHT (Negative Yaw usually? Or Positive?)
+        # Standard Unity/VR: +Y is Up. +RotY is usually turning right?
+        # Let's try offsets 0, 90, 180, 270.
+        labels = ["Front", "Right", "Back", "Left"]
+        
+        try:
+            for i, offset in enumerate(offsets):
+                target_yaw = start_yaw + offset
+                # Normalize to -180 to 180 or 0 to 360?
+                # The underlying system usually handles it.
+                
+                # Rotate
+                self.executor.call("rotate_device", device="headset", pitch=start_pitch, yaw=target_yaw, roll=0)
+                # Wait for movement
+                time.sleep(0.5)
+                
+                # Capture
+                timestamp_str, img_bytes, file_path = self.capture_with_timestamp()
+                if img_bytes:
+                    captured_images.append((labels[i], img_bytes))
+                
+            # 4. Restore original rotation
+            self.executor.call("rotate_device", device="headset", pitch=start_pitch, yaw=start_yaw, roll=start_roll)
+            
+            # 5. Analyze with Gemini
+            if not captured_images:
+                return "Failed to capture images for scan."
+            
+            # Construct Prompt
+            parts = []
+            prompt = f"""
+You are an accessibility assistant for a blind user.
+The user's goal is: "{self.current_goal or 'Explore'}"
+User just asked: "{user_input or 'What should I do?'}"
+
+I have rotated the user to look in 4 directions (Front, Right, Back, Left).
+Analyze these 4 images to understand the FULL environment.
+
+Task:
+1. Briefly summarize the most important things around the user (hazards, paths, objects of interest).
+2. Recommend a clear action (e.g., "Turn right and move towards the door", "Move forward", "Stop, obstacle ahead").
+3. Descriptions must be CONCISE (under 30 words).
+"""
+            parts.append(types.Part(text=prompt))
+            
+            for label, img_data in captured_images:
+                parts.append(types.Part(text=f"\n[{label} View]:"))
+                parts.append(types.Part(inline_data=types.Blob(mime_type="image/png", data=img_data)))
+            
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[types.Content(role="user", parts=parts)]
+            )
+            
+            result_text = response.text.strip()
+            
+            # 6. Cleanup again (optional, but requested "delete images older than 10s")
+            # We already did it at start. The new images are fresh.
+            # We can leave them for a bit or delete immediately? 
+            # Request said "delete images that are older than 10 seconds". 
+            # This implies a periodic cleanup or cleanup check. 
+            # Doing it at start of next scan is fine, or we can do it here too just to be safe.
+            self.cleanup_old_images(max_age_seconds=10)
+            
+            return result_text
+
+        except Exception as e:
+            logger.error(f"360 Scan failed: {e}")
+            # Try to restore rotation if we crashed
+            try:
+                self.executor.call("rotate_device", device="headset", pitch=start_pitch, yaw=start_yaw, roll=start_roll)
+            except:
+                pass
+            return f"Error during scan: {e}"
+
     def get_immediate_help(self, user_input: str = None) -> str:
         """Capture and describe immediately (when user says 'help')."""
         timestamp_str, img_bytes, file_path = self.capture_with_timestamp()
@@ -986,11 +1117,9 @@ class Describer:
         # Add accessibility context for blind users
         accessibility_prompt = (
             "IMPORTANT: This response is for a blind user and will be read aloud. "
-            "Please provide a very detailed but succinct description. "
-            "Specifically mention important items users might need, especially buttons or texts on the screen and their locations. "
+            "Output a maximum of 3 sentences with only essential details on the stuff that the user might need based on their question. "
+            "Do not describe the background unless you are asked about it. "
             "CRITICAL: Do NOT use bullet points, lists, or multi-paragraph structured text. "
-            "Output a single continuous paragraph. "
-            "Ensure the description is fully detailed regardless of length so the user receives all necessary information."
         )
         
         full_query = f"{accessibility_prompt}\n\nQuestion: {question}"
@@ -2323,7 +2452,7 @@ Rules:
         perform_grab, perform_release, release_all_inputs,
         get_controller_state,
         # Utility
-        finish_task, get_connection_status, kill_address, speak_message, provide_help, provide_tutorial, provide_options
+        finish_task, get_connection_status, kill_address, provide_help, provide_tutorial, provide_options
     ]
 # ============================================================================
 # AGENT (Multi-Model Orchestrator)
@@ -2684,7 +2813,7 @@ class GeminiAgent:
                              # If it's a description/verification, we might want to speak the result if it's short.
                              if step.tool in ["describe_view", "verify_action", "locate_object"]:
                                  # Speak the actual result for these information tools if short enough
-                                 if len(result) < 100:
+                                 if len(result) < 500:
                                      self.white_cane.audio.speak(result)
                                  else:
                                      self.white_cane.audio.speak("Done. Content is long.")
@@ -2810,7 +2939,7 @@ if __name__ == "__main__":
     print("VR Agent v4 (Multi-Model) Ready.")
     print("Commands: 'white cane' to activate accessibility mode, 'quit' to exit.")
     if agent.config.get("startup_message", True):
-        agent.white_cane.audio.speak("VR Agent initialized. I am your VR assistant. You can give me commands like 'find the keys' or 'describe the room'. Say 'menu' to see structured options. If you get lost, say 'help'.")
+        agent.white_cane.audio.speak("VR Agent initialized. I am your VR assistant. Press enter, talk to me and press enter again.You can give me commands like 'find the keys' or 'describe the room'. Say 'menu' to see structured options. If you get lost, say 'help'.")
     
     # Execution Thread
     execution_thread = None
@@ -2901,8 +3030,8 @@ if __name__ == "__main__":
                                 # Also stop keyboard if white cane stops? Maybe not.
                                 # But we need to return to break the loop or update state
                             else:
-                                # Always use get_immediate_help to engage LLM and potentially update goal
-                                description = agent.white_cane.get_immediate_help(voice_cmd)
+                                # Always use perform_360_scan to engage LLM with full context
+                                description = agent.white_cane.perform_360_scan(voice_cmd)
                                 print(f"\n[White Cane]:\n{description}\n")
                                 agent.white_cane.audio.speak(description)
                         print("[Resuming Keyboard]...")
@@ -2961,7 +3090,7 @@ if __name__ == "__main__":
                         else:
                              # Default White Cane behavior: Treat as help/goal
                              print(f"Processing White Cane Context: {res}")
-                             description = agent.white_cane.get_immediate_help(res) # Pass user input as context
+                             description = agent.white_cane.perform_360_scan(res) # Pass user input as context
                              print(f"\n[White Cane]:\n{description}\n")
                              agent.white_cane.audio.speak(description)
                 continue

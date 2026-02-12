@@ -82,17 +82,19 @@ flowchart TB
 
     subgraph Orchestrator["🧠 GeminiAgent Orchestrator"]
         direction TB
-        planner["📋 ActionPlanner\n<b>gemini-3-flash-preview</b>\nStructured action plans"]
-        grounding["🎯 VisualGrounder\n<b>gemini-3-flash-preview</b>\nObject detection & bounding boxes"]
-        verifier["✅ Verifier\n<b>gemini-2.5-flash</b>\nAction verification"]
-        describer["👁️ Describer\n<b>gemini-2.5-flash-lite</b>\nScene understanding"]
-        whitecane["🦯 WhiteCaneAssistant\n<b>gemini-3-flash-preview</b>\nBlind-user navigation"]
+        planner["📋 ActionPlanner<br><b>gemini-3-flash-preview</b><br>Structured action plans"]
+        grounding["🎯 VisualGrounder<br><b>gemini-3-flash-preview</b><br>Object detection & bounding boxes"]
+        verifier["✅ Verifier<br><b>gemini-2.5-flash</b><br>Action verification"]
+        describer["👁️ Describer
+        <b>gemini-2.5-flash-lite</b><br>Scene understanding"]
+        whitecane["🦯 WhiteCaneAssistant
+        <b>gemini-3-flash-preview</b><br>Blind-user navigation"]
     end
 
     subgraph Execution["⚡ Execution Layer"]
-        mcp["MCP Server\n30+ VR Tools"]
-        driver["C++ OpenVR Driver\nSteamVR Integration"]
-        tracker["SAM 3 Tracker\nObject Segmentation"]
+        mcp["MCP Server<br>30+ VR Tools"]
+        driver["C++ OpenVR Driver<br>SteamVR Integration"]
+        tracker["SAM 3 Tracker<br>Object Segmentation"]
     end
 
     subgraph Output["📤 Output"]
@@ -140,7 +142,6 @@ GEMINI_Comp_VR/OpenEye/
 ├── cvisionserver.*            # 👁️ C++ vision data server
 ├── cserverdriver_sample.*     # 🔧 C++ driver entry point
 │
-├── UI/                        # 🖥️ React-based control panel
 ├── assets/                    # 🎨 Images, videos, model assets
 ├── requirements.txt           # 📦 Python dependencies
 └── default.vrsettings         # ⚙️ SteamVR driver configuration
@@ -421,8 +422,8 @@ The visual servo system is a **closed-loop controller** that aligns a VR control
 
 ```mermaid
 flowchart LR
-    A["📸 Capture Frame"] --> B["🎯 Locate Target\n(Gemini Grounding)"]
-    B --> C["🎯 Locate Ray\n(Gemini Grounding)"]
+    A["📸 Capture Frame"] --> B["🎯 Locate Target<br>(Gemini Grounding)"]
+    B --> C["🎯 Locate Ray<br>(Gemini Grounding)"]
     C --> D{"Δ < threshold?"}
     D -- No --> E["🕹️ Adjust Pitch/Yaw"]
     E --> A
@@ -467,7 +468,7 @@ The agent saves its configuration to `agent_config.json`:
 | AI Models | Google Gemini 3 Flash, 2.5 Flash, 2.5 Flash Lite |
 | VR Runtime | SteamVR / OpenVR |
 | VR Driver | Custom C++ OpenVR driver |
-| Object Tracking | Meta SAM 3 (Segment Anything Model 2) |
+| Object Tracking | Meta SAM 3 (Segment Anything Model 3) |
 | Speech-to-Text | OpenAI Whisper |
 | Text-to-Speech | Google TTS (gTTS) |
 | Vision | OpenCV, NumPy |

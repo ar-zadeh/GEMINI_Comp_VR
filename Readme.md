@@ -80,14 +80,16 @@ flowchart TB
         text["⌨️ Text Command"]
     end
 
-subgraph Orchestrator["🧠 GeminiAgent Orchestrator"]
-    direction LR
-    planner["📋 ActionPlanner<br/>gemini-3-flash-preview<br/>Structured action plans"]
-    grounding["🎯 VisualGrounder<br/>gemini-3-flash-preview<br/>Object detection & bounding boxes"]
-    verifier["✅ Verifier<br/>gemini-2.5-flash<br/>Action verification"]
-    describer["👁️ Describer<br/>gemini-2.5-flash-lite<br/>Scene understanding"]
-    whitecane["🦯 WhiteCaneAssistant<br/>gemini-3-flash-preview<br/>Blind-user navigation"]
-end
+    subgraph Orchestrator["🧠 GeminiAgent Orchestrator"]
+        direction LR
+        describer["👁️ Describer<br/>gemini-2.5-flash-lite<br/>Scene understanding"]
+        whitecane["🦯 WhiteCaneAssistant<br/>gemini-3-flash-preview<br/>Blind-user navigation"]
+        planner["📋 ActionPlanner<br/>gemini-3-flash-preview<br/>Structured action plans"]
+        grounding["🎯 VisualGrounder<br/>gemini-3-flash-preview<br/>Object detection & bounding boxes"]
+        verifier["✅ Verifier<br/>gemini-2.5-flash<br/>Action verification"]
+        describer ~~~ whitecane ~~~ planner ~~~ grounding ~~~ verifier
+    end
+
 
     subgraph Execution["⚡ Execution Layer"]
         mcp["MCP Server<br>30+ VR Tools"]

@@ -13,7 +13,7 @@ dist/
 *.log
 OpenEye/VREye/
 OpenEye/agent_logs/
-OpenEye/sam3__
+
 # OS
 .DS_Store
 Thumbs.db

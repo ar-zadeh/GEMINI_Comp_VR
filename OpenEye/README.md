@@ -380,12 +380,11 @@ Commands: 'white cane' to activate accessibility mode, 'quit' to exit.
 
 ### Natural Language Tasks
 ```
-> Pick up the red cube and place it on the table
-  📋 Planning → 🎯 Locate "red cube" → 🕹️ Servo align → ✋ Grab → 
-  🎯 Locate "table" → 🕹️ Move → ✋ Release → ✅ Verify
+> Open up the menu
+  📋 Planning → 🎯 Calls the open_menu tool → ✅ Verify
 
-> Type "hello world" on the keyboard
-  📋 Planning → 🎯 Ground all characters → ⌨️ Servo + click per key → ✅ Verify
+> Click the <NAME_OF_ROOM> room
+  📋 Planning → 🎯 Locate "<NAME_OF_ROOM> room" → 🕹️ Servo + click → ✅ Verify
 
 > Describe what's in front of me
   📸 Capture → 👁️ Describe → 🔊 Speak result
@@ -405,13 +404,6 @@ Commands: 'white cane' to activate accessibility mode, 'quit' to exit.
   🦯 White Cane activated. Scanning...
   🔊 "You are in a large room. The exit door is approximately 10 steps 
       ahead and slightly to your right."
-```
-
-### Push-to-Talk
-```
-> f                                        # Hold 'f' to grip controller
-  [Recording...] "Move forward and grab the blue sphere"
-  [Released] Processing...
 ```
 
 ---

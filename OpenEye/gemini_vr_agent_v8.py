@@ -351,12 +351,6 @@ class AudioAssistant:
                     continue
 
                 # Mute mic while speaking
-                if self.executor:
-                    try:
-                        self.executor.call("mute_microphone")
-                    except Exception as e:
-                        print(f"Failed to mute mic: {e}")
-
                 try:
                     # Create temp file
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
@@ -393,13 +387,6 @@ class AudioAssistant:
 
                 except Exception as e:
                     print(f"TTS Error: {e}")
-                finally:
-                    # Unmute mic after speaking
-                    if self.executor:
-                        try:
-                            self.executor.call("unmute_microphone")
-                        except Exception as e:
-                            print(f"Failed to unmute mic: {e}")
 
             except Exception as e:
                 print(f"Speech worker error: {e}")
@@ -476,11 +463,6 @@ class AudioAssistant:
         # "whenever the user presses enter to talk, it mutes the SteamVR mic, and once they press enter again, unmutes it."
         # This means while RECORDING for the Agent, the user should be MUTED in SteamVR (so they don't broadcast to the game).
         
-        if self.executor:
-            try:
-                self.executor.call("mute_microphone")
-            except Exception as e:
-                print(f"Failed to mute mic: {e}")
 
         try:
             # -f cd sets 16bit little endian, 44100Hz, stereo
@@ -506,13 +488,6 @@ class AudioAssistant:
         except Exception as e:
             print(f"Recording failed: {e}")
             return None
-        finally:
-            # Unmute mic after recording
-            if self.executor:
-                try:
-                    self.executor.call("unmute_microphone")
-                except Exception as e:
-                    print(f"Failed to unmute mic: {e}")
         if not wav_path.exists() or wav_path.stat().st_size < 100:
             print("Recording failed or empty.")
             return None

@@ -87,7 +87,6 @@ flowchart TB
         planner["📋 ActionPlanner<br/>gemini-3-flash-preview<br/>Structured action plans"]
         grounding["🎯 VisualGrounder<br/>gemini-3-flash-preview<br/>Object detection & bounding boxes"]
         verifier["✅ Verifier<br/>gemini-2.5-flash<br/>Action verification"]
-        describer ~~~ whitecane ~~~ planner ~~~ grounding ~~~ verifier
     end
 
 

@@ -1,0 +1,23 @@
+{
+    "driver_null" : {
+      "enable" : true,
+      "id" : "Null Driver",
+      "renderHeight" : 1080,
+      "renderWidth" : 1920,
+      "tcpEnabled" : true,
+      "tcpHost" : "127.0.0.1",
+      "tcpPort" : 5555,
+      "visionEnabled" : true,
+      "windowHeight" : 1080,
+      "windowWidth" : 1920,
+      "windowX" : 100,
+      "windowY" : 100
+   },
+   "power" : {
+      "overrideWindowsPowerScheme" : true,
+      "pauseCompositorOnStandby" : false,
+      "powerOffOnExit" : false,
+      "turnOffControllersTimeout" : 0,
+      "turnOffScreensTimeout" : 300
+   },
+}

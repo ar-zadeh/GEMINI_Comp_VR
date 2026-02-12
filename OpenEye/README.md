@@ -9,7 +9,7 @@
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![Gemini API](https://img.shields.io/badge/Google-Gemini_API-4285F4?logo=google&logoColor=white)](https://ai.google.dev/)
 [![OpenVR](https://img.shields.io/badge/OpenVR-SteamVR-1b2838?logo=steam&logoColor=white)](https://github.com/ValveSoftware/openvr)
-[![SAM 2](https://img.shields.io/badge/Meta-SAM_2-0668E1?logo=meta&logoColor=white)](https://github.com/facebookresearch/segment-anything-2)
+[![SAM 3](https://img.shields.io/badge/Meta-SAM_3-0668E1?logo=meta&logoColor=white)](https://github.com/facebookresearch/segment-anything-3)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Gemini VR Interaction Kit** is a full-stack AI agent that bridges Google's Gemini multimodal models with SteamVR through a custom OpenVR driver. It can navigate 3D environments, locate and track objects, type on virtual keyboards, assist blind users, and carry out complex multi-step tasks—all through natural language.
@@ -46,8 +46,8 @@ A first-of-its-kind **blind-user navigation assistant** for VR. Performs 360° e
 </td>
 <td>
 
-### 🎬 SAM 2 Object Tracking
-Detects an object in the first frame, then tracks it across a video sequence using **Meta's Segment Anything Model 2**—producing segmented, annotated tracking videos.
+### 🎬 SAM 3 Object Tracking
+Detects an object in the first frame, then tracks it across a video sequence using **Meta's Segment Anything Model 3**—producing segmented, annotated tracking videos.
 
 </td>
 </tr>
@@ -92,7 +92,7 @@ flowchart TB
     subgraph Execution["⚡ Execution Layer"]
         mcp["MCP Server\n30+ VR Tools"]
         driver["C++ OpenVR Driver\nSteamVR Integration"]
-        tracker["SAM 2 Tracker\nObject Segmentation"]
+        tracker["SAM 3 Tracker\nObject Segmentation"]
     end
 
     subgraph Output["📤 Output"]
@@ -130,7 +130,7 @@ GEMINI_Comp_VR/OpenEye/
 ├── gemini_vr_agent_v8.py      # 🧠 Main agent (this file — 3,100+ lines)
 ├── mcp_server.py              # 🔌 MCP tool server (30+ VR tools)
 ├── keyboard_controller.py     # ⌨️ WASD keyboard control for VR navigation
-├── object_tracker.py          # 🎬 SAM 2 integration for object tracking
+├── object_tracker.py          # 🎬 SAM 3 integration for object tracking
 ├── controllertracker.py       # 📡 Real-time controller pose tracking
 │
 ├── csamplecontrollerdriver.*  # 🎮 C++ OpenVR controller driver
@@ -194,7 +194,7 @@ The agent exposes a rich tool library through the MCP server. Every tool is call
 |------|-------------|
 | `inspect_surroundings` | Capture current frame from VR headset |
 | `locate_object` | Find an object and return center coordinates |
-| `track_object` | Track an object using SAM 2 segmentation |
+| `track_object` | Track an object using SAM 3 segmentation |
 | `track_multiple_items` | Track multiple objects simultaneously |
 | `create_tracking_video` | Generate segmented tracking video |
 | `capture_video` | Record a video clip (configurable duration) |
@@ -287,7 +287,29 @@ Create a `.env` file in the `OpenEye` directory:
 GEMINI_API_KEY=your_api_key_here
 ```
 
-### 4. Build & Install the OpenVR Driver
+### 4. Install the OpenVR Driver
+
+The agent communicates with SteamVR through a custom **Null Driver**. There are two ways to get it set up:
+
+#### Option A — Use the Pre-Built Driver (Recommended)
+
+A pre-compiled driver DLL is included in the repository:
+
+```
+OpenEye/bin/drivers/sample/bin/win64/driver_null.dll
+```
+
+Copy it to your SteamVR null driver directory:
+
+```powershell
+copy "bin\drivers\sample\bin\win64\driver_null.dll" ^
+     "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\drivers\null\bin\win64\"
+```
+
+> [!NOTE]
+> Your Steam installation path may differ. Replace `C:\Program Files (x86)\Steam` with your actual Steam install location.
+
+#### Option B — Build from Source
 
 ```bash
 mkdir build && cd build
@@ -295,7 +317,49 @@ cmake ..
 cmake --build . --config Release
 ```
 
-Then copy the built driver to your SteamVR drivers directory.
+Then copy the resulting `driver_null.dll` from the build output to:
+```
+C:\Program Files (x86)\Steam\steamapps\common\SteamVR\drivers\null\bin\win64\
+```
+
+#### Enable the Null Driver in SteamVR
+
+Open your SteamVR configuration file:
+
+```
+C:\Program Files (x86)\Steam\config\steamvr.vrsettings
+```
+
+Add (or merge) the following JSON into the file:
+
+```json
+{
+    "driver_null" : {
+      "enable" : true,
+      "id" : "Null Driver",
+      "renderHeight" : 1080,
+      "renderWidth" : 1920,
+      "tcpEnabled" : true,
+      "tcpHost" : "127.0.0.1",
+      "tcpPort" : 5555,
+      "visionEnabled" : true,
+      "windowHeight" : 1080,
+      "windowWidth" : 1920,
+      "windowX" : 100,
+      "windowY" : 100
+   },
+   "power" : {
+      "overrideWindowsPowerScheme" : true,
+      "pauseCompositorOnStandby" : false,
+      "powerOffOnExit" : false,
+      "turnOffControllersTimeout" : 0,
+      "turnOffScreensTimeout" : 300
+   }
+}
+```
+
+> [!IMPORTANT]
+> The `tcpEnabled` and `visionEnabled` fields must be `true` for the agent to receive pose data and capture frames from SteamVR.
 
 ### 5. Run the Agent
 
@@ -403,7 +467,7 @@ The agent saves its configuration to `agent_config.json`:
 | AI Models | Google Gemini 3 Flash, 2.5 Flash, 2.5 Flash Lite |
 | VR Runtime | SteamVR / OpenVR |
 | VR Driver | Custom C++ OpenVR driver |
-| Object Tracking | Meta SAM 2 (Segment Anything Model 2) |
+| Object Tracking | Meta SAM 3 (Segment Anything Model 2) |
 | Speech-to-Text | OpenAI Whisper |
 | Text-to-Speech | Google TTS (gTTS) |
 | Vision | OpenCV, NumPy |
@@ -441,7 +505,7 @@ The agent can <b>type on any VR keyboard</b> by grounding characters visually an
 </td>
 <td align="center">
 <h3>🎬 Real-Time Tracking</h3>
-<b>SAM 2</b> integration enables real-time object segmentation and tracking across video sequences captured from VR.
+<b>SAM 3</b> integration enables real-time object segmentation and tracking across video sequences captured from VR.
 </td>
 </tr>
 </table>
@@ -450,7 +514,7 @@ The agent can <b>type on any VR keyboard</b> by grounding characters visually an
 
 <div align="center">
 
-**Built with ❤️ using Google Gemini, SteamVR, and Meta SAM 2**
+**Built with ❤️ using Google Gemini, SteamVR, and Meta SAM 3**
 
 *Gemini VR Interaction Kit — Giving AI eyes, hands, and a voice in Virtual Reality.*
 

@@ -410,19 +410,27 @@ Commands: 'white cane' to activate accessibility mode, 'quit' to exit.
 
 ## 🎯 Visual Servo Pipeline
 
-The visual servo system is a **closed-loop controller** that aligns a VR controller ray to any target object:
+The visual servo system leverages Gemini for initial grounding and then transitions to a **closed-loop SAM3 tracking process** that iteratively aligns a VR controller ray to any target object:
 
 ```mermaid
 flowchart LR
     A["📸 Capture Frame"] --> B["🎯 Locate Target<br>(Gemini Grounding)"]
     B --> C["🎯 Locate Ray<br>(Gemini Grounding)"]
-    C --> D{"Δ < threshold?"}
-    D -- No --> E["🕹️ Adjust Pitch/Yaw"]
-    E --> A
-    D -- Yes --> F["✅ Aligned!"]
+    
+    subgraph TrackingLoop ["Iterative Tracking Loop"]
+        direction LR
+        G["🎞️ Track with SAM3"] --> D{"Δ < θ?"}
+        D -- "No" --> E["🕹️ Adjust Pitch/Yaw"]
+        E --> H["📸 Capture Next Frame"]
+        H --> G
+    end
+
+    C --> G
+    D -- "Yes" --> F["✅ Aligned!"]
 
     style D fill:#f9a825,color:#000
     style F fill:#66bb6a,color:#000
+    style TrackingLoop fill:#f9f9f9,stroke:#333,stroke-dasharray: 5 5
 ```
 
 The agent iteratively adjusts controller pitch and yaw using adaptive gain until the ray center aligns with the target center within a configurable pixel threshold.

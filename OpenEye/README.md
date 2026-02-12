@@ -1,6 +1,6 @@
+<div align="center">
 ![Gemini VR Interaction Kit Banner](assets/github_banner.png)
 
-<div align="center">
 
 # Gemini VR Interaction Kit
 

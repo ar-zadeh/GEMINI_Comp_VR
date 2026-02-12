@@ -82,13 +82,11 @@ flowchart TB
 
     subgraph Orchestrator["🧠 GeminiAgent Orchestrator"]
         direction TB
-        planner["📋 ActionPlanner<br><b>gemini-3-flash-preview</b><br>Structured action plans"]
-        grounding["🎯 VisualGrounder<br><b>gemini-3-flash-preview</b><br>Object detection & bounding boxes"]
-        verifier["✅ Verifier<br><b>gemini-2.5-flash</b><br>Action verification"]
-        describer["👁️ Describer
-        <b>gemini-2.5-flash-lite</b><br>Scene understanding"]
-        whitecane["🦯 WhiteCaneAssistant
-        <b>gemini-3-flash-preview</b><br>Blind-user navigation"]
+        planner["📋 ActionPlanner<br/>gemini-3-flash-preview<br/>Structured action plans"]
+        grounding["🎯 VisualGrounder<br/>gemini-3-flash-preview<br/>Object detection & bounding boxes"]
+        verifier["✅ Verifier<br/>gemini-2.5-flash<br/>Action verification"]
+        describer["👁️ Describer<br/>gemini-2.5-flash-lite<br/>Scene understanding"]
+        whitecane["🦯 WhiteCaneAssistant<br/>gemini-3-flash-preview<br/>Blind-user navigation"]
     end
 
     subgraph Execution["⚡ Execution Layer"]
@@ -474,7 +472,6 @@ The agent saves its configuration to `agent_config.json`:
 | Text-to-Speech | Google TTS (gTTS) |
 | Vision | OpenCV, NumPy |
 | Tool Server | MCP (Model Context Protocol) Server |
-| Frontend | React-based control panel |
 | Language | Python 3.10+, C++ |
 
 ---

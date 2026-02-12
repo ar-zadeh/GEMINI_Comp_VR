@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/github_banner.png" alt="Gemini VR Interaction Kit Banner" width="100%">
+<img src="OpenEye/assets/github_banner.png" alt="Gemini VR Interaction Kit Banner" width="100%">
 
 # Gemini VR Interaction Kit
 

@@ -21,13 +21,13 @@ class ObjectTracker:
         self.model = None
         
         # Check imports
+        import torch
+        import sam3
+        from sam3 import build_sam3_image_model
+        from sam3.model.box_ops import box_xywh_to_cxcywh
+        from sam3.model.sam3_image_processor import Sam3Processor
+        from sam3.visualization_utils import normalize_bbox
         try:
-            import torch
-            import sam3
-            from sam3 import build_sam3_image_model
-            from sam3.model.box_ops import box_xywh_to_cxcywh
-            from sam3.model.sam3_image_processor import Sam3Processor
-            from sam3.visualization_utils import normalize_bbox
             
             self.torch = torch
             self.sam3 = sam3

@@ -99,6 +99,14 @@ class GeminiAgent:
         except ImportError:
             self.keyboard_ctrl = None
 
+        # Camera Walking controller
+        try:
+            from camera_walking_controller import CameraWalkingController
+            self.camera_ctrl = CameraWalkingController(self.executor.module)
+            print("Camera Walking control available.")
+        except ImportError:
+            self.camera_ctrl = None
+
         # Voice menu state
         self.menu_state = VoiceMenuState.IDLE
         self.pending_action: Optional[Dict] = None

@@ -70,6 +70,8 @@ if __name__ == "__main__":
             if cmd in ["quit", "exit"]:
                 if agent.white_cane.active:
                     agent.white_cane.deactivate()
+                if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                    agent.camera_ctrl.stop()
                 if hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
                     agent.keyboard_ctrl.stop()
                 if execution_thread and execution_thread.is_alive():
@@ -94,20 +96,39 @@ if __name__ == "__main__":
 
                 agent.white_cane.start_background_loop(interval=10.0)
 
-                if hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
+                def execute_whitecane_voice_command(voice_cmd):
+                    if voice_cmd:
+                        if any(x in voice_cmd.lower() for x in ["stop", "exit", "disable", "quit"]):
+                            print(f"Voice Command: {voice_cmd} -> Stopping White Cane")
+                            agent.white_cane.deactivate()
+                            if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                                agent.camera_ctrl.deactivate()
+                            elif hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
+                                agent.keyboard_ctrl.deactivate()
+                        else:
+                            description = agent.white_cane.perform_360_scan(voice_cmd)
+                            print(f"\n[White Cane]:\n{description}\n")
+                            agent.white_cane.audio.speak(description)
+
+                if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                    print("Auto-activating Camera Controller for walking and navigation...")
+                    
+                    def on_enter_callback_camera():
+                        print("\n[Paused Camera Walking Tracking] Listening for command...")
+                        voice_cmd = agent.white_cane.listen_command()
+                        execute_whitecane_voice_command(voice_cmd)
+                        print("[Resuming Camera Walking Tracking]...")
+
+                    agent.camera_ctrl.on_trigger_callback = on_enter_callback_camera
+                    agent.camera_ctrl.activate()
+
+                elif hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
                     print("Auto-activating Keyboard Controller for navigation...")
 
                     def on_enter_callback():
                         print("\n[Paused Keyboard] Listening for command...")
                         voice_cmd = agent.white_cane.listen_command()
-                        if voice_cmd:
-                            if any(x in voice_cmd.lower() for x in ["stop", "exit", "disable", "quit"]):
-                                print(f"Voice Command: {voice_cmd} -> Stopping White Cane")
-                                agent.white_cane.deactivate()
-                            else:
-                                description = agent.white_cane.perform_360_scan(voice_cmd)
-                                print(f"\n[White Cane]:\n{description}\n")
-                                agent.white_cane.audio.speak(description)
+                        execute_whitecane_voice_command(voice_cmd)
                         print("[Resuming Keyboard]...")
 
                     agent.keyboard_ctrl.on_trigger_callback = on_enter_callback
@@ -150,6 +171,10 @@ if __name__ == "__main__":
             # ── White Cane deactivation ───────────────────────────────────────
             elif cmd in ["disable white cane", "stop white cane", "exit white cane"]:
                 result = agent.white_cane.deactivate()
+                if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                    agent.camera_ctrl.deactivate()
+                elif hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
+                    agent.keyboard_ctrl.deactivate()
                 print(result)
                 continue
 
@@ -206,6 +231,8 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             if agent.white_cane.active:
                 agent.white_cane.deactivate()
+            if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                agent.camera_ctrl.stop()
             if hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
                 agent.keyboard_ctrl.stop()
             if execution_thread and execution_thread.is_alive():

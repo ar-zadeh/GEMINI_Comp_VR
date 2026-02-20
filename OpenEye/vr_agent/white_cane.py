@@ -2,14 +2,14 @@
 vr_agent/white_cane.py
 ----------------------
 WhiteCaneAssistant: accessibility mode for blind users.
-Silently captures images, describes scenes, and recommends navigation actions.
+Silently captures images and provides concise navigation help from images + user prompt.
 """
 
 import io
 import time
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from datetime import datetime
 
 import base64
@@ -37,23 +37,23 @@ class WhiteCaneAssistant:
     # ── Description prompt template ───────────────────────────────────────────
     _DESCRIPTION_PROMPT = """\
 You are an accessibility assistant helping a blind person navigate a VR environment.
-The user's current goal is: {goal}
-
 You are receiving images captured at different times. Each image has a timestamp.
 The latest image was captured at {timestamp}.
 
+User prompt:
+{user_prompt}
+
 Your task is to:
-1. THINK about what you see and how it relates to the user's goal
-2. DESCRIBE the scene VERY CONCISELY (max 1-2 sentences) for someone who cannot see (spoken aloud)
-3. RECOMMEND one specific action to take. The actions should be "move forward", "move backward", "rotate X degrees", "turn left", "turn right", or "stop"
-4. DETERMINE if the goal has been achieved or if the user wants to change it
+1. Analyze what you see in the images relative to the user prompt
+2. DESCRIBE only essential navigation information VERY CONCISELY (max 1 short sentence)
+3. RECOMMEND one specific action to take in plain language
 
 IMPORTANT RULES:
-- Descriptions MUST be under 20 words. Be super clear and concise. DO NOT use bullet points.
-- If you see something that suggests the user has reached their goal, set goal_achieved to true
-- If the user's spoken input suggests they want to change their goal, extract the new_goal
-- Look at previous images to track progress and give context-aware guidance
-- Remember you need to help user avoid obstacles, hitting the wall, glasses, etc. User should always have a clear path. Help user to have the clear path DIRECTLY INFRONT OF THEM. Anything other than direct path should be avoided.
+- Speak for a blind user: mention immediate hazard first, then safest clear path straight ahead.
+- Descriptions MUST be under 20 words, plain spoken language, no visual fluff, no bullet points.
+- Prefer safety: if uncertain, choose "stop".
+- Look at previous images to track progress and give context-aware guidance.
+- Focus on helping the user avoid obstacles and maintain a clear path directly in front.
 """
 
     def __init__(self, client, executor, log_dir: Path):
@@ -65,7 +65,6 @@ IMPORTANT RULES:
 
         # State
         self.active = False
-        self.current_goal: Optional[str] = None
         self.stop_event = threading.Event()
         self.loop_thread: Optional[threading.Thread] = None
 
@@ -75,23 +74,26 @@ IMPORTANT RULES:
         # Image cache: list of (timestamp_str, image_bytes, file_path)
         self.cached_images: List[tuple] = []
         self.conversation_history: List[Dict] = []
+        self.history_provider: Optional[Callable[[], List[Dict]]] = None
+
+    def set_history_provider(self, provider: Callable[[], List[Dict]]) -> None:
+        self.history_provider = provider
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    def activate(self, goal: Optional[str] = None) -> str:
+    def activate(self) -> str:
         self.active = True
-        self.current_goal = goal
         self.stop_event.clear()
         self.cached_images = []
         self.conversation_history = []
 
         logger = get_logger()
-        logger.info(f"White cane activated. Goal: {goal}")
+        logger.info("White cane activated.")
 
         msg = (
-            f"White cane mode activated. "
-            f"{'Goal: ' + goal if goal else 'No specific goal set. I will describe what I see.'}"
-            "\nSay 'disable white cane' to stop, or tell me your new goal anytime."
+            "White cane mode activated. "
+            "Say what help you need, and I will use camera views to guide you. "
+            "Say 'disable white cane' to stop."
         )
         self.audio.speak(msg)
         return msg
@@ -105,12 +107,6 @@ IMPORTANT RULES:
 
         get_logger().info("White cane deactivated.")
         return "White cane mode deactivated."
-
-    def set_goal(self, goal: str) -> str:
-        old_goal = self.current_goal
-        self.current_goal = goal
-        get_logger().info(f"White cane goal changed: '{old_goal}' -> '{goal}'")
-        return f"Goal updated from '{old_goal}' to '{goal}'"
 
     # ── Image capture ─────────────────────────────────────────────────────────
 
@@ -160,41 +156,63 @@ IMPORTANT RULES:
     ) -> Dict:
         """
         Call Gemini with the current image (+ history) to get a structured response:
-        thought, description, action, goal_achieved, new_goal.
+        description, action.
         """
         logger = get_logger()
 
         if not img_bytes:
             return {
-                "thought": "Failed to capture image",
                 "description": "I'm sorry, I couldn't capture an image. Please try again.",
-                "action": "Wait a moment and try again",
-                "goal_achieved": False,
-                "new_goal": None
+                "action": "Wait a moment and try again"
             }
 
         class WhiteCaneResponse(BaseModel):
-            thought: str = Field(
-                description="Internal reasoning. NOT read to the user."
-            )
             description: str = Field(
                 description="Natural, extremely concise description (max 20 words). No bullet points. Read aloud."
             )
             action: str = Field(
                 description="One specific physical action recommendation."
             )
-            goal_achieved: bool = Field(
-                description="True if the user's goal has been achieved."
-            )
-            new_goal: Optional[str] = Field(
-                default=None,
-                description="New goal if the user expressed a desire to change it."
-            )
+
+        def _history_to_text() -> str:
+            lines: List[str] = []
+
+            if self.history_provider:
+                try:
+                    global_history = self.history_provider() or []
+                    if global_history:
+                        lines.append("Main assistant conversation history (full):")
+                        for entry in global_history:
+                            role = str(entry.get("role", "unknown")).strip()
+                            content = str(entry.get("content", "")).strip()
+                            if content:
+                                lines.append(f"- {role}: {content}")
+                except Exception as e:
+                    logger.warning(f"Failed to read global history: {e}")
+
+            if self.conversation_history:
+                lines.append("White cane interaction history (full):")
+                for entry in self.conversation_history:
+                    timestamp = str(entry.get("timestamp", "unknown"))
+                    user_said = str(entry.get("user_input") or "").strip()
+                    description = str(entry.get("description") or "").strip()
+                    action = str(entry.get("action") or "").strip()
+                    if user_said:
+                        lines.append(f"- {timestamp} user: {user_said}")
+                    if description:
+                        lines.append(f"- {timestamp} scene: {description}")
+                    if action:
+                        lines.append(f"- {timestamp} advised_action: {action}")
+
+            if not lines:
+                return ""
+            return "\nConversation history to preserve task continuity:\n" + "\n".join(lines)
 
         parts = []
+        prompt_user_text = user_input.strip() if user_input else "Help me navigate safely right now."
         prompt = self._DESCRIPTION_PROMPT.format(
-            goal=self.current_goal or "exploring the environment",
-            timestamp=timestamp_str
+            timestamp=timestamp_str,
+            user_prompt=prompt_user_text,
         )
         parts.append(types.Part(text=prompt))
 
@@ -223,10 +241,8 @@ IMPORTANT RULES:
         ))
         parts.append(types.Part(inline_data=types.Blob(mime_type="image/png", data=img_bytes)))
 
-        if self.conversation_history:
-            history_text = "\nPrevious observations:\n"
-            for entry in self.conversation_history[-4:]:
-                history_text += f"- At {entry['timestamp']}: {entry['summary']}\n"
+        history_text = _history_to_text()
+        if history_text:
             parts.append(types.Part(text=history_text))
 
         try:
@@ -244,49 +260,38 @@ IMPORTANT RULES:
                 if not parsed:
                     parsed = WhiteCaneResponse.model_validate_json(response.text)
                 result = {
-                    "thought": parsed.thought,
                     "description": parsed.description,
-                    "action": parsed.action,
-                    "goal_achieved": parsed.goal_achieved,
-                    "new_goal": parsed.new_goal
+                    "action": parsed.action
                 }
             except Exception as parse_error:
                 logger.warning(f"Structured parse failed, using fallback: {parse_error}")
                 result = {
-                    "thought": "Processing...",
                     "description": response.text,
-                    "action": "Continue as you were",
-                    "goal_achieved": False,
-                    "new_goal": None
+                    "action": "Continue as you were"
                 }
 
             self.conversation_history.append({
                 "timestamp": timestamp_str,
-                "summary": (
-                    result["description"][:80] + "..."
-                    if len(result["description"]) > 80
-                    else result["description"]
-                )
+                "user_input": user_input,
+                "description": result["description"],
+                "action": result["action"],
             })
             return result
 
         except Exception as e:
             logger.error(f"White cane description failed: {e}")
             return {
-                "thought": f"Error: {e}",
                 "description": "I encountered an error while analyzing the scene.",
-                "action": "Please wait while I try again",
-                "goal_achieved": False,
-                "new_goal": None
+                "action": "Please wait while I try again"
             }
 
     def format_for_speech(self, result: Dict) -> str:
         """Format structured result into a spoken sentence."""
-        speech = result["description"]
-        if result["action"]:
-            speech += f" I recommend: {result['action']}"
-        if result["goal_achieved"]:
-            speech += " It looks like you've reached your goal!"
+        speech = (result.get("description") or "").strip()
+        action = (result.get("action") or "").strip()
+
+        if action:
+            speech = f"{speech} Action: {action}.".strip()
         return speech
 
     # ── High-level helpers ────────────────────────────────────────────────────
@@ -297,9 +302,6 @@ IMPORTANT RULES:
         if img_bytes:
             self.cached_images.append((timestamp_str, img_bytes, file_path))
         result = self.describe_and_recommend(timestamp_str, img_bytes, user_input)
-        if result.get("new_goal"):
-            self.set_goal(result["new_goal"])
-            print(f"[Goal Changed]: {result['new_goal']}")
         return self.format_for_speech(result)
 
     def listen_command(self) -> Optional[str]:
@@ -362,7 +364,6 @@ IMPORTANT RULES:
             parts = []
             prompt = f"""\
 You are an accessibility assistant for a blind user.
-The user's goal is: "{self.current_goal or 'Explore'}"
 User just asked: "{user_input or 'What should I do?'}"
 
 I have rotated the user to look in 4 directions (Front, Right, Back, Left).
@@ -373,6 +374,15 @@ Task:
 2. Recommend a clear action (e.g., "Turn right and move towards the door", "Move forward", "Stop, obstacle ahead").
 3. Descriptions must be CONCISE (under 30 words).
 """
+
+            class ScanResponse(BaseModel):
+                summary: str = Field(
+                    description="Concise surroundings summary for blind user (under 30 words)."
+                )
+                action: str = Field(
+                    description="Single clear navigation action recommendation."
+                )
+
             parts.append(types.Part(text=prompt))
             for label, img_data in captured_images:
                 parts.append(types.Part(text=f"\n[{label} View]:"))
@@ -380,9 +390,16 @@ Task:
 
             response = self.client.models.generate_content(
                 model=self.model_name,
-                contents=[types.Content(role="user", parts=parts)]
+                contents=[types.Content(role="user", parts=parts)],
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": ScanResponse,
+                }
             )
-            result_text = response.text.strip()
+            parsed = response.parsed
+            if not parsed:
+                parsed = ScanResponse.model_validate_json(response.text)
+            result_text = f"{parsed.summary} I recommend: {parsed.action}".strip()
             self.cleanup_old_images(max_age_seconds=10)
             return result_text
 
@@ -409,8 +426,7 @@ Task:
 
         while self.active and not self.stop_event.is_set():
             if time.time() - last_announcement_time > status_interval:
-                goal_msg = f"Goal: {self.current_goal}." if self.current_goal else "No specific goal."
-                self.audio.speak(f"White cane active. {goal_msg} Say 'help' for details.")
+                self.audio.speak("White cane active. Say what help you need or say help for details.")
                 last_announcement_time = time.time()
 
             timestamp_str, img_bytes, file_path = self.capture_with_timestamp()

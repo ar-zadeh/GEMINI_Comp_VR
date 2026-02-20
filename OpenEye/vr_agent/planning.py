@@ -28,14 +28,28 @@ class ActionPlanner:
         self.client = client
         self.model_name = MODEL_PLANNER
 
-    def create_plan(self, user_request: str) -> List[ActionPlanItem]:
+    def create_plan(self, user_request: str, chat_history: List[Dict[str, Any]] = None) -> List[ActionPlanItem]:
         logger = get_logger()
         logger.info(f"Planning for request: {user_request}")
 
+        history_text = ""
+        if chat_history:
+            history_lines = []
+            for msg in chat_history:
+                role = str(msg.get("role", "unknown")).strip()
+                content = str(msg.get("content", "")).strip()
+                if content:
+                    history_lines.append(f"- {role}: {content}")
+            if history_lines:
+                history_text = "\nConversation History (full):\n" + "\n".join(history_lines)
+
         prompt = f"""
+        {history_text}
+
         User Request: "{user_request}"
 
         You are a VR Agent Planner. Create a sequential list of tools to execute. In this environment (which is called VRChat), the movements are done using press of the track pad. You need to push it all the way on the direction you want to move.
+        Maintain continuity with earlier conversation context and previously stated goals.
 
         AVAILABLE TOOLS:
         1. GROUNDING & TRACKING:
@@ -69,7 +83,6 @@ class ActionPlanner:
 
         3. WHITE CANE ACCESSIBILITY (for blind users):
            - white_cane_describe() -> Immediate capture and description for blind user.
-           - white_cane_set_goal(goal) -> Set/update navigation goal for white cane mode.
 
         CONTROLLER DEFINITIONS:
         - controller1: LEFT

@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import List
 
 from PIL import Image
+from pydantic import BaseModel, Field
 
 try:
     import cv2
@@ -655,11 +656,10 @@ Also find the "blue VR controller ray of the {side}".
 
 You MUST return the answer in the following JSON format:
 {{
-    "thinking": "Describe what you see and where the keys are located...",
-    "keys": {{
-        "a": [ymin, xmin, ymax, xmax],
-        "b": [ymin, xmin, ymax, xmax]
-    }},
+    "keys": [
+        {{"key": "a", "coordinates": [ymin, xmin, ymax, xmax]}},
+        {{"key": "b", "coordinates": [ymin, xmin, ymax, xmax]}}
+    ],
     "controller_ray": [ymin, xmin, ymax, xmax]
 }}
 
@@ -668,6 +668,21 @@ Rules:
 2. Include ONLY the keys you can confidently locate.
 3. "controller_ray" is the bounding box of the blue VR controller ray.
 """
+
+        class KeyDetection(BaseModel):
+            key: str = Field(description="Single keyboard key label.")
+            coordinates: List[float] = Field(
+                description="Normalized coordinates [ymin, xmin, ymax, xmax]."
+            )
+
+        class KeyboardGroundingResponse(BaseModel):
+            keys: List[KeyDetection] = Field(
+                description="Detected keys with their normalized bounding boxes."
+            )
+            controller_ray: List[float] = Field(
+                description="Normalized coordinates [ymin, xmin, ymax, xmax] for the blue VR controller ray."
+            )
+
         try:
             out_buffer = io.BytesIO()
             pil_img_init.save(out_buffer, format="JPEG")
@@ -679,24 +694,29 @@ Rules:
                     types.Part(text=prompt),
                     types.Part(inline_data=types.Blob(mime_type="image/jpeg", data=clean_image_data))
                 ])],
-                config=types.GenerateContentConfig(response_mime_type="application/json")
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": KeyboardGroundingResponse,
+                    "thinking_config": {"thinking_budget": 0},
+                }
             )
 
             if not response.candidates or not response.candidates[0].content.parts:
                 return "Error: Gemini returned no grounding results."
 
-            resp_text = response.candidates[0].content.parts[0].text
-            if resp_text.startswith("```"):
-                resp_text = resp_text.split("\n", 1)[-1].rsplit("\n", 1)[0]
-            if resp_text.startswith("json"):
-                resp_text = resp_text[4:]
-            grounding_data = json.loads(resp_text.strip())
+            parsed_response = response.parsed
+            if not parsed_response:
+                parsed_response = KeyboardGroundingResponse.model_validate_json(response.text)
         except Exception as e:
             logger.error(f"Keyboard grounding failed: {e}")
             return f"Error grounding keyboard keys: {e}"
 
-        grounded_keys = grounding_data.get("keys", {})
-        ray_box_norm = grounding_data.get("controller_ray")
+        grounded_keys = {
+            item.key: item.coordinates
+            for item in parsed_response.keys
+            if item.key and item.coordinates and len(item.coordinates) == 4
+        }
+        ray_box_norm = parsed_response.controller_ray
         if not ray_box_norm:
             return "Error: Could not find the controller ray in the image."
 
@@ -854,14 +874,6 @@ Rules:
             return "White cane mode is not active. Say 'white cane' to activate."
         return _white_cane.get_immediate_help()
 
-    def white_cane_set_goal(goal: str):
-        """Set or update the navigation goal for white cane mode."""
-        _log_action("white_cane_set_goal", goal=goal)
-        if not _white_cane:
-            return "Error: White cane assistant not available."
-        _white_cane.current_goal = goal
-        return f"White cane goal updated: {goal}"
-
     # =========================================================================
     # UX / HELP
     # =========================================================================
@@ -876,7 +888,7 @@ Rules:
         if state == VoiceMenuState.MAIN_MENU:
             msg = "You are in the main menu. You can ask me to navigate, describe surroundings, identify objects, or click on different objects in the scene."
         elif state == VoiceMenuState.WHITE_CANE_MENU:
-            msg = "White cane mode. You can update your goal, ask for a description, or say stop to exit."
+            msg = "White cane mode. Tell me what help you need, ask for a description, or say stop to exit."
         elif state == VoiceMenuState.CONFIRMATION:
             msg = f"I need you to confirm if you want to {_agent_ref.pending_action['description']}. Say confirm or cancel."
         else:
@@ -908,7 +920,7 @@ Rules:
         if state == VoiceMenuState.MAIN_MENU:
             msg = "Options: Navigate, Describe, Identify, Repeat, Help."
         elif state == VoiceMenuState.WHITE_CANE_MENU:
-            msg = "Options: Goal, Help, Stop, Disable."
+            msg = "Options: Help, Stop, Disable."
         elif state == VoiceMenuState.CONFIRMATION:
             msg = "Options: Confirm, Cancel."
         else:
@@ -950,7 +962,7 @@ Rules:
         track_object, track_multiple_items, visual_servo_to_object,
         create_tracking_video, type_text,
         # White Cane Accessibility
-        white_cane_describe, white_cane_set_goal,
+        white_cane_describe,
         # Controller Positioning
         reset_controller_positions, reset_controller_orientation,
         position_controller_relative_to_headset, open_menu_sequence,

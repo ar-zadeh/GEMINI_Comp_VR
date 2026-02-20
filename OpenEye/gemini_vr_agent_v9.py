@@ -85,11 +85,7 @@ if __name__ == "__main__":
             # ── White Cane activation ─────────────────────────────────────────
             elif cmd in ["white cane", "whitecane", "enable white cane"]:
                 print("\nWhite Cane mode activating...")
-                goal = input(
-                    "What would you like to find or where do you want to go? "
-                    "(or press Enter to explore): "
-                ).strip()
-                result = agent.white_cane.activate(goal if goal else None)
+                result = agent.white_cane.activate()
                 print(result)
 
                 agent.white_cane.start_background_loop(interval=10.0)
@@ -161,13 +157,6 @@ if __name__ == "__main__":
                 description = agent.white_cane.get_immediate_help()
                 print(f"\n[White Cane]:\n{description}\n")
                 agent.white_cane.audio.speak(description)
-                continue
-
-            # ── White Cane goal update ────────────────────────────────────────
-            elif agent.white_cane.active and cmd.startswith("goal "):
-                new_goal = user_input[5:].strip()
-                agent.white_cane.current_goal = new_goal
-                print(f"Goal updated: {new_goal}")
                 continue
 
             # ── Push-to-talk (hold grip) ──────────────────────────────────────

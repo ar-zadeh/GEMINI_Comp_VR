@@ -55,7 +55,6 @@ class VisualGrounder:
 
         You MUST return the answer in the following JSON format:
         {{
-            "thinking": "Reasoning about the scene...",
             "detections": [
                 {{
                     "label": "exact_object_name_from_list",
@@ -66,6 +65,7 @@ class VisualGrounder:
 
         1. ymin, xmin, ymax, xmax must be normalized coordinates (0 to 1).
         2. Only return objects you are confident you see.
+        3. Do not output any reasoning or thinking text.
         """
 
         class Detection(BaseModel):
@@ -75,7 +75,6 @@ class VisualGrounder:
             )
 
         class GroundingResponse(BaseModel):
-            thinking: str = Field(description="Reasoning about the scene and object locations.")
             detections: List[Detection] = Field(description="List of detected objects.")
 
         try:
@@ -102,6 +101,7 @@ class VisualGrounder:
                 config={
                     "response_mime_type": "application/json",
                     "response_schema": GroundingResponse,
+                    "thinking_config": {"thinking_budget": 0},
                 }
             )
 

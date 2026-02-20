@@ -11,6 +11,7 @@ import base64
 import inspect
 import threading
 import traceback
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -68,6 +69,7 @@ class GeminiAgent:
         self.white_cane = WhiteCaneAssistant(self.client, self.executor, LOG_DIR)
 
         self.chat_history: list = []
+        self.white_cane.set_history_provider(lambda: self.chat_history)
 
         # Object tracker (optional — requires SAM 3)
         if ObjectTracker:
@@ -102,6 +104,7 @@ class GeminiAgent:
         # Voice menu state
         self.menu_state = VoiceMenuState.IDLE
         self.pending_action: Optional[Dict] = None
+        self.last_action_images: Optional[Dict[str, Any]] = None
 
     # ── Config ────────────────────────────────────────────────────────────────
 
@@ -188,7 +191,7 @@ class GeminiAgent:
                 )
             elif self.menu_state == VoiceMenuState.WHITE_CANE_MENU:
                 self.white_cane.audio.speak(
-                    "White cane mode. You can update your goal, ask for a description, or say stop to exit."
+                    "White cane mode. Tell me what help you need, ask for a description, or say stop to exit."
                 )
             elif self.menu_state == VoiceMenuState.CONFIRMATION:
                 self.white_cane.audio.speak(
@@ -203,7 +206,7 @@ class GeminiAgent:
             if self.menu_state == VoiceMenuState.MAIN_MENU:
                 self.white_cane.audio.speak("Options: Navigate, Describe, Identify, Repeat, Help.")
             elif self.menu_state == VoiceMenuState.WHITE_CANE_MENU:
-                self.white_cane.audio.speak("Options: Goal, Help, Stop, Disable.")
+                self.white_cane.audio.speak("Options: Help, Stop, Disable.")
             elif self.menu_state == VoiceMenuState.CONFIRMATION:
                 self.white_cane.audio.speak("Options: Confirm, Cancel.")
             else:
@@ -249,14 +252,7 @@ class GeminiAgent:
             return cmd
 
     def handle_white_cane_menu(self, cmd: str):
-        if "goal" in cmd:
-            new_goal = cmd.replace("goal", "").strip()
-            if new_goal:
-                self.white_cane.current_goal = new_goal
-                self.white_cane.audio.speak(f"Goal updated to: {new_goal}")
-            else:
-                self.white_cane.audio.speak("What is your new goal?")
-        elif "stop" in cmd or "disable" in cmd:
+        if "stop" in cmd or "disable" in cmd:
             self.white_cane.deactivate()
             self.menu_state = VoiceMenuState.IDLE
             self.white_cane.audio.speak("White cane mode deactivated.")
@@ -306,14 +302,39 @@ class GeminiAgent:
 
     def _verify_action_tool(self, action_description: str):
         """Tool wrapper for the verification model."""
-        print("Capturing image for verification...")
-        res = self.executor.call("inspect_surroundings")
+        print("Capturing before/after images for verification...")
         try:
-            data = json.loads(res).get("data")
-            img_bytes = base64.b64decode(data)
-            return self.verifier.verify(img_bytes, action_description)
+            before_img = None
+            after_img = None
+
+            if self.last_action_images:
+                before_img = self.last_action_images.get("before")
+                after_img = self.last_action_images.get("after")
+
+            if not before_img:
+                before_img = self._capture_surroundings_image()
+            if not after_img:
+                time.sleep(0.15)
+                after_img = self._capture_surroundings_image()
+
+            if not before_img or not after_img:
+                return "Verification failed: could not capture before/after images."
+
+            return self.verifier.verify(before_img, after_img, action_description)
         except Exception as e:
             return f"Verification failed: {e}"
+
+    def _capture_surroundings_image(self) -> Optional[bytes]:
+        """Capture one screenshot from VR and return raw image bytes."""
+        try:
+            res = self.executor.call("inspect_surroundings")
+            data = json.loads(res).get("data")
+            if not data:
+                return None
+            return base64.b64decode(data)
+        except Exception as e:
+            self.logger.warning(f"Image capture failed: {e}")
+            return None
 
     def _get_spoken_action_name(self, tool: str, args: dict) -> str:
         """Convert a tool name + args into a natural-language phrase for TTS."""
@@ -331,7 +352,6 @@ class GeminiAgent:
             "track_object":          lambda a: f"Tracking {a.get('object_description', 'object')}",
             "track_multiple_items":  lambda a: "Tracking multiple items",
             "white_cane_describe":   lambda a: "Describing scene",
-            "white_cane_set_goal":   lambda a: f"Setting goal to {a.get('goal', 'unknown')}",
             "provide_help":          lambda a: "Providing help",
             "provide_tutorial":      lambda a: "Tutorial",
             "provide_options":       lambda a: "Listing options",
@@ -347,18 +367,25 @@ class GeminiAgent:
         """Plan → execute loop. Intended to run in a daemon thread."""
         self.stop_execution.clear()
 
+        task_start = time.time()
+        self.logger.info(f"[BENCHMARK] Command received: '{user_input}'")
         self.logger.info(f"User: {user_input}")
         self.chat_history.append({"role": "user", "content": user_input})
+        print(f"\n[BENCHMARK] Processing started at {time.strftime('%H:%M:%S')}")
         print(f"\nAgent (Planner) is thinking about: '{user_input}'...")
 
         # 1. PLANNING PHASE
         if self.stop_execution.is_set():
             return
-        plan = self.planner.create_plan(user_input)
+        plan_start = time.time()
+        plan = self.planner.create_plan(user_input, self.chat_history)
+        plan_elapsed = time.time() - plan_start
         if not plan:
             print("Failed to generate a plan.")
             return
 
+        self.logger.info(f"[BENCHMARK] Planning took {plan_elapsed:.2f}s")
+        print(f"[BENCHMARK] Planning took {plan_elapsed:.2f}s")
         print(f"\nGenerated Plan ({len(plan)} steps):")
         for i, step in enumerate(plan):
             print(f"{i+1}. {step.tool}: {step.description}")
@@ -376,11 +403,32 @@ class GeminiAgent:
 
             if func:
                 try:
+                    before_img = None
+                    if step.tool != "verify_action":
+                        before_img = self._capture_surroundings_image()
+
                     action_desc = self._get_spoken_action_name(step.tool, step.args)
                     print(f"Speaking: {action_desc}...")
                     self.white_cane.audio.speak(action_desc)
 
+                    step_start = time.time()
                     result = func(**step.args)
+                    step_elapsed = time.time() - step_start
+
+                    if step.tool != "verify_action":
+                        after_img = self._capture_surroundings_image()
+                        if before_img or after_img:
+                            self.last_action_images = {
+                                "before": before_img,
+                                "after": after_img,
+                                "tool": step.tool,
+                                "args": step.args,
+                                "description": step.description,
+                                "captured_at": time.time(),
+                            }
+
+                    self.logger.info(f"[BENCHMARK] Step '{step.tool}' took {step_elapsed:.2f}s")
+                    print(f"[BENCHMARK] Step '{step.tool}' took {step_elapsed:.2f}s")
                     print(f"Result: {str(result)[:200]}...")
                     self.chat_history.append({"role": "agent", "content": f"Executed {step.tool}: {result}"})
                     self.logger.info(f"Step '{step.tool}' Result: {result}")
@@ -407,6 +455,10 @@ class GeminiAgent:
             else:
                 print(f"Error: Unknown tool '{step.tool}'")
                 self.white_cane.audio.speak(f"Unknown tool {step.tool}")
+
+        total_elapsed = time.time() - task_start
+        self.logger.info(f"[BENCHMARK] Total command duration: {total_elapsed:.2f}s for '{user_input}'")
+        print(f"[BENCHMARK] Total command duration: {total_elapsed:.2f}s")
 
     # ── Direct command execution ──────────────────────────────────────────────
 

@@ -12,6 +12,7 @@ Usage:
 
 import time
 import threading
+import argparse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,7 +24,16 @@ from vr_agent.agent import GeminiAgent
 # ============================================================================
 
 if __name__ == "__main__":
-    agent = GeminiAgent()
+    parser = argparse.ArgumentParser(description="VR Agent v9")
+    parser.add_argument(
+        "--tracking-model",
+        default="SAM3",
+        choices=["SAM3", "VNS-SAM"],
+        help="Select tracking backend (default: SAM3).",
+    )
+    args = parser.parse_args()
+
+    agent = GeminiAgent(tracking_model=args.tracking_model)
     print("VR Agent v9 (Modular) Ready.")
     print("Commands: 'white cane' to activate accessibility mode, 'quit' to exit.")
 

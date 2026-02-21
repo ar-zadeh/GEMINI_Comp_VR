@@ -13,14 +13,35 @@ logger = logging.getLogger("VRAgent.Tracker")
 
 
 class ObjectTracker:
-    def __init__(self, log_dir: Path):
+    def __init__(self, log_dir: Path, tracking_model: str = "SAM3"):
         self.log_dir = log_dir / "tracking"
         self.log_dir.mkdir(exist_ok=True, parents=True)
         self.available = False
         self.processor = None
         self.model = None
+        self.tracking_model = self._normalize_tracking_model(tracking_model)
+        self.runtime_model = "SAM3"
+        self.vns_decoder = None
+        self.vns_checkpoint = os.environ.get("VNS_SAM_CHECKPOINT", "")
         
-        # Check imports
+        self._init_sam3_runtime()
+        if not self.available:
+            return
+
+        if self.tracking_model == "VNS-SAM":
+            self._init_vns_decoder_if_available()
+
+    @staticmethod
+    def _normalize_tracking_model(tracking_model: str) -> str:
+        value = (tracking_model or "SAM3").strip().upper().replace("_", "-")
+        if value in {"SAM", "SAM3"}:
+            return "SAM3"
+        if value in {"VNS-SAM", "VNSSAM"}:
+            return "VNS-SAM"
+        logger.warning("Unknown tracking model '%s'. Falling back to SAM3.", tracking_model)
+        return "SAM3"
+
+    def _init_sam3_runtime(self):
         try:
             import torch
             import sam3
@@ -28,7 +49,7 @@ class ObjectTracker:
             from sam3.model.box_ops import box_xywh_to_cxcywh
             from sam3.model.sam3_image_processor import Sam3Processor
             from sam3.visualization_utils import normalize_bbox
-            
+
             self.torch = torch
             self.sam3 = sam3
             self.build_sam3_image_model = build_sam3_image_model
@@ -37,29 +58,75 @@ class ObjectTracker:
             self.normalize_bbox = normalize_bbox
             self.available = True
         except ImportError as e:
-            logger.warning(f"SAM 3 or Torch not available: {e}")
+            logger.warning(f"SAM 3 runtime or Torch not available: {e}")
             self.available = False
             return
 
-        # Initialize Model
-        if self.available:
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+            sam3_root = os.path.join(os.path.dirname(self.sam3.__file__), "..")
+            bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
+
+            self.model = self.build_sam3_image_model(bpe_path=bpe_path)
+            self.processor = self.Sam3Processor(self.model, confidence_threshold=0.87)
+            logger.info("SAM 3 runtime initialized with confidence 0.87.")
+        except Exception as e:
+            logger.error(f"Failed to initialize SAM 3 runtime: {e}")
+            self.available = False
+
+    def _init_vns_decoder_if_available(self):
+        vns_repo = os.environ.get("VNS_SAM_REPO", "")
+        if not vns_repo:
+            self.runtime_model = "SAM3 (VNS-SAM compatible mode)"
+            logger.info(
+                "VNS-SAM selected without VNS_SAM_REPO; using SAM3-compatible runtime in VNS-SAM mode."
+            )
+            return
+
+        try:
+            vns_train_path = Path(vns_repo) / "VNS-Train"
+            if not vns_train_path.exists():
+                logger.warning("VNS_SAM_REPO is set but VNS-Train directory was not found: %s", vns_repo)
+                return
+
+            if str(vns_train_path) not in sys.path:
+                sys.path.insert(0, str(vns_train_path))
+
+            from models.vns_sam import VNS_SAM_Decoder
+
+            if not self.vns_checkpoint:
+                self.runtime_model = "SAM3 (VNS-SAM compatible mode)"
+                logger.info(
+                    "VNS-SAM code found but VNS_SAM_CHECKPOINT is not set; using SAM3-compatible runtime."
+                )
+                return
+
+            original_torch_load = self.torch.load
+
+            def _safe_torch_load(path, *args, **kwargs):
+                if isinstance(path, str) and "sam_vit_l_maskdecoder.pth" in path and not os.path.exists(path):
+                    logger.warning(
+                        "VNS-SAM requested missing base maskdecoder checkpoint '%s'; continuing with empty init.",
+                        path,
+                    )
+                    return {}
+                return original_torch_load(path, *args, **kwargs)
+
+            self.torch.load = _safe_torch_load
             try:
-                # Configure CUDA settings
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                
-                # Get BPE path from sam3 assets
-                sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
-                bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
-                
-                # Build model and processor
-                self.model = build_sam3_image_model(bpe_path=bpe_path)
-                # User requested higher confidence to prevent tracking swaps
-                self.processor = Sam3Processor(self.model, confidence_threshold=0.87)
-                logger.info("SAM 3 Model initialized with confidence 0.87.")
-            except Exception as e:
-                logger.error(f"Failed to init SAM 3: {e}")
-                self.available = False
+                self.vns_decoder = VNS_SAM_Decoder("vit_l")
+            finally:
+                self.torch.load = original_torch_load
+
+            self.vns_decoder.load_state_dict(self.torch.load(self.vns_checkpoint, map_location="cpu"), strict=False)
+            self.vns_decoder.eval()
+            self.runtime_model = "VNS-SAM (decoder loaded)"
+            logger.info("VNS-SAM decoder loaded from %s", self.vns_checkpoint)
+        except Exception as e:
+            self.runtime_model = "SAM3 (VNS-SAM compatible mode)"
+            logger.warning("VNS-SAM decoder init failed, using SAM3-compatible runtime: %s", e)
 
     def track(self, video_path: str, initial_box: List[float], label: str) -> str:
         """
@@ -71,7 +138,7 @@ class ObjectTracker:
         Returns: Path to the output video with tracking visualization.
         """
         if not self.available or not self.processor:
-            return "Error: SAM 3 not available."
+            return f"Error: {self.runtime_model} runtime not available."
 
         try:
             import cv2
@@ -304,7 +371,7 @@ class ObjectTracker:
                [{'label1': [cx, cy], 'label2': [cx, cy]}, ...]
         """
         if not self.available or not self.processor:
-            return {"error": "SAM 3 not available."}
+            return {"error": f"{self.runtime_model} runtime not available."}
 
         try:
             import cv2

@@ -43,7 +43,7 @@ class GeminiAgent:
     - Handles voice menus and direct commands.
     """
 
-    def __init__(self):
+    def __init__(self, tracking_model: str = "SAM3"):
         import os
         self.api_key = os.environ.get("GEMINI_API_KEY")
         if not self.api_key:
@@ -71,9 +71,9 @@ class GeminiAgent:
         self.chat_history: list = []
         self.white_cane.set_history_provider(lambda: self.chat_history)
 
-        # Object tracker (optional — requires SAM 3)
+        # Object tracker (optional)
         if ObjectTracker:
-            self.tracker = ObjectTracker(LOG_DIR)
+            self.tracker = ObjectTracker(LOG_DIR, tracking_model=tracking_model)
         else:
             self.tracker = None
 
@@ -132,6 +132,10 @@ class GeminiAgent:
         print(f"Grounding:    {MODEL_GROUNDING}")
         print(f"Verification: {MODEL_VERIFICATION}")
         print(f"Description:  {MODEL_DESCRIPTION}")
+        if self.tracker:
+            print(f"Tracking:     {self.tracker.runtime_model}")
+        else:
+            print("Tracking:     Disabled")
         print(f"Log Dir:      {LOG_DIR}")
         try:
             status = self.executor.call("get_connection_status")

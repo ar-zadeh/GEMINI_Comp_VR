@@ -563,8 +563,8 @@ def _get_tools(executor, grounder, tracker):
             return "Error: Object Tracking (SAM 3) is not available."
 
         # Config
-        Kp_YAW = 0.02   # Gain for Horizontal (Yaw)
-        Kp_PITCH = 0.02 # Gain for Vertical (Pitch)
+        Kp_YAW = 0.05   # Gain for Horizontal (Yaw)
+        Kp_PITCH = 0.05 # Gain for Vertical (Pitch)
         MAX_ITER = 100
         TOLERANCE_PX = 20  # Stop if within this many pixels (Relaxed from 5)
         

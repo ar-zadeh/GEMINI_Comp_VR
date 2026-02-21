@@ -414,8 +414,8 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         if not _tracker or not _tracker.available:
             return "Error: Object Tracking (SAM 3) is not available."
 
-        Kp_YAW = 0.01
-        Kp_PITCH = 0.01
+        Kp_YAW = 0.02
+        Kp_PITCH = 0.02
         MAX_ITER = 100
         TOLERANCE_PX = 15
 
@@ -488,10 +488,11 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 print(f"Image parse error in loop: {e}")
                 break
 
-            # SAM tracking
+            # SAM tracking — process both objects with geometric prompts only
             inference_state = _tracker.processor.set_image(pil_img_loop)
             points = {}
             masks_for_viz = {}
+            save_debug = (i % 15 == 0)  # only visualize every 15 iters
 
             for key, desc in targets.items():
                 if key not in current_boxes:
@@ -504,7 +505,6 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                     box_input_cxcywh, w, h).flatten().tolist()
 
                 _tracker.processor.reset_all_prompts(inference_state)
-                inference_state = _tracker.processor.set_text_prompt(desc, inference_state)
                 inference_state = _tracker.processor.add_geometric_prompt(
                     state=inference_state, box=norm_box_cxcywh, label=True
                 )
@@ -533,7 +533,8 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                         del current_boxes[key]
                     continue
 
-                masks_for_viz[key] = mask
+                if save_debug:
+                    masks_for_viz[key] = mask
                 rows = np.any(mask, axis=1)
                 cols = np.any(mask, axis=0)
                 if rows.any() and cols.any():
@@ -551,13 +552,14 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                             points[key] = (int(M["m10"] / M["m00"]),
                                            int(M["m01"] / M["m00"]))
 
-            # Visualize masks
-            for key, mask in masks_for_viz.items():
-                color = (np.array([255, 100, 0] if key == "ray" else [0, 255, 100],
-                                  dtype=np.uint8))
-                overlay = img_cv.copy()
-                overlay[mask] = color
-                cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
+            # Visualize masks — only every 15 iterations
+            if save_debug:
+                for key, mask in masks_for_viz.items():
+                    color = (np.array([255, 100, 0] if key == "ray" else [0, 255, 100],
+                                      dtype=np.uint8))
+                    overlay = img_cv.copy()
+                    overlay[mask] = color
+                    cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
 
             # PID control
             if "ray" in points and "logo" in points:
@@ -576,12 +578,13 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 if divergence_count >= 3:
                     return "Visual Servoing Aborted: Divergence detected."
 
-                # Save debug image
-                cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
-                timestamp = datetime.now().strftime("%H%M%S")
-                debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
-                if CV2_AVAILABLE:
-                    cv2.imwrite(str(debug_path), img_cv)
+                # Save debug image — only every 15 iterations
+                if save_debug:
+                    cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
+                    timestamp = datetime.now().strftime("%H%M%S")
+                    debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
+                    if CV2_AVAILABLE:
+                        cv2.imwrite(str(debug_path), img_cv)
 
                 if dist < TOLERANCE_PX:
                     msg = f"Visual Servoing Complete. Aligned with {object_description} (Error: {dist:.2f}px)."

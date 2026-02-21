@@ -25,7 +25,14 @@ export GEMINI_API_KEY=your_key_here
 1. Start SteamVR with your driver loaded
 2. Run the agent:
 ```bash
-python gemini_vr_agent.py
+python gemini_vr_agent_v9.py --tracking-model SAM3
+```
+
+Optional VNS-SAM mode:
+```bash
+export VNS_SAM_REPO=/path/to/VNS-SAM
+export VNS_SAM_CHECKPOINT=/path/to/vns_sam_checkpoint.pth
+python gemini_vr_agent_v9.py --tracking-model VNS-SAM
 ```
 
 3. Give it tasks in natural language:

@@ -28,9 +28,9 @@ pose = mp_pose.Pose(
 
 # ── Detection parameters (tune these) ────────────────────────────────────────
 # Walking detection
-KNEE_HISTORY_LENGTH = 30        # frames of knee-Y history to keep
+KNEE_HISTORY_LENGTH = 12        # frames of knee-Y history to keep
 WALK_OSCILLATION_THRESHOLD = 0.015  # Lowered from 0.012 for better sensitivity
-MIN_STEP_FREQUENCY = 0.22       # Hz — slower than this = standing
+MIN_STEP_FREQUENCY = 0.35       # Hz — slower than this = standing
 MAX_STEP_FREQUENCY = 5.0       # Hz — faster than this = noise
 SMOOTHING_WINDOW = 2           # frames for moving-average smoothing
 
@@ -38,6 +38,9 @@ SMOOTHING_WINDOW = 2           # frames for moving-average smoothing
 left_leg_history = collections.deque(maxlen=KNEE_HISTORY_LENGTH)
 right_leg_history = collections.deque(maxlen=KNEE_HISTORY_LENGTH)
 timestamps = collections.deque(maxlen=KNEE_HISTORY_LENGTH)
+
+FULL_BODY_VISIBILITY_THRESHOLD = 0.6
+FRAME_EDGE_MARGIN = 0.02
 
 def nothing(val):
     pass
@@ -68,6 +71,39 @@ def _count_zero_crossings(signal):
         if centered[i-1] * centered[i] < 0:
             crossings += 1
     return crossings
+
+
+def _is_landmark_visible_in_frame(landmark, visibility_threshold, margin):
+    return (
+        landmark.visibility >= visibility_threshold
+        and margin <= landmark.x <= (1.0 - margin)
+        and margin <= landmark.y <= (1.0 - margin)
+    )
+
+
+def is_full_body_visible(landmarks, visibility_threshold=FULL_BODY_VISIBILITY_THRESHOLD, margin=FRAME_EDGE_MARGIN):
+    """Require head/torso/legs landmarks to be confidently visible and inside frame."""
+    required = [
+        mp_pose.PoseLandmark.NOSE,
+        mp_pose.PoseLandmark.LEFT_SHOULDER,
+        mp_pose.PoseLandmark.RIGHT_SHOULDER,
+        mp_pose.PoseLandmark.LEFT_HIP,
+        mp_pose.PoseLandmark.RIGHT_HIP,
+        mp_pose.PoseLandmark.LEFT_KNEE,
+        mp_pose.PoseLandmark.RIGHT_KNEE,
+        mp_pose.PoseLandmark.LEFT_ANKLE,
+        mp_pose.PoseLandmark.RIGHT_ANKLE,
+    ]
+    for idx in required:
+        if not _is_landmark_visible_in_frame(landmarks[idx], visibility_threshold, margin):
+            return False
+    return True
+
+
+def reset_walking_history():
+    left_leg_history.clear()
+    right_leg_history.clear()
+    timestamps.clear()
 
 
 def detect_walking(landmarks, joint_idx, threshold, smoothing, min_freq, max_freq, independent_legs=True):
@@ -126,7 +162,7 @@ def detect_walking(landmarks, joint_idx, threshold, smoothing, min_freq, max_fre
     return is_walking, frequency, amplitude
 
 
-def draw_status(frame, is_walking, cadence, amplitude):
+def draw_status(frame, is_walking, cadence, amplitude, full_body_visible):
     """Draw status text overlay on the frame."""
     h, w = frame.shape[:2]
 
@@ -141,6 +177,10 @@ def draw_status(frame, is_walking, cadence, amplitude):
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     cv2.putText(frame, f"Amplitude: {amplitude:.4f}", (20, 120),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    if not full_body_visible:
+        cv2.putText(frame, "Show full body (head to ankles)", (20, 155),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 215, 255), 2)
 
     # Movement arrows (visual cue)
     cx, cy = w // 2, h - 60
@@ -193,6 +233,7 @@ def main():
         is_walking = False
         cadence = 0.0
         amplitude = 0.0
+        full_body_visible = False
 
         if results.pose_landmarks:
             landmarks = results.pose_landmarks.landmark
@@ -215,21 +256,29 @@ def main():
             tuner_max_f = cv2.getTrackbarPos('Max Freq (x10)', 'Walk-in-Place Demo') / 10.0
             tuner_indep = (tuner_mode == 1)
 
-            # Detect walking
-            is_walking, cadence, amplitude = detect_walking(
-                landmarks, tuner_joint, tuner_thresh, tuner_smooth, 
-                tuner_min_f, tuner_max_f, tuner_indep
-            )
+            full_body_visible = is_full_body_visible(landmarks)
+
+            if full_body_visible:
+                # Detect walking
+                is_walking, cadence, amplitude = detect_walking(
+                    landmarks, tuner_joint, tuner_thresh, tuner_smooth,
+                    tuner_min_f, tuner_max_f, tuner_indep
+                )
+            else:
+                reset_walking_history()
 
             # Console output (throttled)
             now = time.time()
             if now - last_print_time >= PRINT_INTERVAL:
                 last_print_time = now
-                walk_msg = "WALKING" if is_walking else "STANDING"
-                print(f"{walk_msg} (cadence={cadence:.1f}Hz, amp={amplitude:.4f})")
+                if full_body_visible:
+                    walk_msg = "WALKING" if is_walking else "STANDING"
+                    print(f"{walk_msg} (cadence={cadence:.1f}Hz, amp={amplitude:.4f})")
+                else:
+                    print("WAITING: show full body (head to ankles)")
 
         # Draw status overlay
-        draw_status(frame, is_walking, cadence, amplitude)
+        draw_status(frame, is_walking, cadence, amplitude, full_body_visible)
 
         cv2.imshow("Walk-in-Place Demo", frame)
 

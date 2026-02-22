@@ -1,0 +1,117 @@
+{
+  "status": "found",
+  "reason": "The bar area is visible in the background, and a path can be navigated around the sofa to reach it.",
+  "destination": {
+    "label": "bar area",
+    "box_2d": [
+      406,
+      240,
+      585,
+      488
+    ]
+  },
+  "obstacles": [
+    {
+      "label": "brown sectional sofa",
+      "box_2d": [
+        555,
+        83,
+        900,
+        686
+      ],
+      "why": "The large sofa is directly in front of the current viewpoint and blocks the path to the bar area. The path must go around it."
+    },
+    {
+      "label": "round coffee table",
+      "box_2d": [
+        624,
+        285,
+        665,
+        381
+      ],
+      "why": "This table is near the sofa and must be navigated around to reach the bar area."
+    },
+    {
+      "label": "small side table",
+      "box_2d": [
+        579,
+        380,
+        653,
+        452
+      ],
+      "why": "This table is near the sofa and must be navigated around to reach the bar area."
+    }
+  ],
+  "suggested_path": [
+    {
+      "point": [
+        890.0,
+        100.0
+      ],
+      "label": "0"
+    },
+    {
+      "point": [
+        890.0,
+        150.0
+      ],
+      "label": "1"
+    },
+    {
+      "point": [
+        890.0,
+        200.0
+      ],
+      "label": "2"
+    },
+    {
+      "point": [
+        890.0,
+        250.0
+      ],
+      "label": "3"
+    },
+    {
+      "point": [
+        890.0,
+        300.0
+      ],
+      "label": "4"
+    },
+    {
+      "point": [
+        890.0,
+        350.0
+      ],
+      "label": "5"
+    },
+    {
+      "point": [
+        890.0,
+        400.0
+      ],
+      "label": "6"
+    },
+    {
+      "point": [
+        890.0,
+        450.0
+      ],
+      "label": "7"
+    },
+    {
+      "point": [
+        890.0,
+        500.0
+      ],
+      "label": "8"
+    },
+    {
+      "point": [
+        890.0,
+        550.0
+      ],
+      "label": "9"
+    }
+  ]
+}

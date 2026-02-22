@@ -1,0 +1,76 @@
+{
+  "found_exit": true,
+  "reason": "The open bar area is visible in the background, and a clear path leads from the foreground, past the sofa, towards the bar. The path avoids the sofa and other furniture.",
+  "trajectory": [
+    {
+      "point": [
+        850.0,
+        499.0
+      ],
+      "label": "0"
+    },
+    {
+      "point": [
+        800.0,
+        499.0
+      ],
+      "label": "1"
+    },
+    {
+      "point": [
+        750.0,
+        499.0
+      ],
+      "label": "2"
+    },
+    {
+      "point": [
+        700.0,
+        499.0
+      ],
+      "label": "3"
+    },
+    {
+      "point": [
+        650.0,
+        499.0
+      ],
+      "label": "4"
+    },
+    {
+      "point": [
+        600.0,
+        499.0
+      ],
+      "label": "5"
+    },
+    {
+      "point": [
+        550.0,
+        499.0
+      ],
+      "label": "6"
+    },
+    {
+      "point": [
+        500.0,
+        499.0
+      ],
+      "label": "7"
+    },
+    {
+      "point": [
+        450.0,
+        499.0
+      ],
+      "label": "8"
+    },
+    {
+      "point": [
+        400.0,
+        499.0
+      ],
+      "label": "9"
+    }
+  ]
+}

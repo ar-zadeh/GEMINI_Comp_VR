@@ -75,7 +75,6 @@ class AudioAssistant:
                 break
             try:
                 if not AUDIO_AVAILABLE:
-                    self.speech_queue.task_done()
                     continue
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:

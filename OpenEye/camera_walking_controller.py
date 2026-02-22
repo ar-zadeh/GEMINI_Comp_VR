@@ -1,19 +1,93 @@
-import sys
 import time
-import math
 import collections
 import threading
+import multiprocessing as mproc
+import queue
+
 import cv2
+import numpy as np
 import mediapipe as mp
 
 from keyboard_controller import KeyboardVRController
 
 # Settings from Demo.py
-KNEE_HISTORY_LENGTH = 30
+KNEE_HISTORY_LENGTH = 12
 WALK_OSCILLATION_THRESHOLD = 0.015
-MIN_STEP_FREQUENCY = 0.22
+MIN_STEP_FREQUENCY = 0.35
 MAX_STEP_FREQUENCY = 5.0
 SMOOTHING_WINDOW = 2
+FULL_BODY_VISIBILITY_THRESHOLD = 0.6
+FRAME_EDGE_MARGIN = 0.02
+
+
+def _run_overlay_window(status_queue, stop_event, window_name):
+    print(f"[CameraWalking] Overlay process started: {window_name}")
+    latest = {
+        "is_walking": False,
+        "cadence": 0.0,
+        "amplitude": 0.0,
+        "full_body_visible": False,
+        "frame_jpeg": None,
+    }
+    frame_h, frame_w = 420, 720
+
+    try:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, frame_w, frame_h)
+    except Exception as e:
+        print(f"[CameraWalking] Overlay process failed to create window: {e}")
+        return
+
+    try:
+        while not stop_event.is_set():
+            try:
+                while True:
+                    latest = status_queue.get_nowait()
+            except queue.Empty:
+                pass
+
+            frame = None
+            frame_jpeg = latest.get("frame_jpeg")
+            if frame_jpeg:
+                arr = np.frombuffer(frame_jpeg, dtype=np.uint8)
+                decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if decoded is not None:
+                    frame = decoded
+            if frame is None:
+                frame = np.zeros((frame_h, frame_w, 3), dtype=np.uint8)
+
+            frame_h, frame_w = frame.shape[:2]
+            is_walking = bool(latest.get("is_walking", False))
+            cadence = float(latest.get("cadence", 0.0))
+            amplitude = float(latest.get("amplitude", 0.0))
+            full_body_visible = bool(latest.get("full_body_visible", False))
+
+            walk_text = "WALKING" if is_walking else "STANDING"
+            walk_color = (0, 255, 0) if is_walking else (0, 0, 255)
+            cv2.putText(frame, walk_text, (20, 70), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.7, walk_color, 3, cv2.LINE_AA)
+            cv2.putText(frame, f"Cadence: {cadence:.1f} Hz", (20, 135),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            cv2.putText(frame, f"Amplitude: {amplitude:.4f}", (20, 175),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+            if not full_body_visible:
+                cv2.putText(frame, "Show full body (head to ankles)", (20, 225),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 215, 255), 2)
+
+            cx, cy = frame_w // 2, frame_h - 70
+            if is_walking:
+                cv2.arrowedLine(frame, (cx, cy), (cx, cy - 55), (0, 255, 0), 4, tipLength=0.4)
+
+            cv2.imshow(window_name, frame)
+            key = cv2.waitKey(16) & 0xFF
+            if key == ord('q'):
+                break
+    finally:
+        try:
+            cv2.destroyWindow(window_name)
+        except Exception:
+            pass
+        print("[CameraWalking] Overlay process exiting.")
 
 def _moving_average(data, window):
     if len(data) < window:
@@ -53,9 +127,128 @@ class CameraWalkingController(KeyboardVRController):
         self.left_leg_history = collections.deque(maxlen=KNEE_HISTORY_LENGTH)
         self.right_leg_history = collections.deque(maxlen=KNEE_HISTORY_LENGTH)
         self.timestamps = collections.deque(maxlen=KNEE_HISTORY_LENGTH)
+        self.show_ui = False
+        self.window_name = "White Cane Walk UI"
+        self.ui_process = None
+        self.ui_queue = None
+        self.ui_stop_event = None
+        self._ui_frame_counter = 0
         
         # Disable trackpad mode by default since we manage movement here
         self.mode = 'headset'
+
+    def set_overlay_enabled(self, enabled: bool):
+        self.show_ui = bool(enabled)
+        if self.show_ui:
+            self._start_overlay_process()
+        else:
+            self._stop_overlay_process()
+
+    def _start_overlay_process(self):
+        if self.ui_process and self.ui_process.is_alive():
+            return
+        try:
+            ctx = mproc.get_context("spawn")
+            self.ui_queue = ctx.Queue(maxsize=8)
+            self.ui_stop_event = ctx.Event()
+            self.ui_process = ctx.Process(
+                target=_run_overlay_window,
+                args=(self.ui_queue, self.ui_stop_event, self.window_name),
+                daemon=False,
+            )
+            self.ui_process.start()
+            print(f"[CameraWalking] Overlay process pid={self.ui_process.pid}")
+        except Exception as e:
+            print(f"[CameraWalking] Failed to start overlay process: {e}")
+            self.show_ui = False
+            self.ui_process = None
+            self.ui_queue = None
+            self.ui_stop_event = None
+
+    def _stop_overlay_process(self):
+        if self.ui_stop_event:
+            self.ui_stop_event.set()
+        if self.ui_process:
+            self.ui_process.join(timeout=1.5)
+            if self.ui_process.is_alive():
+                self.ui_process.terminate()
+            print("[CameraWalking] Overlay process stopped.")
+            self.ui_process = None
+        if self.ui_queue:
+            try:
+                self.ui_queue.close()
+                self.ui_queue.join_thread()
+            except Exception:
+                pass
+            self.ui_queue = None
+        self.ui_stop_event = None
+
+    def _publish_overlay_status(self, is_walking, cadence, amplitude, full_body_visible, frame=None):
+        if not self.show_ui or not self.ui_queue:
+            return
+        frame_jpeg = None
+        if frame is not None:
+            self._ui_frame_counter += 1
+            if self._ui_frame_counter % 2 == 0:
+                try:
+                    ok, enc = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                    if ok:
+                        frame_jpeg = enc.tobytes()
+                except Exception:
+                    frame_jpeg = None
+        payload = {
+            "is_walking": bool(is_walking),
+            "cadence": float(cadence),
+            "amplitude": float(amplitude),
+            "full_body_visible": bool(full_body_visible),
+            "frame_jpeg": frame_jpeg,
+        }
+        try:
+            self.ui_queue.put_nowait(payload)
+        except queue.Full:
+            try:
+                self.ui_queue.get_nowait()
+            except Exception:
+                pass
+            try:
+                self.ui_queue.put_nowait(payload)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_landmark_visible_in_frame(landmark, visibility_threshold, margin):
+        return (
+            landmark.visibility >= visibility_threshold
+            and margin <= landmark.x <= (1.0 - margin)
+            and margin <= landmark.y <= (1.0 - margin)
+        )
+
+    def _is_full_body_visible(self, landmarks):
+        mp_pose = mp.solutions.pose
+        required = [
+            mp_pose.PoseLandmark.NOSE,
+            mp_pose.PoseLandmark.LEFT_SHOULDER,
+            mp_pose.PoseLandmark.RIGHT_SHOULDER,
+            mp_pose.PoseLandmark.LEFT_HIP,
+            mp_pose.PoseLandmark.RIGHT_HIP,
+            mp_pose.PoseLandmark.LEFT_KNEE,
+            mp_pose.PoseLandmark.RIGHT_KNEE,
+            mp_pose.PoseLandmark.LEFT_ANKLE,
+            mp_pose.PoseLandmark.RIGHT_ANKLE,
+        ]
+        for idx in required:
+            if not self._is_landmark_visible_in_frame(
+                landmarks[idx], FULL_BODY_VISIBILITY_THRESHOLD, FRAME_EDGE_MARGIN
+            ):
+                return False
+        return True
+
+    def _reset_walking_history(self):
+        self.left_leg_history.clear()
+        self.right_leg_history.clear()
+        self.timestamps.clear()
 
     def activate(self):
         super().activate()
@@ -64,6 +257,8 @@ class CameraWalkingController(KeyboardVRController):
             return
             
         self.camera_active = True
+        if self.show_ui:
+            self._start_overlay_process()
         self.camera_thread = threading.Thread(target=self._camera_loop, daemon=True)
         self.camera_thread.start()
         print("\n[Camera Walking Controller] Camera loop started.")
@@ -77,6 +272,7 @@ class CameraWalkingController(KeyboardVRController):
         if self.camera_thread is not None:
             self.camera_thread.join(timeout=2.0)
             self.camera_thread = None
+        self._stop_overlay_process()
         print("\n[Camera Walking Controller] Camera loop stopped.")
 
     def _handle_char(self, ch: str):
@@ -158,28 +354,38 @@ class CameraWalkingController(KeyboardVRController):
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = pose.process(rgb)
 
+                is_walking = False
+                cadence = 0.0
+                amplitude = 0.0
+                full_body_visible = False
+
                 if results.pose_landmarks:
                     landmarks = results.pose_landmarks.landmark
 
-                    is_walking, cadence, amplitude = self._detect_walking(landmarks)
+                    full_body_visible = self._is_full_body_visible(landmarks)
 
-                    # Output status occasionally to not spam
-                    now = time.time()
-                    if now - last_print_time >= 0.5:
-                        msg = "WALKING" if is_walking else "STANDING"
-                        # Only print if something is happening to avoid spam 
+                    if not full_body_visible:
+                        self._reset_walking_history()
+                        now = time.time()
+                        if now - last_print_time >= 0.5:
+                            print("\r[Camera] WAITING: show full body (head to ankles)", end="")
+                            last_print_time = now
+                    else:
+                        is_walking, cadence, amplitude = self._detect_walking(landmarks)
+
+                        # Output status occasionally to not spam
+                        now = time.time()
+                        if now - last_print_time >= 0.5:
+                            msg = "WALKING" if is_walking else "STANDING"
+                            if is_walking:
+                                print(f"\r[Camera] {msg} (cadence={cadence:.1f}Hz, amp={amplitude:.4f})", end="")
+                            last_print_time = now
+
                         if is_walking:
-                            print(f"\r[Camera] {msg} (cadence={cadence:.1f}Hz, amp={amplitude:.4f})", end="")
-                        last_print_time = now
+                            move_amt = self.move_step
+                            self._move_headset(forward=move_amt)
 
-                    # Apply movement
-                    if is_walking:
-                        # Move forward based on cadence or fixed step
-                        move_amt = self.move_step # Adjust based on cadence if desired
-                        self._move_headset(forward=move_amt)
-
-                # Not doing cv2.imshow to keep it headless and performant
-                cv2.waitKey(1)
+                self._publish_overlay_status(is_walking, cadence, amplitude, full_body_visible, frame)
                 
         except Exception as e:
             print(f"[CameraWalking] Exception in camera thread: {e}")

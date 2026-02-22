@@ -87,11 +87,7 @@ if __name__ == "__main__":
             # ── White Cane activation ─────────────────────────────────────────
             elif cmd in ["white cane", "whitecane", "enable white cane"]:
                 print("\nWhite Cane mode activating...")
-                goal = input(
-                    "What would you like to find or where do you want to go? "
-                    "(or press Enter to explore): "
-                ).strip()
-                result = agent.white_cane.activate(goal if goal else None)
+                result = agent.white_cane.activate()
                 print(result)
 
                 agent.white_cane.start_background_loop(interval=10.0)
@@ -102,6 +98,8 @@ if __name__ == "__main__":
                             print(f"Voice Command: {voice_cmd} -> Stopping White Cane")
                             agent.white_cane.deactivate()
                             if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                                if hasattr(agent.camera_ctrl, "set_overlay_enabled"):
+                                    agent.camera_ctrl.set_overlay_enabled(False)
                                 agent.camera_ctrl.deactivate()
                             elif hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
                                 agent.keyboard_ctrl.deactivate()
@@ -112,6 +110,8 @@ if __name__ == "__main__":
 
                 if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
                     print("Auto-activating Camera Controller for walking and navigation...")
+                    if hasattr(agent.camera_ctrl, "set_overlay_enabled"):
+                        agent.camera_ctrl.set_overlay_enabled(True)
                     
                     def on_enter_callback_camera():
                         print("\n[Paused Camera Walking Tracking] Listening for command...")
@@ -161,6 +161,10 @@ if __name__ == "__main__":
                         if any(x in res.lower() for x in ["stop", "exit", "disable", "quit"]):
                             print(f"Voice Command: {res} -> Stopping White Cane")
                             agent.white_cane.deactivate()
+                            if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                                if hasattr(agent.camera_ctrl, "set_overlay_enabled"):
+                                    agent.camera_ctrl.set_overlay_enabled(False)
+                                agent.camera_ctrl.deactivate()
                         else:
                             print(f"Processing White Cane Context: {res}")
                             description = agent.white_cane.perform_360_scan(res)
@@ -172,6 +176,8 @@ if __name__ == "__main__":
             elif cmd in ["disable white cane", "stop white cane", "exit white cane"]:
                 result = agent.white_cane.deactivate()
                 if hasattr(agent, "camera_ctrl") and agent.camera_ctrl:
+                    if hasattr(agent.camera_ctrl, "set_overlay_enabled"):
+                        agent.camera_ctrl.set_overlay_enabled(False)
                     agent.camera_ctrl.deactivate()
                 elif hasattr(agent, "keyboard_ctrl") and agent.keyboard_ctrl:
                     agent.keyboard_ctrl.deactivate()

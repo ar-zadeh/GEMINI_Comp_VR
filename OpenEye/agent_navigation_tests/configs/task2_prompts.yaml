@@ -1,0 +1,44 @@
+# ============================================================
+# Task 2 — Goal-Oriented Walking: Prompt Variants
+# ============================================================
+# Use {goal_description} as a placeholder — the runner will
+# substitute it with the goal's `goal_description` field from
+# the experiment config.
+
+prompts:
+  # ---------- Freespace strategy prompts ----------
+  freespace_goal_v1:
+    strategy: freespace
+    system: ""
+    user: >
+      You are guiding a blind person. Their goal is: {goal_description}
+      Look at this first-person view. Is the path ahead clear to walk
+      towards the goal? If not, should they turn LEFT or RIGHT?
+      Respond with: DIRECTION (LEFT, STRAIGHT, RIGHT) and a brief reason.
+
+  freespace_goal_v2:
+    strategy: freespace
+    system: "You are a mobility assistant helping a blind person reach a destination. Be concise."
+    user: >
+      The destination is: {goal_description}
+      Based on this view, which direction should the person walk?
+      Reply with one word: LEFT, STRAIGHT, or RIGHT, then a short reason.
+
+  # ---------- Clockface strategy prompts ----------
+  clockface_goal_v1:
+    strategy: clockface
+    system: ""
+    user: >
+      A blind person needs to reach: {goal_description}
+      Using a clock-face overlay (10=left, 12=straight, 2=right),
+      which clock direction (10, 11, 12, 1, or 2) best leads toward
+      the goal while avoiding obstacles?
+      Respond with only the clock number.
+
+  clockface_goal_v2:
+    strategy: clockface
+    system: "You are a precise navigation assistant. Respond with a single number."
+    user: >
+      Goal: {goal_description}
+      Which clock direction (10, 11, 12, 1, 2) best heads toward this
+      goal with the clearest path? Reply with one number only.

@@ -1,0 +1,42 @@
+# ============================================================
+# Task 1 — Unobstructed Exploration: Prompt Variants
+# ============================================================
+# Each entry is a named prompt variant.  The runner will test
+# every combination of (strategy × prompt_variant × run).
+
+prompts:
+  # ---------- Freespace strategy prompts ----------
+  freespace_v1:
+    strategy: freespace
+    system: ""
+    user: >
+      You are looking through the eyes of a person walking forward.
+      Is the floor clear ahead for at least 3 steps?
+      If not, is there more walkable floor space to the LEFT or RIGHT?
+      Respond with: DIRECTION (LEFT, STRAIGHT, RIGHT) and a brief reason.
+
+  freespace_v2:
+    strategy: freespace
+    system: "You are a mobility assistant for a blind person. Be concise."
+    user: >
+      Analyse this first-person view. Identify the safest direction
+      to continue walking. Reply with exactly one word: LEFT, STRAIGHT,
+      or RIGHT — followed by a one-sentence reason.
+
+  # ---------- Clockface strategy prompts ----------
+  clockface_v1:
+    strategy: clockface
+    system: ""
+    user: >
+      Imagine a clock face overlay on this first-person view.
+      12 o'clock is straight ahead, 10 o'clock is left, 2 o'clock is right.
+      Which clock direction (10, 11, 12, 1, or 2) has the clearest and
+      longest obstacle-free walking path? Respond with only the clock number.
+
+  clockface_v2:
+    strategy: clockface
+    system: "You are a navigation assistant. Be precise and direct."
+    user: >
+      Using a clock-face model (10 = far left, 12 = straight, 2 = far right),
+      which direction offers the most open walking space?
+      Reply with a single number from: 10, 11, 12, 1, 2.

@@ -11,11 +11,6 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional
 from datetime import datetime
-import sys
-import os
-import cv2
-import numpy as np
-import heapq
 
 import base64
 from PIL import Image
@@ -29,16 +24,6 @@ except ImportError:
 from .config import MODEL_WHITE_CANE
 from .logger import get_logger
 from .audio import AudioAssistant
-
-# Add Depth-Anything-3 to path
-sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Depth-Anything-3", "src"))
-try:
-    from depth_anything_3.api import DepthAnything3
-    import torch
-    DEPTH_AVAILABLE = True
-except ImportError:
-    DEPTH_AVAILABLE = False
-    print("Warning: Depth-Anything-3 not found. Safety mechanism disabled.")
 
 
 class WhiteCaneAssistant:
@@ -90,28 +75,6 @@ IMPORTANT RULES:
         # Image cache: list of (timestamp_str, image_bytes, file_path)
         self.cached_images: List[tuple] = []
         self.conversation_history: List[Dict] = []
-        
-        # Depth Model
-        self.depth_model = None
-        self.device = "cuda" if DEPTH_AVAILABLE and torch.cuda.is_available() else "cpu"
-        if DEPTH_AVAILABLE:
-            self._init_depth_model()
-
-    def _init_depth_model(self):
-        try:
-            logger = get_logger()
-            logger.info(f"Loading Depth-Anything-3 model on {self.device}...")
-            self.depth_model = DepthAnything3(model_name="da3-large")
-            
-            checkpoint_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Depth-Anything-3", "checkpoints", "depth_anything_3_vitl.pth")
-            if os.path.exists(checkpoint_path):
-                self.depth_model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'))
-            
-            self.depth_model = self.depth_model.to(self.device).eval()
-            logger.info("Depth model loaded successfully.")
-        except Exception as e:
-            get_logger().error(f"Failed to load depth model: {e}")
-            self.depth_model = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -187,118 +150,12 @@ IMPORTANT RULES:
         except Exception as e:
             logger.error(f"Error cleaning up old images: {e}")
 
-    # ── Depth & Pathfinding ───────────────────────────────────────────────────
-
-    def _heuristic(self, a, b):
-        return abs(a[0] - b[0]) + abs(a[1] - b[1])
-
-    def _astar_pathfinding(self, grid, start, goal):
-        neighbors = [(0, 1), (0, -1), (1, 0), (-1, 0), (1, 1), (1, -1), (-1, 1), (-1, -1)]
-        close_set = set()
-        came_from = {}
-        gscore = {start: 0}
-        fscore = {start: self._heuristic(start, goal)}
-        oheap = []
-        heapq.heappush(oheap, (fscore[start], start))
-        
-        while oheap:
-            current = heapq.heappop(oheap)[1]
-            if current == goal:
-                data = []
-                while current in came_from:
-                    data.append(current)
-                    current = came_from[current]
-                data.append(start)
-                return data[::-1]
-                
-            close_set.add(current)
-            for i, j in neighbors:
-                neighbor = current[0] + i, current[1] + j
-                if 0 <= neighbor[0] < grid.shape[0] and 0 <= neighbor[1] < grid.shape[1]:
-                    if grid[neighbor[0]][neighbor[1]] == 1:
-                        continue
-                else:
-                    continue
-                    
-                cost = 1.414 if i != 0 and j != 0 else 1.0
-                tentative_g_score = gscore[current] + cost
-                
-                if neighbor in close_set and tentative_g_score >= gscore.get(neighbor, 0):
-                    continue
-                    
-                if tentative_g_score < gscore.get(neighbor, 0) or neighbor not in [i[1] for i in oheap]:
-                    came_from[neighbor] = current
-                    gscore[neighbor] = tentative_g_score
-                    fscore[neighbor] = tentative_g_score + self._heuristic(neighbor, goal)
-                    heapq.heappush(oheap, (fscore[neighbor], neighbor))
-        return None
-
-    def get_safe_action(self, image_path: str) -> Optional[str]:
-        """Returns a safe action based on depth map, or None if no immediate danger."""
-        if not self.depth_model:
-            return None
-            
-        try:
-            with torch.no_grad():
-                prediction = self.depth_model.inference([image_path])
-                depth_map = prediction.depth[0].cpu().numpy()
-                
-            h, w = depth_map.shape
-            depth_min = depth_map.min()
-            depth_max = depth_map.max()
-            depth_norm = (depth_map - depth_min) / (depth_max - depth_min + 1e-8)
-            
-            # Look at bottom 60% of image
-            bottom_half = depth_norm[int(h*0.4):, :]
-            grid_size = (50, 50)
-            grid_raw = cv2.resize(bottom_half, grid_size, interpolation=cv2.INTER_AREA)
-            
-            # Fixed threshold: 0.6 means anything closer than 60% of max depth is obstacle
-            threshold = 0.6
-            occupancy_grid = (grid_raw > threshold).astype(np.uint8)
-            
-            user_pos = (grid_size[0] - 1, grid_size[1] // 2)
-            occupancy_grid[user_pos[0]-3:user_pos[0]+1, user_pos[1]-3:user_pos[1]+4] = 0
-            
-            start = user_pos
-            goal = (0, grid_size[1] // 2) # Top center
-            
-            if occupancy_grid[goal[0], goal[1]] == 1:
-                min_dist = float('inf')
-                best_goal = goal
-                for y in range(grid_size[0]):
-                    for x in range(grid_size[1]):
-                        if occupancy_grid[y, x] == 0:
-                            dist = self._heuristic((y, x), goal)
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_goal = (y, x)
-                goal = best_goal
-                
-            path = self._astar_pathfinding(occupancy_grid, start, goal)
-            
-            if path and len(path) > 5:
-                dx = path[5][1] - start[1]
-                if dx < -2:
-                    return "Turn left and move forward"
-                elif dx > 2:
-                    return "Turn right and move forward"
-                else:
-                    return "Move straight forward"
-            else:
-                return "Stop, obstacle ahead"
-                
-        except Exception as e:
-            get_logger().error(f"Depth pathfinding failed: {e}")
-            return None
-
     # ── Description / recommendation ──────────────────────────────────────────
 
     def describe_and_recommend(
         self,
         timestamp_str: str,
         img_bytes: Optional[bytes],
-        file_path: Optional[str] = None,
         user_input: Optional[str] = None
     ) -> Dict:
         """
@@ -315,13 +172,6 @@ IMPORTANT RULES:
                 "goal_achieved": False,
                 "new_goal": None
             }
-            
-        # 1. Run local depth pathfinding first
-        safe_action = None
-        if file_path and self.depth_model:
-            safe_action = self.get_safe_action(file_path)
-            if safe_action:
-                logger.info(f"[Depth Pathfinder] Recommended action: {safe_action}")
 
         class WhiteCaneResponse(BaseModel):
             thought: str = Field(
@@ -346,10 +196,6 @@ IMPORTANT RULES:
             goal=self.current_goal or "exploring the environment",
             timestamp=timestamp_str
         )
-        
-        if safe_action:
-            prompt += f"\n\n[CRITICAL SAFETY OVERRIDE]: The local depth sensor has analyzed the geometry and recommends: '{safe_action}'. You MUST incorporate this safety recommendation into your final action."
-            
         parts.append(types.Part(text=prompt))
 
         if user_input:
@@ -450,7 +296,7 @@ IMPORTANT RULES:
         timestamp_str, img_bytes, file_path = self.capture_with_timestamp()
         if img_bytes:
             self.cached_images.append((timestamp_str, img_bytes, file_path))
-        result = self.describe_and_recommend(timestamp_str, img_bytes, file_path, user_input)
+        result = self.describe_and_recommend(timestamp_str, img_bytes, user_input)
         if result.get("new_goal"):
             self.set_goal(result["new_goal"])
             print(f"[Goal Changed]: {result['new_goal']}")
@@ -573,16 +419,6 @@ Task:
                 if len(self.cached_images) > 20:
                     self.cached_images.pop(0)
                 logger.info(f"[White Cane] Silent Monitor: Captured {timestamp_str}")
-                
-                # Run fast local depth check
-                if file_path and self.depth_model:
-                    safe_action = self.get_safe_action(file_path)
-                    if safe_action == "Stop, obstacle ahead":
-                        # Immediate override if danger is detected
-                        print(f"\n[CRITICAL SAFETY] {safe_action}")
-                        self.audio.speak("Stop! Obstacle ahead.")
-                        # Optional: trigger controller haptics here
-                        
                 print(f"[White Cane] Monitoring... ({timestamp_str})", end='\r')
 
             self.stop_event.wait(timeout=interval)

@@ -1,4 +1,3 @@
-@"
 # Python
 __pycache__/
 *.pyc
@@ -6,7 +5,8 @@ __pycache__/
 *.pyd
 .venv/
 .env
-.mp4
+*.mp4
+
 # VR / build artifacts
 build/
 dist/
@@ -14,13 +14,20 @@ dist/
 OpenEye/VREye/
 OpenEye/agent_logs/
 OpenEye/sam3__
+
 # OS
 .DS_Store
 Thumbs.db
-"@ | Out-File .gitignore -Encoding utf8
+
+# Project specific
 OpenEye/checkpoints/
 *.pt
 *.pth
 *.onnx
 sam3/
 Depth-Anything-3/
+vggt/
+src/depth-anything-3
+src/sam3
+output/
+output_3d_map/

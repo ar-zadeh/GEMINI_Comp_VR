@@ -81,52 +81,132 @@ def _depths_to_world_points(depth, K, ext_w2c, images_u8, conf=None, conf_thr=1.
 
     return np.concatenate(pts_all, 0), np.concatenate(col_all, 0)
 
-def points_to_occupancy_grid(points, cam_points=None, grid_res=0.05, height_thresh=(-1.0, 1.0)):
-    # Points in glTF coordinates (X right, Y up, Z backward)
-    # Filter points by height (Y axis in glTF) to ignore ceiling and floor
-    valid_mask = (points[:, 1] >= height_thresh[0]) & (points[:, 1] <= height_thresh[1])
-    points = points[valid_mask]
-    
-    if len(points) == 0:
-        return np.zeros((10, 10), dtype=np.uint8), (0,0)
+def classify_points_by_height(points, return_masks=False):
+    """Separate aligned 3D points into floor (free space) and wall (obstacle) sets.
+
+    Strategy:
+        1. Use RANSAC to robustly fit a plane to the ground points, handling camera tilt.
+        2. Fallback to simple height percentiles if RANSAC fails or Open3D is unavailable.
+        3. Floor points are within a thin band around the ground plane.
+        4. Wall points start just above the floor and extend upwards.
+
+    Returns:
+        floor_points, wall_points  (both Nx3 arrays)
+    """
+    y_range = np.percentile(points[:, 1], 95) - np.percentile(points[:, 1], 5)
+
+    try:
+        import open3d as o3d
         
-    x = points[:, 0]
-    z = points[:, 2] # Depth is usually Z
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        
+        # Downsample for faster plane fitting
+        if len(points) > 50000:
+            pcd_down = pcd.random_down_sample(50000 / len(points))
+        else:
+            pcd_down = pcd
+            
+        plane_model, _ = pcd_down.segment_plane(distance_threshold=max(0.02 * y_range, 0.05),
+                                                ransac_n=3,
+                                                num_iterations=1000)
+        a, b, c, d = plane_model
+        normal = np.array([a, b, c])
+        
+        # Ensure normal points mostly "up" (Y ascending)
+        if normal[1] < 0:
+            normal = -normal
+            d = -d
+            
+        # Check if the detected plane is actually horizontal-ish
+        if normal[1] >= 0.5:
+            distances = np.dot(points, normal) + d
+            
+            # Re-anchor the floor level so it captures the bottom surface tightly
+            dist_5th = np.percentile(distances, 5)
+            distances = distances - dist_5th
+            
+            floor_mask = (distances >= -0.2 * y_range) & (distances < 0.05 * y_range)
+            wall_mask = (distances >= 0.05 * y_range) & (distances < 0.4 * y_range)
+            
+            if return_masks:
+                return points[floor_mask], points[wall_mask], floor_mask, wall_mask
+            return points[floor_mask], points[wall_mask]
+            
+    except ImportError:
+        pass # open3d not available, fallback to pure numpy
+        
+    # Fallback: Estimate floor level using simple percentiles
+    y = points[:, 1]
+    floor_y = np.percentile(y, 5)
     
-    x_min, x_max = np.min(x), np.max(x)
-    z_min, z_max = np.min(z), np.max(z)
+    floor_band_top = floor_y + 0.05 * y_range
+    wall_band_top = floor_y + 0.4 * y_range
     
+    floor_mask = (y >= floor_y) & (y < floor_band_top)
+    wall_mask = (y >= floor_band_top) & (y < wall_band_top)
+    
+    if return_masks:
+        return points[floor_mask], points[wall_mask], floor_mask, wall_mask
+    return points[floor_mask], points[wall_mask]
+
+def points_to_occupancy_grid(floor_points, wall_points, cam_points=None, grid_res=0.05):
+    """Build a 2D occupancy grid from classified 3D points.
+
+    Color convention (standard robotics):
+        - White (255,255,255) = free / traversable  (floor-level points detected)
+        - Dark red (0,0,140)  = obstacle / wall      (wall-level points detected)
+        - Black (0,0,0)       = unknown / unobserved
+    """
+    # Combine all points to determine grid bounds
+    all_pts = []
+    if len(floor_points) > 0:
+        all_pts.append(floor_points)
+    if len(wall_points) > 0:
+        all_pts.append(wall_points)
+
+    if len(all_pts) == 0:
+        return np.zeros((10, 10, 3), dtype=np.uint8), (0, 0, 0, 0)
+
+    all_pts = np.concatenate(all_pts, 0)
+    x_min, x_max = np.min(all_pts[:, 0]), np.max(all_pts[:, 0])
+    z_min, z_max = np.min(all_pts[:, 2]), np.max(all_pts[:, 2])
+
     if cam_points is not None and len(cam_points) > 0:
         cx, cz = cam_points[:, 0], cam_points[:, 2]
         x_min, x_max = min(x_min, np.min(cx)), max(x_max, np.max(cx))
         z_min, z_max = min(z_min, np.min(cz)), max(z_max, np.max(cz))
-        
+
     # Add a small margin
     margin = grid_res * 10
     x_min, x_max = x_min - margin, x_max + margin
     z_min, z_max = z_min - margin, z_max + margin
-    
-    # Calculate grid dimensions based on point bounds
+
     width = int(np.ceil((x_max - x_min) / grid_res))
     height = int(np.ceil((z_max - z_min) / grid_res))
-    
+
     if width <= 0 or height <= 0:
-        return np.zeros((10, 10), dtype=np.uint8), (0,0)
-    
-    # 3-channel image for colored camera markers
+        return np.zeros((10, 10, 3), dtype=np.uint8), (0, 0, 0, 0)
+
+    # 3-channel grid: black = unknown
     grid = np.zeros((height, width, 3), dtype=np.uint8)
-    
-    # Map coordinates to grid indices
-    col_idx = np.floor((x - x_min) / grid_res).astype(int)
-    row_idx = np.floor((z - z_min) / grid_res).astype(int)
-    
-    # Clip indices to fit properly within arrays
-    col_idx = np.clip(col_idx, 0, width - 1)
-    row_idx = np.clip(row_idx, 0, height - 1)
-    
-    # Populate the occupancy grid (white for occupied)
-    grid[row_idx, col_idx] = [255, 255, 255]
-    
+
+    def _project_to_grid(pts):
+        x, z = pts[:, 0], pts[:, 2]
+        c = np.clip(np.floor((x - x_min) / grid_res).astype(int), 0, width - 1)
+        r = np.clip(np.floor((z - z_min) / grid_res).astype(int), 0, height - 1)
+        return r, c
+
+    # 1) Paint floor cells white (free space)
+    if len(floor_points) > 0:
+        fr, fc = _project_to_grid(floor_points)
+        grid[fr, fc] = [255, 255, 255]
+
+    # 2) Paint wall cells dark red (obstacle) - overwrites floor where walls stand
+    if len(wall_points) > 0:
+        wr, wc = _project_to_grid(wall_points)
+        grid[wr, wc] = [0, 0, 140]  # BGR: dark red
+
     return grid, (x_min, z_min, x_max, z_max)
 
 def main(video_path, output_path, model_name="da3-large-1.1"):
@@ -137,7 +217,7 @@ def main(video_path, output_path, model_name="da3-large-1.1"):
     model = model.to(device)
     
     print(f"Extracting frames from {video_path}")
-    frames = extract_frames(video_path, max_frames=40)
+    frames = extract_frames(video_path, max_frames=200)
     if len(frames) == 0:
         print("No frames extracted.")
         return
@@ -225,22 +305,22 @@ def main(video_path, output_path, model_name="da3-large-1.1"):
     
     print("Converting 3D point cloud to 2D occupancy grid...")
     if len(pts_aligned) > 0:
-        y = pts_aligned[:, 1]
-        y_median = np.median(y)
-        y_std = np.std(y)
+        # Classify points into floor (free) and wall (obstacle) by height
+        floor_pts, wall_pts, floor_mask, wall_mask = classify_points_by_height(pts_aligned, return_masks=True)
+        print(f"  Floor points: {len(floor_pts)}, Wall points: {len(wall_pts)}")
         
-        # Adaptive height thresholds roughly around the median height
-        h_thresh = (y_median - y_std, y_median + y_std * 0.5) 
+        # Highlight obstacles (walls) with a differentiating color (e.g., Red)
+        colors[wall_mask] = [255, 0, 0]
         
         # Determine grid resolution
         span_x = np.max(pts_aligned[:,0]) - np.min(pts_aligned[:,0])
         grid_res = max(0.01, span_x / 200.0) # Aiming for ~200 bins along width
         
         occupancy_grid, bounds = points_to_occupancy_grid(
-            pts_aligned, 
+            floor_pts, 
+            wall_pts,
             cam_aligned,
-            grid_res=grid_res, 
-            height_thresh=h_thresh
+            grid_res=grid_res
         )
         
         x_min, z_min, x_max, z_max = bounds
@@ -256,7 +336,7 @@ def main(video_path, output_path, model_name="da3-large-1.1"):
                 ratio = i / max(1, len(cam_aligned) - 1)
                 # BGR format for OpenCV
                 col = (0, int(255 * (1 - ratio)), int(255 * ratio))
-                cv2.circle(occupancy_grid, (c_col, c_row), radius=max(2, int(3.0 / grid_res * 0.05)), color=col, thickness=-1)
+                cv2.circle(occupancy_grid, (c_col, c_row), radius=1, color=col, thickness=-1)
                 
                 # Draw a line connecting consecutive cameras
                 if i > 0:

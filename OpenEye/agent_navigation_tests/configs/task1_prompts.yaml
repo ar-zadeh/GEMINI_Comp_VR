@@ -8,7 +8,7 @@ prompts:
   # ---------- Freespace strategy prompts ----------
   freespace_v1:
     strategy: freespace
-    system: ""
+    system: "You are a helpful assistant."
     user: >
       You are looking through the eyes of a person walking forward.
       Is the floor clear ahead for at least 3 steps?

@@ -198,6 +198,9 @@ python -m agent_navigation_tests.runner --config agent_navigation_tests/configs/
 ```
 read more on how to setup your test suites in the `agent_navigation_tests` directory.
 
+
+# Part 2
+Here we'll examine how we can better incorporate VLM (cosmos reason 2) with the SLAM pipeline.
 ---
 
 **Created:** 2026-02-22

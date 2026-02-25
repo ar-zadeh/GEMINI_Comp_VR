@@ -20,6 +20,7 @@ import argparse
 import requests
 import yaml
 import threading
+import copy
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -112,6 +113,36 @@ def load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def log_vlm_payload(payload: dict, results_dir: str):
+    """Log the VLM payload to a jsonl file, truncating base64 images."""
+    log_file = os.path.join(results_dir, "vlm_payloads.jsonl")
+    
+    # Deep copy to avoid modifying the original payload
+    logged_payload = copy.deepcopy(payload)
+    
+    # Truncate base64 images in messages
+    for msg in logged_payload.get("messages", []):
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if part.get("type") == "image_url":
+                    url = part.get("image_url", {}).get("url", "")
+                    if url.startswith("data:image"):
+                        # Keep first 50 chars of base64
+                        prefix = url.split(",")[0] + ","
+                        b64_part = url.split(",")[1]
+                        truncated = b64_part[:50] + "..."
+                        part["image_url"]["url"] = prefix + truncated
+
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "payload": logged_payload
+    }
+    
+    with open(log_file, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
 # ------------------------------------------------------------------ #
 #  Single run executor
 # ------------------------------------------------------------------ #
@@ -130,6 +161,7 @@ def execute_run(
     stuck_limit: int,
     goal_position: Optional[List[float]] = None,
     goal_reached_threshold: float = 0.5,
+    results_dir: str = "agent_navigation_tests/results",
 ) -> Dict:
     """
     Run a single navigation test episode.
@@ -195,6 +227,9 @@ def execute_run(
                     "max_tokens": vlm_cfg.get("max_tokens", 150),
                     "temperature": vlm_cfg.get("temperature", 0.1),
                 }
+
+                # Log payload
+                log_vlm_payload(payload, results_dir)
 
                 t0 = time.time()
                 try:
@@ -353,6 +388,7 @@ def main():
                     history_length=settings["history_length"],
                     stuck_threshold=settings["stuck_position_threshold"],
                     stuck_limit=settings["stuck_consecutive_limit"],
+                    results_dir=results_dir,
                 )
                 run_summaries.append(result["summary"])
 
@@ -435,6 +471,7 @@ def main():
                         stuck_limit=settings["stuck_consecutive_limit"],
                         goal_position=target_pos,
                         goal_reached_threshold=goal_thresh,
+                        results_dir=results_dir,
                     )
                     run_summaries.append(result["summary"])
 

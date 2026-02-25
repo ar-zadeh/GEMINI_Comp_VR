@@ -30,4 +30,4 @@ vggt/
 src/depth-anything-3
 src/sam3
 output/
-output_3d_map/
+output_3d_map/*.ply

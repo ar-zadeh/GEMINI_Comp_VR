@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Configuration
-MODELS=("Firworks/Cosmos-Reason2-8B-nvfp4") # "nvidia/Cosmos-Reason2-2B" "nvidia/Cosmos-Reason2-8b" "Firworks/Cosmos-Reason2-8B-nvfp4"
+MODELS=("nvidia/Cosmos-Reason2-8b") # "nvidia/Cosmos-Reason2-2B" "nvidia/Cosmos-Reason2-8b" "Firworks/Cosmos-Reason2-8B-nvfp4"
 PROMPTS_FILE="prompts.yaml"
 PLANNING_SCRIPT="001.basic_planning.py"
 
@@ -36,7 +36,7 @@ for model in models:
             "--model", model,
             "--prompt", p_text,
             "--prompt_id", p_id,
-            "--img_path", "../occupancy_grid.png"
+            "--img_path", "./sample_maps/map_1.png"
         ]
         
         # Run the command and wait

@@ -1,1 +1,1 @@
-[{"point_2d": [305, 109], "label": "robot waypoint"}, {"point_2d": [298, 109], "label": "robot waypoint"}, {"point_2d": [298, 109], "label": "robot waypoint"}]
+[{"point_2d": [101, 811], "label": "robot waypoint"}]

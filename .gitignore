@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 .env
 *.mp4
+*.ply
 
 # VR / build artifacts
 build/
@@ -31,3 +32,4 @@ src/depth-anything-3
 src/sam3
 output/
 output_3d_map/
+screen_shots/

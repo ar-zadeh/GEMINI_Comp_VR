@@ -1,0 +1,8 @@
+```json
+{
+  "step_1": "The robot's start position is at [498, 300], and the goal area is located at [100, 970]. The bottom-left region is blocked by the black area.",
+  "step_2": "The main obstacle is the black area covering the top-left portion of the map.",
+  "step_3": "The robot will navigate through the central gap between the black area and the goal area.",
+  "step_4": "Waypoints will guide the robot from [498, 300] to [100, 970], passing through the central gap."
+}
+```

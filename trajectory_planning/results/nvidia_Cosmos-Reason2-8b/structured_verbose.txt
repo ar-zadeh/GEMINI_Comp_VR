@@ -1,0 +1,8 @@
+
+[
+  {"point_2d": [466, 108], "label": "waypoint"},
+  {"point_2d": [380, 321], "label": "waypoint"},
+  {"point_2d": [305, 529], "label": "waypoint"},
+  {"point_2d": [286, 680], "label": "waypoint"},
+  {"point_2d": [286, 745], "label": "waypoint"}
+]

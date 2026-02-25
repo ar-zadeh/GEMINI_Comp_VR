@@ -1,0 +1,1 @@
+[{"point_2d": [462, 309], "label": "replan waypoint"}, {"point_2d": [380, 482], "label": "replan waypoint"}, {"point_2d": [305, 650], "label": "replan waypoint"}, {"point_2d": [262, 780], "label": "replan waypoint"}]

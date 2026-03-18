@@ -36,3 +36,6 @@ src/sam3
 output/
 output_3d_map/
 screen_shots/
+OpenVR-InputEmulator/
+*.npz
+*.ply

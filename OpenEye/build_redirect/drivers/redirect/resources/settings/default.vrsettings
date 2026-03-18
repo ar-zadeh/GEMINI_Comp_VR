@@ -1,0 +1,7 @@
+{
+   "driver_redirect" : {
+      "enable" : true,
+      "tcpPort" : 5570,
+      "autoEnableHmd" : false
+   }
+}

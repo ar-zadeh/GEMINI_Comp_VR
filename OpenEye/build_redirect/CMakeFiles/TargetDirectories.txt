@@ -1,0 +1,7 @@
+/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/build_redirect/CMakeFiles/driver_redirect.dir
+/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/build_redirect/CMakeFiles/edit_cache.dir
+/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/build_redirect/CMakeFiles/rebuild_cache.dir
+/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/build_redirect/CMakeFiles/list_install_components.dir
+/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/build_redirect/CMakeFiles/install.dir
+/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/build_redirect/CMakeFiles/install/local.dir
+/home/amir/gemini_project_VR/GEMINI_Comp_VR/OpenEye/build_redirect/CMakeFiles/install/strip.dir

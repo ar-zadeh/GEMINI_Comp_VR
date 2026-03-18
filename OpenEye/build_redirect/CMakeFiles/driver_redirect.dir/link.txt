@@ -1,0 +1,1 @@
+/usr/bin/c++ -fPIC -shared  -o drivers/redirect/bin/64/driver_redirect.so CMakeFiles/driver_redirect.dir/driver_redirect.o CMakeFiles/driver_redirect.dir/hooks.o CMakeFiles/driver_redirect.dir/pose_manipulator.o CMakeFiles/driver_redirect.dir/redirect_tcp_server.o CMakeFiles/driver_redirect.dir/driverlog.o 

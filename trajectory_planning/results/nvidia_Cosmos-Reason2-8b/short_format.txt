@@ -1,0 +1,22 @@
+```json
+[
+  {"point_2d": [101, 101], "label": "waypoint"},
+  {"point_2d": [101, 201], "label": "waypoint"},
+  {"point_2d": [101, 301], "label": "waypoint"},
+  {"point_2d": [101, 401], "label": "waypoint"},
+  {"point_2d": [101, 501], "label": "waypoint"},
+  {"point_2d": [101, 601], "label": "waypoint"},
+  {"point_2d": [101, 701], "label": "waypoint"},
+  {"point_2d": [101, 801], "label": "waypoint"},
+  {"point_2d": [101, 901], "label": "waypoint"},
+  {"point_2d": [101, 901], "label": "waypoint"},
+  {"point_2d": [101, 801], "label": "waypoint"},
+  {"point_2d": [101, 701], "label": "waypoint"},
+  {"point_2d": [101, 601], "label": "waypoint"},
+  {"point_2d": [101, 501], "label": "waypoint"},
+  {"point_2d": [101, 401], "label": "waypoint"},
+  {"point_2d": [101, 301], "label": "waypoint"},
+  {"point_2d": [101, 201], "label": "waypoint"},
+  {"point_2d": [101, 101], "label": "waypoint"}
+]
+```

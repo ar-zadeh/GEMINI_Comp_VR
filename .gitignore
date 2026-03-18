@@ -6,11 +6,13 @@ __pycache__/
 .venv/
 .env
 *.mp4
+*.ply
 
 # VR / build artifacts
 build/
 dist/
 *.log
+*.ply
 OpenEye/VREye/
 OpenEye/agent_logs/
 OpenEye/sam3__
@@ -18,6 +20,8 @@ OpenEye/sam3__
 # OS
 .DS_Store
 Thumbs.db
+.vs/
+OpenEye/.vs/
 
 # Project specific
 OpenEye/checkpoints/
@@ -30,4 +34,5 @@ vggt/
 src/depth-anything-3
 src/sam3
 output/
-output_3d_map/*.ply
+output_3d_map/
+screen_shots/

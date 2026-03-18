@@ -5,6 +5,26 @@ This script combines:
 - **SfM-style visual odometry** (feature matching + PnP) for camera motion
 - **Depth fusion** into one global occupancy map as the camera moves
 
+
+## Installation
+
+``` bash
+git clone https://github.com/ByteDance-Seed/depth-anything-3
+cd depth-anything-3
+pip install -e . # Basic
+export TORCH_CUDA_ARCH_LIST="10.0" # this is needed if the next step fails
+pip install  --no-build-isolation git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70 # for gaussian head
+```
+
+if your build still failed (especially i'm testing on WSL):
+```bash
+export TORCH_CUDA_ARCH_LIST="10.0"
+export CUDA_HOME=$CONDA_PREFIX
+export CPATH=$CUDA_HOME/targets/x86_64-linux/include:$CPATH
+pip install git+https://github.com/nerfstudio-project/gsplat.git@0b4dddf04cb687367602c01196913cde6a743d70 --no-build-isolation
+```
+
+
 ## Script
 
 - `holistic_obstacle_mapper.py`

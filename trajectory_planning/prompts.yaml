@@ -1,0 +1,132 @@
+prompts:
+  - id: "short_format"
+    prompt: |
+      You are a robot motion planner. The image shows a 2D grid map.
+      WHITE = free space. BLACK = obstacles. GREEN = start.
+      RED = goal.
+      Coordinates are in pixels (0–1000 range, top-left origin).
+
+      Plan a collision-free path from the start to the goal. Return sparse waypoints as JSON:
+      [{"point_2d": [x, y], "label": "waypoint"}, ...]
+
+      <think>Your reasoning.</think>
+      Answer immediately after </think>.
+
+  - id: "structured_verbose"
+    prompt: |
+      You are an autonomous mobile robot navigation planner.
+
+      ENVIRONMENT DESCRIPTION:
+      - The image is a top-down 2D occupancy grid map.
+      - WHITE pixels represent traversable free space.
+      - BLACK pixels represent walls or static obstacles.
+      - The GREEN marker indicates the robot's current position (start).
+      - The target destination (RED) is the **destination**.
+
+      COORDINATE SYSTEM:
+      - Origin (0, 0) is at the top-left corner of the image.
+      - X-axis increases to the right. Y-axis increases downward.
+      - All coordinates are normalized to a 0–1000 range for both axes.
+
+      YOUR TASK:
+      Plan a smooth, collision-free path from the GREEN marker to the RED marker.
+      Follow these constraints:
+        1. No waypoint may overlap with a BLACK (occupied) pixel.
+        2. Keep the path as direct as possible while avoiding obstacles.
+        3. Use sparse waypoints — only include inflection points and corners, not every pixel step.
+        4. The first waypoint should be near the start. The last should reach the goal.
+
+      Return your planned path in JSON format:
+      [
+        {"point_2d": [x, y], "label": "waypoint"},
+        ...
+      ]
+
+      Answer using this format:
+      <think>
+      Describe your reasoning: identify obstacles, sketch a high-level route, then refine waypoints.
+      </think>
+      Write your final JSON answer immediately after the </think> tag.
+
+  - id: "cot_enforced"
+    prompt: |
+      You are a robot path planner operating on a 2D grid (0–1000 px, top-left origin).
+      WHITE = free. BLACK = blocked. GREEN marker = robot start. RED marker = goal.
+
+      Before planning, reason step by step:
+        Step 1: Locate the start (GREEN) marker coordinates and identify the goal (RED) marker coordinates.
+        Step 2: Identify major obstacle regions between them.
+        Step 3: Choose a corridor or gap to route through.
+        Step 4: Define sparse waypoints that navigate through that corridor to the goal.
+
+      Return your path as:
+      [{"point_2d": [x, y], "label": "nav waypoint"}, ...]
+
+      <think>
+      Step 1: ...
+      Step 2: ...
+      Step 3: ...
+      Step 4: ...
+      </think>
+      JSON answer immediately after </think>.
+
+  - id: "robot_grounded"
+    prompt: |
+      You are controlling a differential-drive robot. The image is a bird's-eye occupancy map of its environment.
+
+      Map legend:
+        - WHITE: open floor (safe to traverse)
+        - BLACK: wall or obstacle (robot footprint must never enter)
+        - GREEN marker: robot's current pose (center = position)
+        - RED marker: goal
+
+      Coordinate space: pixel units, 0–1000 on both axes, origin top-left.
+
+      Assume the robot has a circular footprint of radius ~15 units.
+      Plan a path that keeps the robot center at least 15 units away from any BLACK pixel while navigating to the bottom left.
+
+      Output a minimal set of waypoints as a JSON array:
+      [{"point_2d": [x, y], "label": "robot waypoint"}, ...]
+
+      <think>Your spatial reasoning here.</think>
+      Provide the JSON path directly after </think>.
+
+  - id: "multi_task"
+    prompt: |
+      You are a task-conditioned robot planner. You will receive:
+        (1) A top-down 2D map image (WHITE=free, BLACK=obstacle, GREEN=start).
+        (2) Information that the goal is the bottom left of the map.
+        (3) A natural language instruction describing how the robot should navigate.
+
+      Instruction: "Take the path that stays close to the left wall."
+
+      Coordinate system: 0–1000 range, top-left origin, x-right, y-down.
+
+      Using the instruction as a behavioral constraint, plan a path from the GREEN marker to the RED marker.
+
+      Output:
+      [{"point_2d": [x, y], "label": "waypoint"}, ...]
+
+      <think>Reason about both the instruction and the map layout.</think>
+      JSON answer after </think>.
+
+  - id: "replanning_feedback"
+    prompt: |
+      You are a robot replanner. The robot attempted a previous path but encountered an unexpected obstacle mid-execution.
+
+      Map (image): WHITE=free, BLACK=obstacle, GREEN=current robot position.
+      Goal: RED.
+      Coordinates: 0–1000, top-left origin.
+
+      The robot's previously planned path was:
+      [{"point_2d": [500, 100], "label": "waypoint"}, {"point_2d": [500, 500], "label": "waypoint"}]
+
+      The robot stopped at approximately (500, 300) due to an obstacle not in the original map.
+
+      Replan the remaining path from the current GREEN marker to the RED marker, routing around the newly discovered obstacle.
+
+      Return only the remaining path:
+      [{"point_2d": [x, y], "label": "replan waypoint"}, ...]
+
+      <think>Reason about where the blockage is and how to route around it.</think>
+      JSON after </think>.

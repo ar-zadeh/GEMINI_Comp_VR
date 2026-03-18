@@ -1,0 +1,1 @@
+[{"point_2d": [101, 811], "label": "robot waypoint"}]

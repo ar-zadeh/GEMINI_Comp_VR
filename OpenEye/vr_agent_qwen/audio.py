@@ -91,7 +91,7 @@ class AudioAssistant:
                         fast_path = temp_path.replace(".mp3", "_fast.mp3")
                         subprocess.run(
                             ["ffmpeg", "-y", "-i", temp_path,
-                             "-filter:a", "atempo=1.5", "-vn", fast_path],
+                             "-filter:a", "atempo=1.5", "-vn", "-loglevel", "quiet","-hide_banner", fast_path],
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
                         )
                         os.replace(fast_path, temp_path)
@@ -101,11 +101,11 @@ class AudioAssistant:
                 # Play (mpg123 → ffplay → warn)
                 if shutil.which("mpg123") is not None:
                     subprocess.run(["mpg123", "-q", temp_path],
-                                   check=False, stdin=subprocess.DEVNULL)
+                                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
                 elif shutil.which("ffplay") is not None:
                     subprocess.run(
-                        ["ffplay", "-nodisp", "-autoexit", "-hide_banner", temp_path],
-                        check=False, stdin=subprocess.DEVNULL
+                        ["ffplay", "-nodisp", "-autoexit", "-hide_banner", "-loglevel", "quiet", temp_path],
+                        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL
                     )
                 else:
                     print("Error: No audio player found (install mpg123 or ffmpeg).")

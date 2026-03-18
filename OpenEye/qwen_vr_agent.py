@@ -17,7 +17,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from vr_agent_qwen.agent import QwenAgent
+import warnings
 
+# Ignore this specific annoying warning about pkg_resources
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API")
 # ============================================================================
 # MAIN
 # ============================================================================
@@ -29,10 +32,7 @@ if __name__ == "__main__":
 
     if agent.config.get("startup_message", True):
         agent.white_cane.audio.speak(
-            "VR Agent initialized. I am your VR assistant. "
-            "Press enter, talk to me and press enter again. "
-            "You can give me commands like 'find the keys' or 'describe the room'. "
-            "Say 'menu' to see structured options. If you get lost, say 'help'."
+            "VR Agent initialized. Say help for more infor"
         )
 
     execution_thread = None

@@ -66,66 +66,7 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         get_logger().info(f"[TOOL] {tool_name}({kwargs})")
         print(f"Action: {tool_name} {kwargs}")
 
-    def _capture_mss_frame():
-        """Capture a frame from the desktop using MSS and return (PIL image, jpeg bytes)."""
-        try:
-            import mss
-        except ImportError as e:
-            raise RuntimeError(
-                "mss is required for visual servoing. Install it with `pip install mss`."
-            ) from e
-
-        with mss.mss() as sct:
-            monitors = sct.monitors
-            if not monitors:
-                raise RuntimeError("No monitor found for MSS capture.")
-
-            def _encode_raw(raw_img):
-                pil_img_local = Image.frombytes("RGB", raw_img.size, raw_img.rgb)
-                out_local = io.BytesIO()
-                pil_img_local.save(out_local, format="JPEG", quality=95)
-                return pil_img_local, out_local.getvalue()
-
-            # Try region first if one was detected at startup.
-            if _agent_ref and hasattr(_agent_ref, "mss_capture_region") and _agent_ref.mss_capture_region:
-                region = dict(_agent_ref.mss_capture_region)
-
-                # Clamp region to the monitor bounds to avoid XGetImage out-of-range errors.
-                mon = monitors[1] if len(monitors) > 1 else monitors[0]
-                mon_left = int(mon["left"])
-                mon_top = int(mon["top"])
-                mon_right = mon_left + int(mon["width"])
-                mon_bottom = mon_top + int(mon["height"])
-
-                left = max(mon_left, int(region.get("left", mon_left)))
-                top = max(mon_top, int(region.get("top", mon_top)))
-                right = min(mon_right, left + int(region.get("width", 0)))
-                bottom = min(mon_bottom, top + int(region.get("height", 0)))
-                width = right - left
-                height = bottom - top
-
-                if width > 10 and height > 10:
-                    safe_region = {"left": left, "top": top, "width": width, "height": height}
-                    try:
-                        raw = sct.grab(safe_region)
-                        return _encode_raw(raw)
-                    except Exception as e:
-                        get_logger().warning(f"MSS region capture failed ({safe_region}): {e}")
-
-            # MSS index 1 is the primary monitor; index 0 is the virtual full desktop.
-            monitor_index = 1
-            try:
-                monitor_index = int(os.getenv("MSS_MONITOR_INDEX", "1"))
-            except ValueError:
-                monitor_index = 1
-
-            if monitor_index < 0 or monitor_index >= len(monitors):
-                monitor_index = 1 if len(monitors) > 1 else 0
-
-            raw = sct.grab(monitors[monitor_index])
-            return _encode_raw(raw)
-
-    def _capture_driver_frame():
+    def _capture_driver_frame(return_bytes=True):
         """Fallback frame capture via VR driver inspect_surroundings."""
         res = _executor.call("inspect_surroundings")
         if isinstance(res, str) and res.startswith("Error"):
@@ -135,11 +76,16 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
             data = json.loads(res).get("data")
             if not data:
                 raise RuntimeError("inspect_surroundings returned no image data")
-            img_bytes = base64.b64decode(data)
-            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            out = io.BytesIO()
-            pil_img.save(out, format="JPEG", quality=95)
-            return pil_img, out.getvalue()
+            
+            # The data is already a base64 encoded jpeg or png
+            img_bytes_raw = base64.b64decode(data)
+            pil_img = Image.open(io.BytesIO(img_bytes_raw)).convert("RGB")
+            
+            if return_bytes:
+                # We can reuse the raw bytes for grounding since they are already an image format
+                # unless the model specifically needs it re-encoded. Usually raw bytes from driver (JPEG) are fine.
+                return pil_img, img_bytes_raw
+            return pil_img, None
         except Exception as e:
             raise RuntimeError(f"Driver frame parse failed: {e}") from e
 
@@ -505,17 +451,12 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         except Exception as e:
             return f"Failed to parse initial pose: {e}"
 
-        # 2. Capture initial image from desktop (MSS)
+        # 2. Capture initial image from driver
         try:
-            pil_img_init, img_bytes = _capture_mss_frame()
+            pil_img_init, img_bytes = _capture_driver_frame()
             w, h = pil_img_init.size
         except Exception as e:
-            get_logger().warning(f"Initial MSS capture failed, falling back to driver: {e}")
-            try:
-                pil_img_init, img_bytes = _capture_driver_frame()
-                w, h = pil_img_init.size
-            except Exception as e2:
-                return f"Initial capture failed (MSS + driver): {e2}"
+            return f"Initial capture failed: {e}"
 
         # 3. Ground targets
         targets = {"ray": ray_description, "logo": object_description}
@@ -545,26 +486,70 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         prev_dist = float('inf')
         divergence_count = 0
         dist = float('inf')
+        
+        # Timing variables
+        capture_times = []
+        capture_parts = {"rpc": 0, "decode": 0, "cv2": 0}
+        sam_times = []
+        sam_parts = {"resize": 0, "set_image": 0, "prompt": 0, "mask": 0, "viz": 0}
+        pid_times = []
+
+        def print_timing():
+            n = len(capture_times) if capture_times else 1
+            cap = f"Capture(avg={sum(capture_times)/n:.3f}s = rpc:{capture_parts['rpc']/n:.3f}, decode:{capture_parts['decode']/n:.3f}, cv2:{capture_parts['cv2']/n:.3f})"
+            sam = f"SAM(avg={sum(sam_times)/n:.3f}s = resize:{sam_parts['resize']/n:.3f}, set_img:{sam_parts['set_image']/n:.3f}, prompt:{sam_parts['prompt']/n:.3f}, mask:{sam_parts['mask']/n:.3f}, viz:{sam_parts['viz']/n:.3f})"
+            pid = f"PID(avg={sum(pid_times)/n:.3f}s)"
+            print(f"\n[TIMING BREAKDOWN]\n - {cap}\n - {sam}\n - {pid}\n")
 
         for i in range(MAX_ITER):
             if _agent_ref and _agent_ref.stop_execution.is_set():
+                print(f"Visual Servoing Stopped by User.")
                 return "Visual Servoing Stopped by User."
 
-            # Capture from desktop (MSS)
+            # Capture from driver
+            import time
+            t0 = time.time()
             try:
-                pil_img_loop, img_bytes_loop = _capture_mss_frame()
-                img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                print(f"MSS capture error in loop: {e}. Falling back to driver frame.")
-                try:
-                    pil_img_loop, img_bytes_loop = _capture_driver_frame()
-                    img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
-                except Exception as e2:
-                    print(f"Driver capture fallback failed in loop: {e2}")
+                # BREAKDOWN CAPTURE
+                t0_a = time.time()
+                res = _executor.call("inspect_surroundings")
+                t0_b = time.time()
+                capture_parts["rpc"] += (t0_b - t0_a)
+                
+                if isinstance(res, str) and res.startswith("Error"):
                     break
+                
+                data = json.loads(res).get("data")
+                img_bytes_loop = base64.b64decode(data)
+                pil_img_loop = Image.open(io.BytesIO(img_bytes_loop)).convert("RGB")
+                t0_c = time.time()
+                capture_parts["decode"] += (t0_c - t0_b)
+                
+                img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
+                t0_d = time.time()
+                capture_parts["cv2"] += (t0_d - t0_c)
+                
+            except Exception as e:
+                print(f"Driver capture failed in loop: {e}")
+                break
+            t1 = time.time()
+            capture_times.append(t1 - t0)
 
             # SAM tracking
-            inference_state = _tracker.processor.set_image(pil_img_loop)
+            t2 = time.time()
+            
+            # --- RESOLUTION REDUCTION FOR FASTER SAM ---
+            # Resize image to speed up SAM processing while keeping normalized boxes intact
+            scale_factor = 0.5  # lowering this further (e.g. 0.3) will be faster but less precise
+            sam_w, sam_h = int(w * scale_factor), int(h * scale_factor)
+            pil_img_sam = pil_img_loop.resize((sam_w, sam_h), Image.Resampling.BILINEAR)
+            t2_a = time.time()
+            sam_parts["resize"] += (t2_a - t2)
+            
+            inference_state = _tracker.processor.set_image(pil_img_sam)
+            t2_b = time.time()
+            sam_parts["set_image"] += (t2_b - t2_a)
+            
             points = {}
             masks_for_viz = {}
 
@@ -572,17 +557,23 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 if key not in current_boxes:
                     continue
                 box_x, box_y, box_w, box_h = current_boxes[key]
+                # Scale bounding box for the smaller image SAM sees
                 box_input_xywh = _tracker.torch.tensor(
-                    [box_x, box_y, box_w, box_h]).view(-1, 4)
+                    [box_x * scale_factor, box_y * scale_factor, 
+                     box_w * scale_factor, box_h * scale_factor]).view(-1, 4)
                 box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
                 norm_box_cxcywh = _tracker.normalize_bbox(
-                    box_input_cxcywh, w, h).flatten().tolist()
+                    box_input_cxcywh, sam_w, sam_h).flatten().tolist()
 
                 _tracker.processor.reset_all_prompts(inference_state)
-                inference_state = _tracker.processor.set_text_prompt(desc, inference_state)
+                # Text prompt is heavy and not needed every frame when tracking with geometric prompt
+                # inference_state = _tracker.processor.set_text_prompt(desc, inference_state)
                 inference_state = _tracker.processor.add_geometric_prompt(
                     state=inference_state, box=norm_box_cxcywh, label=True
                 )
+                
+                t2_c = time.time()
+                sam_parts["prompt"] += (t2_c - t2_b)
 
                 mask = None
                 if "masks" in inference_state and inference_state["masks"] is not None:
@@ -593,19 +584,7 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                         mask = m[0]
 
                 if mask is None:
-                    print(f"[{key}] Lost tracking. Attempting reground...")
-                    try:
-                        reground_res = _grounder.ground_multiple_objects(img_bytes_loop, [desc])
-                        if desc in reground_res:
-                            ymin, xmin, ymax, xmax = reground_res[desc]
-                            current_boxes[key] = [xmin * w, ymin * h,
-                                                  (xmax - xmin) * w, (ymax - ymin) * h]
-                            print(f"[{key}] Reground Successful.")
-                        else:
-                            del current_boxes[key]
-                    except Exception as e:
-                        print(f"[{key}] Reground Error: {e}")
-                        del current_boxes[key]
+                    print(f"[{key}] Lost tracking...")
                     continue
 
                 masks_for_viz[key] = mask
@@ -614,27 +593,45 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 if rows.any() and cols.any():
                     rmin, rmax = np.where(rows)[0][[0, -1]]
                     cmin, cmax = np.where(cols)[0][[0, -1]]
-                    current_boxes[key] = [cmin, rmin, cmax - cmin, rmax - rmin]
+                    
+                    # Upscale the box back to original image coordinates!
+                    orig_cmin, orig_rmin = cmin / scale_factor, rmin / scale_factor
+                    orig_w, orig_h = (cmax - cmin) / scale_factor, (rmax - rmin) / scale_factor
+                    current_boxes[key] = [orig_cmin, orig_rmin, orig_w, orig_h]
+                    
                     if key == "ray":
                         ys, xs = np.where(mask)
                         if len(ys) > 0:
                             idx = np.argmin(ys)
-                            points[key] = (xs[idx], ys[idx])
+                            # Upscale point back to original coordinates
+                            points[key] = (xs[idx] / scale_factor, ys[idx] / scale_factor)
                     elif key == "logo":
                         M = cv2.moments(mask.astype(np.uint8))
                         if M["m00"] != 0:
-                            points[key] = (int(M["m10"] / M["m00"]),
-                                           int(M["m01"] / M["m00"]))
+                            # Upscale point back to original coordinates
+                            points[key] = (int((M["m10"] / M["m00"]) / scale_factor),
+                                           int((M["m01"] / M["m00"]) / scale_factor))
+                
+                t2_b = time.time() # Reset t2_b for next target in loop
+                sam_parts["mask"] += (t2_b - t2_c)
 
-            # Visualize masks
+            t2_d = time.time()
+            # Visualize masks (need to upscale mask to original image size for viz)
             for key, mask in masks_for_viz.items():
+                mask_up = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
                 color = (np.array([255, 100, 0] if key == "ray" else [0, 255, 100],
                                   dtype=np.uint8))
                 overlay = img_cv.copy()
-                overlay[mask] = color
+                overlay[mask_up] = color
                 cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
 
+            t3 = time.time()
+            sam_parts["viz"] += (t3 - t2_d)
+            if t2 is not None:
+                sam_times.append(t3 - t2)
+            
             # PID control
+            t4 = time.time()
             if "ray" in points and "logo" in points:
                 rx, ry = points["ray"]
                 lx, ly = points["logo"]
@@ -649,16 +646,24 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 prev_dist = dist
 
                 if divergence_count >= 3:
+                    t5 = time.time()
+                    pid_times.append(t5 - t4)
+                    print_timing()
+                    print(f"Visual Servoing Aborted. Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
                     return "Visual Servoing Aborted: Divergence detected."
 
-                # Save debug image
-                cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
-                timestamp = datetime.now().strftime("%H%M%S")
-                debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
-                if CV2_AVAILABLE:
-                    cv2.imwrite(str(debug_path), img_cv)
+                # Save debug image (Commented out to improve speed. Un-comment if you need loop tracking debugging)
+                # cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
+                # timestamp = datetime.now().strftime("%H%M%S")
+                # debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
+                # if CV2_AVAILABLE:
+                #     cv2.imwrite(str(debug_path), img_cv)
 
                 if dist < TOLERANCE_PX:
+                    t5 = time.time()
+                    pid_times.append(t5 - t4)
+                    print_timing()
+                    print(f"Visual Servoing Complete. Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
                     msg = f"Visual Servoing Complete. Aligned with {object_description} (Error: {dist:.2f}px)."
                     logger.info(msg)
                     return msg
@@ -667,11 +672,22 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 curr_pitch += -Kp_PITCH * dy
                 _executor.call("rotate_device", device=controller,
                                pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
+                
+                t5 = time.time()
+                pid_times.append(t5 - t4)
             else:
                 if "ray" in current_boxes and "logo" in current_boxes:
+                    t5 = time.time()
+                    pid_times.append(t5 - t4)
                     continue
+                t5 = time.time()
+                pid_times.append(t5 - t4)
+                print_timing()
+                print(f"Lost tracking. Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
                 return "Lost tracking of one or both objects during loop. Stopping."
 
+        print_timing()
+        print(f"Visual Servoing Loop Ended. Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
         if dist < 50.0:
             return f"Visual Servoing finished. Aligned within {dist:.1f}px (acceptable)."
         return f"Visual servoing finished max iterations ({MAX_ITER}). Final error: {dist:.1f}."
@@ -816,6 +832,11 @@ Rules:
         typed_chars = []
         failed_chars = []
 
+        # Timing variables
+        capture_times = []
+        sam_times = []
+        pid_times = []
+
         for char_idx, char in enumerate(text.lower()):
             print(f"\n=== Typing '{char}' ({char_idx + 1}/{len(text)}) ===")
             if char not in key_boxes:
@@ -829,8 +850,11 @@ Rules:
 
             for i in range(MAX_ITER_PER_CHAR):
                 if _agent_ref and _agent_ref.stop_execution.is_set():
+                    print(f"Typing Stopped. Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
                     return "Typing Stopped by User."
 
+                import time
+                t0 = time.time()
                 res = _executor.call("inspect_surroundings")
                 if isinstance(res, str) and res.startswith("Error"):
                     break
@@ -842,8 +866,18 @@ Rules:
                 except Exception as e:
                     print(f"Image parse error: {e}")
                     break
+                
+                t1 = time.time()
+                capture_times.append(t1 - t0)
 
-                inference_state = _tracker.processor.set_image(pil_img_loop)
+                t2 = time.time()
+                
+                # --- RESOLUTION REDUCTION FOR FASTER SAM ---
+                scale_factor = 0.5
+                sam_w, sam_h = int(w * scale_factor), int(h * scale_factor)
+                pil_img_sam = pil_img_loop.resize((sam_w, sam_h), Image.Resampling.BILINEAR)
+                inference_state = _tracker.processor.set_image(pil_img_sam)
+                
                 points = {}
                 boxes_to_track = {"ray": current_ray_box, "key": target_box}
                 updated_boxes = {}
@@ -852,14 +886,16 @@ Rules:
                 for key, box in boxes_to_track.items():
                     box_x, box_y, box_w, box_h = box
                     box_input_xywh = _tracker.torch.tensor(
-                        [box_x, box_y, box_w, box_h]).view(-1, 4)
+                        [box_x * scale_factor, box_y * scale_factor, 
+                         box_w * scale_factor, box_h * scale_factor]).view(-1, 4)
                     box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
                     norm_box_cxcywh = _tracker.normalize_bbox(
-                        box_input_cxcywh, w, h).flatten().tolist()
+                        box_input_cxcywh, sam_w, sam_h).flatten().tolist()
 
                     _tracker.processor.reset_all_prompts(inference_state)
                     text_desc = "VR controller ray" if key == "ray" else f"keyboard key {char}"
-                    inference_state = _tracker.processor.set_text_prompt(text_desc, inference_state)
+                    # Removed set_text_prompt here to speed up servoing loop
+                    # inference_state = _tracker.processor.set_text_prompt(text_desc, inference_state)
                     inference_state = _tracker.processor.add_geometric_prompt(
                         state=inference_state, box=norm_box_cxcywh, label=True
                     )
@@ -881,25 +917,35 @@ Rules:
                     if rows.any() and cols.any():
                         rmin, rmax = np.where(rows)[0][[0, -1]]
                         cmin, cmax = np.where(cols)[0][[0, -1]]
-                        updated_boxes[key] = [cmin, rmin, cmax - cmin, rmax - rmin]
+                        
+                        # Upscale box back to original coordinates
+                        orig_cmin, orig_rmin = cmin / scale_factor, rmin / scale_factor
+                        orig_w, orig_h = (cmax - cmin) / scale_factor, (rmax - rmin) / scale_factor
+                        updated_boxes[key] = [orig_cmin, orig_rmin, orig_w, orig_h]
+                        
                         if key == "ray":
                             ys, xs = np.where(mask)
                             if len(ys) > 0:
                                 idx = np.argmin(ys)
-                                points[key] = (xs[idx], ys[idx])
+                                points[key] = (xs[idx] / scale_factor, ys[idx] / scale_factor)
                         elif key == "key":
                             M = cv2.moments(mask.astype(np.uint8))
                             if M["m00"] != 0:
-                                points[key] = (int(M["m10"] / M["m00"]),
-                                               int(M["m01"] / M["m00"]))
+                                points[key] = (int((M["m10"] / M["m00"]) / scale_factor),
+                                               int((M["m01"] / M["m00"]) / scale_factor))
 
                 for key, mask in masks_for_viz.items():
+                    mask_up = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
                     color = np.array([255, 100, 0] if key == "ray" else [0, 255, 100],
                                      dtype=np.uint8)
                     overlay = img_cv.copy()
-                    overlay[mask] = color
+                    overlay[mask_up] = color
                     cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
 
+                t3 = time.time()
+                sam_times.append(t3 - t2)
+
+                t4 = time.time()
                 if "ray" in updated_boxes:
                     current_ray_box = updated_boxes["ray"]
                 if "key" in updated_boxes:
@@ -915,6 +961,8 @@ Rules:
 
                     if dist < TOLERANCE_PX:
                         converged = True
+                        t5 = time.time()
+                        pid_times.append(t5 - t4)
                         break
 
                     curr_yaw += -Kp_YAW * dx
@@ -922,7 +970,11 @@ Rules:
                     _executor.call("rotate_device", device=controller,
                                    pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
                     time.sleep(0.05)
+                    t5 = time.time()
+                    pid_times.append(t5 - t4)
                 else:
+                    t5 = time.time()
+                    pid_times.append(t5 - t4)
                     break
 
             if converged:
@@ -930,11 +982,12 @@ Rules:
                                button="trigger", duration=0.1)
                 time.sleep(0.15)
                 typed_chars.append(char)
-                print(f"Typed '{char}' successfully!")
+                print(f"Typed '{char}' successfully! Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
             else:
-                print(f"Failed to align to '{char}' (final error: {final_dist:.2f}px)")
+                print(f"Failed to align to '{char}' (final error: {final_dist:.2f}px). Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
                 failed_chars.append(char)
 
+        print(f"Typing Loop Ended. Overall Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
         result = f"Typed {len(typed_chars)}/{len(text)} characters: '{''.join(typed_chars)}'"
         if failed_chars:
             result += f". Failed: {failed_chars}"

@@ -11,6 +11,7 @@ import queue
 import subprocess
 import tempfile
 import threading
+import shutil
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -85,7 +86,7 @@ class AudioAssistant:
                 tts.save(temp_path)
 
                 # Speed up 1.5× with ffmpeg if available
-                if subprocess.call(["which", "ffmpeg"], stdout=subprocess.DEVNULL) == 0:
+                if shutil.which("ffmpeg") is not None:
                     try:
                         fast_path = temp_path.replace(".mp3", "_fast.mp3")
                         subprocess.run(
@@ -98,10 +99,10 @@ class AudioAssistant:
                         print(f"Audio speed adjustment failed: {e}")
 
                 # Play (mpg123 → ffplay → warn)
-                if subprocess.call(["which", "mpg123"], stdout=subprocess.DEVNULL) == 0:
+                if shutil.which("mpg123") is not None:
                     subprocess.run(["mpg123", "-q", temp_path],
                                    check=False, stdin=subprocess.DEVNULL)
-                elif subprocess.call(["which", "ffplay"], stdout=subprocess.DEVNULL) == 0:
+                elif shutil.which("ffplay") is not None:
                     subprocess.run(
                         ["ffplay", "-nodisp", "-autoexit", "-hide_banner", temp_path],
                         check=False, stdin=subprocess.DEVNULL

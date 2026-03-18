@@ -3,9 +3,14 @@
 # pyre-unsafe
 
 import os
+from pathlib import Path
 from typing import Optional
 
 import pkg_resources
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
 
 import torch
 import torch.nn as nn
@@ -643,11 +648,32 @@ def build_sam3_image_model(
 
 
 def download_ckpt_from_hf():
+    # Load OpenEye/.env so HF_TOKEN can be provided without hardcoding secrets.
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if load_dotenv is not None:
+        load_dotenv(dotenv_path=env_path)
+    elif env_path.exists():
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     SAM3_MODEL_ID = "facebook/sam3"
     SAM3_CKPT_NAME = "sam3.pt"
     SAM3_CFG_NAME = "config.json"
-    _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
-    checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
+
+    if token:
+        _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME, token=token)
+        checkpoint_path = hf_hub_download(
+            repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME, token=token
+        )
+    else:
+        _ = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CFG_NAME)
+        checkpoint_path = hf_hub_download(repo_id=SAM3_MODEL_ID, filename=SAM3_CKPT_NAME)
+
     return checkpoint_path
 
 

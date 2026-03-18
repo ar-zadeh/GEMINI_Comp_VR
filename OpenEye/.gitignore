@@ -6,7 +6,7 @@ __pycache__/
 *.pyd
 .venv/
 .env
-
+.ply
 # VR / build artifacts
 build/
 dist/

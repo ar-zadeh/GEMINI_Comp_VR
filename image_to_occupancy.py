@@ -1,5 +1,6 @@
 import os
 import sys
+import glob
 import cv2
 import numpy as np
 import torch
@@ -22,52 +23,43 @@ def _as_homogeneous44(ext: np.ndarray) -> np.ndarray:
     raise ValueError(f"Extrinsic must be (3,4) or (4,4), got {ext.shape}")
 
 
-def extract_frames(video_path, max_frames=20):
-    cap = cv2.VideoCapture(video_path)
+def load_images(image_paths):
+    """Load a list of image file paths as RGB numpy arrays.
+
+    Args:
+        image_paths : list of file path strings (supports glob patterns)
+
+    Returns:
+        frames : list of (H, W, 3) uint8 numpy arrays in RGB order
+    """
+    # Expand any glob patterns
+    expanded = []
+    for p in image_paths:
+        matches = sorted(glob.glob(p))
+        if matches:
+            expanded.extend(matches)
+        else:
+            expanded.append(p)  # keep as-is; will fail below with a clear error
+
     frames = []
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    for p in expanded:
+        img = cv2.imread(p)
+        if img is None:
+            print(f"  WARNING: could not read image '{p}', skipping.")
+            continue
+        frames.append(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        print(f"  Loaded {p}  ({frames[-1].shape[1]}x{frames[-1].shape[0]})")
 
-    if total_frames <= 0:
-        total_frames = max_frames  # Fallback
-
-    # Reserve one slot for the guaranteed last frame
-    sample_slots = max_frames - 1
-    step = max(1, total_frames // max(1, sample_slots))
-
-    idx = 0
-    count = 0
-    last_sampled_idx = -1
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        if idx % step == 0 and count < sample_slots:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frames.append(frame_rgb)
-            last_sampled_idx = idx
-            count += 1
-        idx += 1
-
-    # Always append the actual last frame (seek back if needed)
-    true_last_idx = total_frames - 1
-    if last_sampled_idx != true_last_idx:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, true_last_idx)
-        ret, frame = cap.read()
-        if ret:
-            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-
-    cap.release()
     return frames
 
 
 def _unproject_depth_to_world(depth, intrinsics, extrinsics, images_u8, conf=None, conf_thr=0.0):
-    """Unproject depth maps (N,H,W) to 3D world points using camera intrinsics and extrinsics.
+    """Unproject depth maps (N,H,W) to 3D world points.
 
     Args:
         depth      : (N, H, W) float depth maps
         intrinsics : (N, 3, 3) camera intrinsic matrices
-        extrinsics : (N, 4, 4) world-to-camera (w2c) extrinsic matrices
+        extrinsics : (N, 3,4) or (N, 4,4) world-to-camera (w2c) extrinsics
         images_u8  : (N, H, W, 3) uint8 RGB images
         conf       : (N, H, W) confidence maps or None
         conf_thr   : confidence threshold for filtering
@@ -96,7 +88,6 @@ def _unproject_depth_to_world(depth, intrinsics, extrinsics, images_u8, conf=Non
         vidx = np.flatnonzero(valid.reshape(-1))
 
         K_inv = np.linalg.inv(intrinsics[i].astype(np.float64))
-        # extrinsics are w2c -> invert to get c2w
         c2w = np.linalg.inv(_as_homogeneous44(extrinsics[i].astype(np.float64)))
 
         rays = K_inv @ pix[vidx].T          # (3, M)
@@ -135,7 +126,6 @@ def classify_points_by_height(points, return_masks=False):
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
 
-        # Downsample for faster plane fitting
         if len(points) > 50000:
             pcd_down = pcd.random_down_sample(50000 / len(points))
         else:
@@ -149,21 +139,17 @@ def classify_points_by_height(points, return_masks=False):
         a, b, c, d = plane_model
         normal = np.array([a, b, c])
 
-        # Ensure normal points mostly "up" (Y ascending)
         if normal[1] < 0:
             normal = -normal
             d = -d
 
-        # Check if the detected plane is actually horizontal-ish
         if normal[1] >= 0.5:
             distances = np.dot(points, normal) + d
-
-            # Re-anchor the floor level so it captures the bottom surface tightly
             dist_5th = np.percentile(distances, 5)
             distances = distances - dist_5th
 
             floor_mask = (distances >= -0.2 * y_range) & (distances < 0.10 * y_range)
-            wall_mask  = (distances >= 0.10 * y_range) & (distances < 0.4 * y_range)
+            wall_mask  = (distances >= 0.10 * y_range) & (distances < 0.4  * y_range)
 
             if return_masks:
                 return points[floor_mask], points[wall_mask], floor_mask, wall_mask
@@ -213,7 +199,6 @@ def points_to_occupancy_grid(floor_points, wall_points, cam_points=None, grid_re
         x_min, x_max = min(x_min, np.min(cx)), max(x_max, np.max(cx))
         z_min, z_max = min(z_min, np.min(cz)), max(z_max, np.max(cz))
 
-    # Add a small margin
     margin = grid_res * 10
     x_min, x_max = x_min - margin, x_max + margin
     z_min, z_max = z_min - margin, z_max + margin
@@ -224,7 +209,6 @@ def points_to_occupancy_grid(floor_points, wall_points, cam_points=None, grid_re
     if width <= 0 or height <= 0:
         return np.zeros((10, 10, 3), dtype=np.uint8), (0, 0, 0, 0)
 
-    # 3-channel grid: black = unknown
     grid = np.zeros((height, width, 3), dtype=np.uint8)
 
     def _project_to_grid(pts):
@@ -233,12 +217,10 @@ def points_to_occupancy_grid(floor_points, wall_points, cam_points=None, grid_re
         r = np.clip(np.floor((z - z_min) / grid_res).astype(int), 0, height - 1)
         return r, c
 
-    # 1) Paint floor cells white (free space)
     if len(floor_points) > 0:
         fr, fc = _project_to_grid(floor_points)
         grid[fr, fc] = [255, 255, 255]
 
-    # 2) Paint wall cells dark red (obstacle) - overwrites floor where walls stand
     if len(wall_points) > 0:
         wr, wc = _project_to_grid(wall_points)
         grid[wr, wc] = [0, 0, 140]  # BGR: dark red
@@ -246,7 +228,7 @@ def points_to_occupancy_grid(floor_points, wall_points, cam_points=None, grid_re
     return grid, (x_min, z_min, x_max, z_max)
 
 
-def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40.0):
+def main(image_paths, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40.0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading Depth Anything 3 model: {model_name} on {device}...")
@@ -254,20 +236,21 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
     model.eval()
     model = model.to(device)
 
-    # --- Extract video frames ---
-    print(f"Extracting frames from {video_path}")
-    frames = extract_frames(video_path, max_frames=20)
+    # --- Load images ---
+    print(f"Loading {len(image_paths)} image path(s)...")
+    frames = load_images(image_paths)
     if len(frames) == 0:
-        print("No frames extracted.")
+        print("No images loaded. Check the provided paths.")
         return
+    print(f"Loaded {len(frames)} image(s).")
 
     # --- Run DA3 inference ---
-    print(f"Running DA3 inference on {len(frames)} frames...")
+    print("Running DA3 inference...")
     prediction = model.inference(frames)
 
     depth      = prediction.depth            # (N, H, W)
     conf       = prediction.conf             # (N, H, W) or None
-    extrinsics = prediction.extrinsics       # (N, 4, 4) w2c
+    extrinsics = prediction.extrinsics       # (N, 3,4) or (N, 4,4) w2c
     intrinsics = prediction.intrinsics       # (N, 3, 3)
     images_u8  = prediction.processed_images # (N, H, W, 3) uint8
 
@@ -276,19 +259,19 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
     # Confidence-based filtering threshold
     conf_thr = np.percentile(conf, conf_percentile) if conf is not None else 0.0
 
-    # --- Build 3D world points from depth maps ---
+    # --- Unproject depth maps to 3D world points ---
     print("Unprojecting depth maps to 3D world points...")
     points, colors = _unproject_depth_to_world(
         depth, intrinsics, extrinsics, images_u8, conf, conf_thr
     )
 
     if len(points) == 0:
-        print("No valid 3D points after filtering. Check thresholds or input video.")
+        print("No valid 3D points after filtering. Check thresholds or input images.")
         return
 
     print(f"Extracted {len(points)} points. Aligning to first camera...")
 
-    # --- Align point cloud using the first camera ---
+    # --- Align point cloud to first camera frame ---
     w2c0 = _as_homogeneous44(extrinsics[0].astype(np.float64))
 
     M = np.eye(4, dtype=np.float64)
@@ -297,7 +280,7 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
 
     A_no_center = M @ w2c0
 
-    center   = np.median(points, axis=0) if len(points) > 0 else np.zeros(3)
+    center   = np.median(points, axis=0)
     T_center = np.eye(4, dtype=np.float64)
     T_center[:3, 3] = -center
     A = T_center @ A_no_center
@@ -310,8 +293,7 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
     cam_centers_w = []
     for ext in extrinsics:
         c2w = np.linalg.inv(_as_homogeneous44(ext.astype(np.float64)))
-        Cw  = (c2w @ np.array([0.0, 0.0, 0.0, 1.0]))[:3]
-        cam_centers_w.append(Cw)
+        cam_centers_w.append((c2w @ np.array([0.0, 0.0, 0.0, 1.0]))[:3])
 
     cam_centers_w = np.array(cam_centers_w)  # (N, 3)
     cam_homo    = np.hstack([cam_centers_w, np.ones((N, 1))])
@@ -325,9 +307,7 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
             pts_aligned, return_masks=True
         )
         print(f"  Floor points: {len(floor_pts)}, Wall points: {len(wall_pts)}")
-
-        # Highlight obstacles (walls) red in the point cloud colours
-        colors[wall_mask] = [255, 0, 0]
+        colors[wall_mask] = [255, 0, 0]  # paint obstacle points red in PLY
 
     # --- Save PLY ---
     ply_out = output_path.rsplit(".", 1)[0] + "_pointcloud.ply"
@@ -342,9 +322,8 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
         sphere.apply_translation(c)
         cam_pts.append(sphere.vertices)
 
-        # Color gradient: first camera green -> last camera red
         ratio = i / max(1, len(cam_aligned) - 1)
-        col   = [int(255 * ratio), int(255 * (1 - ratio)), 0]
+        col   = [int(255 * ratio), int(255 * (1 - ratio)), 0]  # green → red gradient
         cam_cols.append(np.tile(col, (len(sphere.vertices), 1)))
 
     cam_pts  = np.vstack(cam_pts)
@@ -360,9 +339,8 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
     print("Converting 3D point cloud to 2D occupancy grid...")
     if len(pts_aligned) > 0:
 
-        # Determine grid resolution
         span_x   = np.max(pts_aligned[:, 0]) - np.min(pts_aligned[:, 0])
-        grid_res = max(0.01, span_x / 200.0)  # ~200 bins along width
+        grid_res = max(0.01, span_x / 200.0)
 
         occupancy_grid, bounds = points_to_occupancy_grid(
             floor_pts,
@@ -374,10 +352,7 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
         x_min, z_min, x_max, z_max = bounds
         print(f"Occupancy grid shape: {occupancy_grid.shape}")
 
-        # Save a clean copy for pathfinding BEFORE drawing camera annotations
-        occupancy_grid_clean = occupancy_grid.copy()
-
-        # Draw camera positions on the occupancy grid
+        # Draw camera positions and trajectory on the grid
         for i, c in enumerate(cam_aligned):
             cx, cz = c[0], c[2]
             c_col  = int((cx - x_min) / grid_res)
@@ -385,17 +360,9 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
 
             if 0 <= c_col < occupancy_grid.shape[1] and 0 <= c_row < occupancy_grid.shape[0]:
                 ratio = i / max(1, len(cam_aligned) - 1)
-                # BGR format for OpenCV
-                col = (0, int(255 * (1 - ratio)), int(255 * ratio))
-                cv2.circle(
-                    occupancy_grid,
-                    (c_col, c_row),
-                    radius=1,
-                    color=col,
-                    thickness=-1,
-                )
+                col = (0, int(255 * (1 - ratio)), int(255 * ratio))  # BGR
+                cv2.circle(occupancy_grid, (c_col, c_row), radius=1, color=col, thickness=-1)
 
-                # Draw a line connecting consecutive cameras
                 if i > 0:
                     prev_c = cam_aligned[i - 1]
                     p_col  = int((prev_c[0] - x_min) / grid_res)
@@ -406,41 +373,16 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
                             (p_col, p_row),
                             (c_col, c_row),
                             (0, 0, 255),
-                            1,
+                            max(1, int(1.0 / grid_res * 0.05)),
                         )
 
         # Flip vertically so Z-up maps to image top
-        occupancy_grid       = np.flipud(occupancy_grid)
-        occupancy_grid_clean = np.flipud(occupancy_grid_clean)
+        occupancy_grid = np.flipud(occupancy_grid)
 
         cv2.imwrite(output_path, occupancy_grid)
         print(f"Saved occupancy grid to {output_path}")
-
-        # --- Save companion data for navigate.py ---
-        # frames[-1] is guaranteed to be the true last video frame
-        last_idx        = N - 1
-        last_depth      = depth[last_idx]          # (H_proc, W_proc)
-        last_intrinsic  = intrinsics[last_idx]      # (3, 3)
-        last_extrinsic  = _as_homogeneous44(extrinsics[last_idx].astype(np.float64))  # (4, 4)
-        last_frame_orig = frames[last_idx]          # (H_orig, W_orig, 3) RGB uint8
-
-        npz_out = output_path.rsplit(".", 1)[0] + "_navdata.npz"
-        np.savez_compressed(
-            npz_out,
-            occupancy_grid       = occupancy_grid,        # (H, W, 3) uint8 – annotated, for display
-            occupancy_grid_clean = occupancy_grid_clean,  # (H, W, 3) uint8 – clean, for pathfinding
-            bounds          = np.array([x_min, z_min, x_max, z_max]),
-            grid_res        = np.float64(grid_res),
-            cam_aligned     = cam_aligned,               # (N, 3)
-            alignment_matrix= A,                         # (4, 4)
-            last_depth      = last_depth,                # (H_proc, W_proc)
-            last_intrinsic  = last_intrinsic,            # (3, 3)
-            last_extrinsic  = last_extrinsic,            # (4, 4) w2c
-            last_frame_orig = last_frame_orig,           # (H_orig, W_orig, 3) RGB
-        )
-        print(f"Saved navigation data to {npz_out}")
     else:
-        print("Point cloud was empty. Check thresholds or input video.")
+        print("Point cloud was empty. Check thresholds or input images.")
 
     print("Done.")
 
@@ -448,15 +390,19 @@ def main(video_path, output_path, model_name="DA3-LARGE-1.1", conf_percentile=40
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--video", type=str, required=True,
-                        help="Input video path")
+    parser = argparse.ArgumentParser(
+        description="Generate a 2D occupancy map from one or more images using Depth Anything 3."
+    )
+    parser.add_argument(
+        "images", nargs="+",
+        help="One or more image file paths (or glob patterns, e.g. 'frames/*.png')"
+    )
     parser.add_argument("--out",   type=str, default="occupancy_grid.png",
-                        help="Output 2D grid image path")
+                        help="Output 2D occupancy grid image path")
     parser.add_argument("--model", type=str, default="DA3-LARGE-1.1",
                         help="Depth Anything 3 model name (e.g. DA3-LARGE-1.1, DA3-BASE-1.1)")
     parser.add_argument("--conf_percentile", type=float, default=40.0,
                         help="Percentile of depth confidence below which points are filtered")
     args = parser.parse_args()
 
-    main(args.video, args.out, args.model, args.conf_percentile)
+    main(args.images, args.out, args.model, args.conf_percentile)

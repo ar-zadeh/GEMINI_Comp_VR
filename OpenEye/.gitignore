@@ -6,7 +6,7 @@ __pycache__/
 *.pyd
 .venv/
 .env
-.ply
+*.ply
 # VR / build artifacts
 build/
 dist/
@@ -24,3 +24,6 @@ OpenEye/checkpoints/
 *.onnx
 *.jpg
 *.wav
+*.ply
+.vs/
+*.npz

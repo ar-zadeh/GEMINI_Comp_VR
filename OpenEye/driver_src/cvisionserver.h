@@ -14,6 +14,7 @@
 #include <atomic>
 #include <mutex>
 #include <functional>
+#include <cstdint>
 #include "cframecapture.h"
 
 // Vision request types
@@ -55,9 +56,32 @@ public:
     bool IsCapturing() const { return m_bCapturing; }
 
 private:
+#pragma pack(push, 1)
+    struct SharedFrameMeta
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t headerSize;
+        uint32_t sequence;
+        uint64_t timestampMs;
+        uint32_t width;
+        uint32_t height;
+        uint32_t jpegSize;
+        uint32_t capacity;
+    };
+#pragma pack(pop)
+
     bool HandleCaptureFrame(std::string& jsonResponse);
     bool HandleCaptureVideo(float duration, int fps, std::string& jsonResponse);
     bool HandleGetStatus(std::string& jsonResponse);
+
+    void StartAsyncCapture();
+    void StopAsyncCapture();
+    void AsyncCaptureThread();
+
+    bool InitSharedMemory();
+    void ShutdownSharedMemory();
+    bool PublishFrameToSharedMemory(const FrameData& frame);
 
     std::string Base64Encode(const std::vector<uint8_t>& data);
     std::string BuildJsonResponse(const VisionResponse& response);
@@ -65,7 +89,20 @@ private:
     CFrameCapture m_frameCapture;
     std::atomic<bool> m_bCapturing;
     std::atomic<bool> m_bInitialized;
+    std::atomic<bool> m_bAsyncCaptureRunning;
     std::mutex m_captureMutex;
+    std::thread* m_pAsyncCaptureThread;
+
+    std::mutex m_lastFrameMutex;
+    FrameData m_lastFrame;
+    bool m_bHasLastFrame;
+
+    uint32_t m_sharedFrameCapacity;
+
+#if defined(_WIN32)
+    HANDLE m_hFrameMap;
+    unsigned char* m_pFrameMapView;
+#endif
 };
 
 // Global instance

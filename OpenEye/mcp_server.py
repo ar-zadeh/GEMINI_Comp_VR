@@ -18,6 +18,9 @@ import time
 import math
 import base64
 import io
+import mmap
+import struct
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 from mcp.server.fastmcp import FastMCP
 
@@ -39,9 +42,140 @@ audio_event = threading.Event()
 # Logging suppression (set True during keyboard control to silence broadcast spam)
 suppress_logging = False
 
+# Shared-memory frame bridge (Windows named file mapping).
+SHARED_FRAME_MAP_NAME = "Local\\OpenEyeVRFrameMap_v1"
+SHARED_FRAME_MAGIC = 0x4F455946
+SHARED_FRAME_VERSION = 1
+SHARED_FRAME_CAPACITY = 16 * 1024 * 1024
+SHARED_FRAME_HEADER_STRUCT = struct.Struct("<IIIIQIIII")
+SHARED_FRAME_TOTAL_SIZE = SHARED_FRAME_HEADER_STRUCT.size + SHARED_FRAME_CAPACITY
+
+CAPTURE_SAVE_DIR = Path(__file__).resolve().parent / "captures_driver"
+CAPTURE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
 # Optional callback invoked after headset pose changes.
 # keyboard_controller registers here so controllers follow the headset.
 _headset_changed_callback = None
+_capture_save_lock = threading.Lock()
+_last_saved_shared_sequence = -1
+_last_returned_shared_sequence = -1
+
+
+def _save_driver_capture(
+    jpeg_bytes: bytes,
+    source: str,
+    width: int,
+    height: int,
+    timestamp_ms: Optional[int] = None,
+    sequence: Optional[int] = None,
+) -> Optional[str]:
+    # Return None immediately to stop saving raw images in captures_driver
+    return None
+
+    global _last_saved_shared_sequence
+
+    if not jpeg_bytes:
+        return None
+
+    with _capture_save_lock:
+        if source == "shared_memory" and sequence is not None:
+            if sequence == _last_saved_shared_sequence:
+                return None
+            _last_saved_shared_sequence = sequence
+
+        if timestamp_ms is None:
+            timestamp_ms = int(time.time() * 1000)
+
+        ts_struct = time.localtime(timestamp_ms / 1000.0)
+        ts_prefix = time.strftime("%Y%m%d_%H%M%S", ts_struct)
+        ms = int(timestamp_ms % 1000)
+        seq_part = f"_seq{sequence}" if sequence is not None else ""
+        filename = f"{ts_prefix}_{ms:03d}_{source}{seq_part}_{width}x{height}.jpg"
+        out_path = CAPTURE_SAVE_DIR / filename
+
+        try:
+            out_path.write_bytes(jpeg_bytes)
+            return str(out_path)
+        except Exception:
+            return None
+
+
+class SharedFrameReader:
+    def __init__(self):
+        self._mmap = None
+
+    def reset(self):
+        try:
+            if self._mmap is not None:
+                self._mmap.close()
+        except Exception:
+            pass
+        self._mmap = None
+
+    def _ensure_open(self) -> bool:
+        if self._mmap is not None:
+            return True
+        try:
+            self._mmap = mmap.mmap(
+                -1,
+                SHARED_FRAME_TOTAL_SIZE,
+                tagname=SHARED_FRAME_MAP_NAME,
+                access=mmap.ACCESS_READ,
+            )
+            return True
+        except OSError:
+            self._mmap = None
+            return False
+
+    def read_latest_jpeg(self, max_retries: int = 5) -> Optional[Dict[str, Any]]:
+        if not self._ensure_open():
+            return None
+
+        for _ in range(max_retries):
+            self._mmap.seek(0)
+            header_bytes = self._mmap.read(SHARED_FRAME_HEADER_STRUCT.size)
+            if len(header_bytes) != SHARED_FRAME_HEADER_STRUCT.size:
+                return None
+
+            (magic, version, header_size, seq1, ts_ms, width, height, jpeg_size, capacity) = SHARED_FRAME_HEADER_STRUCT.unpack(header_bytes)
+
+            if magic != SHARED_FRAME_MAGIC or version != SHARED_FRAME_VERSION:
+                return None
+            if header_size != SHARED_FRAME_HEADER_STRUCT.size:
+                return None
+            if capacity > SHARED_FRAME_CAPACITY:
+                return None
+            if seq1 & 1:
+                time.sleep(0.0005)
+                continue
+            if jpeg_size <= 0 or jpeg_size > capacity:
+                return None
+
+            payload = self._mmap.read(jpeg_size)
+            if len(payload) != jpeg_size:
+                return None
+
+            self._mmap.seek(0)
+            verify_bytes = self._mmap.read(SHARED_FRAME_HEADER_STRUCT.size)
+            if len(verify_bytes) != SHARED_FRAME_HEADER_STRUCT.size:
+                return None
+
+            (_, _, _, seq2, _, _, _, _, _) = SHARED_FRAME_HEADER_STRUCT.unpack(verify_bytes)
+            if seq1 == seq2 and (seq2 & 1) == 0:
+                return {
+                    "jpeg": payload,
+                    "width": width,
+                    "height": height,
+                    "timestamp_ms": ts_ms,
+                    "sequence": seq2,
+                }
+
+            time.sleep(0.0005)
+
+        return None
+
+
+shared_frame_reader = SharedFrameReader()
 
 def _notify_headset_changed():
     """Call registered callback (if any) after headset pose change. Must be called WITHOUT state_lock held."""
@@ -807,42 +941,77 @@ def inspect_surroundings() -> str:
     - Verify navigation was successful
     - Understand the current scene before taking action
     """
+    # Fast path: read latest frame from the driver's shared memory map.
+    shm_frame = shared_frame_reader.read_latest_jpeg()
+    if shm_frame is not None:
+        saved_path = _save_driver_capture(
+            jpeg_bytes=shm_frame["jpeg"],
+            source="shared_memory",
+            width=shm_frame["width"],
+            height=shm_frame["height"],
+            timestamp_ms=shm_frame.get("timestamp_ms"),
+            sequence=shm_frame.get("sequence"),
+        )
+        return json.dumps({
+            "type": "image",
+            "format": "jpeg",
+            "width": shm_frame["width"],
+            "height": shm_frame["height"],
+            "data": base64.b64encode(shm_frame["jpeg"]).decode("ascii"),
+            "source": "shared_memory",
+            "timestamp_ms": shm_frame["timestamp_ms"],
+            "sequence": shm_frame["sequence"],
+            "saved_path": saved_path,
+        })
+
+    # If shared-memory map exists but no fresh frame arrived, force a reopen on next call.
+    # This helps when the writer was restarted and the reader is stuck on stale content.
+    shared_frame_reader.reset()
+
+    # Compatibility fallback for environments where shared memory is not available yet.
     global vision_response
     vision_response = None
     vision_event.clear()
-    
+
     request = {
         "type": "vision_request",
         "action": "capture_frame"
     }
-    
+
     if not send_vision_request(request):
         return "Error: No VR driver connected. Cannot capture frame."
-    
-    # Wait for response
+
     if not vision_event.wait(timeout=VISION_TIMEOUT):
         return "Error: Timeout waiting for frame capture."
-    
+
     if vision_response is None:
         return "Error: No response received from driver."
-    
+
     if vision_response.get('type') == 'error':
         return f"Error: {vision_response.get('message', 'Unknown error')}"
-    
+
     frames = vision_response.get('frames', [])
     if not frames:
         return "Error: No frame data received."
-    
+
     width = vision_response.get('width', 0)
     height = vision_response.get('height', 0)
-    
-    # Return the base64 image data for the LLM to analyze
+    frame_bytes = base64.b64decode(frames[0])
+    saved_path = _save_driver_capture(
+        jpeg_bytes=frame_bytes,
+        source="rpc_fallback",
+        width=width,
+        height=height,
+    )
+
     return json.dumps({
         "type": "image",
         "format": "jpeg",
         "width": width,
         "height": height,
-        "data": frames[0]  # Base64 encoded JPEG
+        "data": frames[0],
+        "source": "rpc_fallback",
+        "saved_path": saved_path,
     })
 
 @mcp.tool()

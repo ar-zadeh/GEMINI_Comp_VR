@@ -468,6 +468,17 @@ bool CFrameCapture::EncodeJpeg(const std::vector<uint8_t>& rgbData, int width, i
 
 bool CFrameCapture::CaptureFrame(FrameData& outFrame)
 {
+#if defined(_WIN32)
+    // CRITICAL FIX: Refresh the screen DC every frame. Caching GetDC(nullptr) 
+    // permanently will result in frozen frames on modern Windows DWM as it caches 
+    // the display buffer surface until renewed.
+    if (m_hdcScreen)
+    {
+        ReleaseDC(nullptr, m_hdcScreen);
+        m_hdcScreen = GetDC(nullptr);
+    }
+#endif
+
     std::vector<uint8_t> rgbData;
     int width, height;
 

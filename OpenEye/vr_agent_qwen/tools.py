@@ -640,12 +640,17 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                     print(f"Visual Servoing Aborted. Avg Capture: {sum(capture_times)/len(capture_times) if capture_times else 0:.3f}s, Avg SAM: {sum(sam_times)/len(sam_times) if sam_times else 0:.3f}s, Avg PID: {sum(pid_times)/len(pid_times) if pid_times else 0:.3f}s")
                     return "Visual Servoing Aborted: Divergence detected."
 
-                # Save debug image (Commented out to improve speed. Un-comment if you need loop tracking debugging)
-                # cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
-                # timestamp = datetime.now().strftime("%H%M%S")
-                # debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
-                # if CV2_AVAILABLE:
-                #     cv2.imwrite(str(debug_path), img_cv)
+                # Save debug image to captures_driver folder
+                if CV2_AVAILABLE:
+                    cv2.line(img_cv, (int(rx), int(ry)), (int(lx), int(ly)), (0, 255, 255), 2)
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+                    
+                    # Point to the captures_driver folder next to the scripts
+                    captures_dir = Path(__file__).resolve().parent.parent / "captures_driver"
+                    captures_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    debug_path = captures_dir / f"visual_servo_{timestamp}_iter_{i}.jpg"
+                    cv2.imwrite(str(debug_path), img_cv)
 
                 if dist < TOLERANCE_PX:
                     t5 = time.time()

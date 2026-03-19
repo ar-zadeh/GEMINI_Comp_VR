@@ -158,7 +158,7 @@ class ObjectTracker:
         elif masks.ndim == 3:
             masks = masks[0]
 
-        return masks > 0.5
+        return masks > 0.1
 
     def _predict_mask(self, frame_bgr: np.ndarray, box_xywh: List[float]) -> Optional[np.ndarray]:
         if cv2 is None:
@@ -194,12 +194,12 @@ class ObjectTracker:
             try:
                 prediction = self.processor.predict(
                     box=box_xyxy[None, :],
-                    multimask_output=False,
+                    multimask_output=True,
                 )
             except TypeError:
                 prediction = self.processor.predict(
                     box=box_xyxy,
-                    multimask_output=False,
+                    multimask_output=True,
                 )
             return self._extract_efficientvit_mask(prediction)
 

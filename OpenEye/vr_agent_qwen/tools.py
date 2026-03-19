@@ -540,7 +540,7 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
             
             # --- RESOLUTION REDUCTION FOR FASTER SAM ---
             # Resize image to speed up SAM processing while keeping normalized boxes intact
-            scale_factor = 0.5  # lowering this further (e.g. 0.3) will be faster but less precise
+            scale_factor = 1  # lowering this further (e.g. 0.3) will be faster but less precise
             sam_w, sam_h = int(w * scale_factor), int(h * scale_factor)
             pil_img_sam = pil_img_loop.resize((sam_w, sam_h), Image.Resampling.BILINEAR)
             sam_frame_bgr = cv2.cvtColor(np.array(pil_img_sam), cv2.COLOR_RGB2BGR)

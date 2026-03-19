@@ -543,10 +543,10 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
             scale_factor = 0.5  # lowering this further (e.g. 0.3) will be faster but less precise
             sam_w, sam_h = int(w * scale_factor), int(h * scale_factor)
             pil_img_sam = pil_img_loop.resize((sam_w, sam_h), Image.Resampling.BILINEAR)
+            sam_frame_bgr = cv2.cvtColor(np.array(pil_img_sam), cv2.COLOR_RGB2BGR)
             t2_a = time.time()
             sam_parts["resize"] += (t2_a - t2)
-            
-            inference_state = _tracker.processor.set_image(pil_img_sam)
+
             t2_b = time.time()
             sam_parts["set_image"] += (t2_b - t2_a)
             
@@ -557,31 +557,19 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 if key not in current_boxes:
                     continue
                 box_x, box_y, box_w, box_h = current_boxes[key]
-                # Scale bounding box for the smaller image SAM sees
-                box_input_xywh = _tracker.torch.tensor(
-                    [box_x * scale_factor, box_y * scale_factor, 
-                     box_w * scale_factor, box_h * scale_factor]).view(-1, 4)
-                box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
-                norm_box_cxcywh = _tracker.normalize_bbox(
-                    box_input_cxcywh, sam_w, sam_h).flatten().tolist()
 
-                _tracker.processor.reset_all_prompts(inference_state)
-                # Text prompt is heavy and not needed every frame when tracking with geometric prompt
-                # inference_state = _tracker.processor.set_text_prompt(desc, inference_state)
-                inference_state = _tracker.processor.add_geometric_prompt(
-                    state=inference_state, box=norm_box_cxcywh, label=True
-                )
+                # Scale bounding box for the smaller image tracking pass.
+                scaled_box_xywh = [
+                    box_x * scale_factor,
+                    box_y * scale_factor,
+                    box_w * scale_factor,
+                    box_h * scale_factor,
+                ]
                 
                 t2_c = time.time()
                 sam_parts["prompt"] += (t2_c - t2_b)
 
-                mask = None
-                if "masks" in inference_state and inference_state["masks"] is not None:
-                    m = inference_state["masks"].detach().cpu().numpy() > 0.5
-                    if m.ndim == 4:
-                        mask = m[0, 0]
-                    elif m.ndim == 3:
-                        mask = m[0]
+                mask = _tracker._predict_mask(sam_frame_bgr, scaled_box_xywh)
 
                 if mask is None:
                     print(f"[{key}] Lost tracking...")
@@ -876,7 +864,7 @@ Rules:
                 scale_factor = 0.5
                 sam_w, sam_h = int(w * scale_factor), int(h * scale_factor)
                 pil_img_sam = pil_img_loop.resize((sam_w, sam_h), Image.Resampling.BILINEAR)
-                inference_state = _tracker.processor.set_image(pil_img_sam)
+                sam_frame_bgr = cv2.cvtColor(np.array(pil_img_sam), cv2.COLOR_RGB2BGR)
                 
                 points = {}
                 boxes_to_track = {"ray": current_ray_box, "key": target_box}
@@ -885,28 +873,14 @@ Rules:
 
                 for key, box in boxes_to_track.items():
                     box_x, box_y, box_w, box_h = box
-                    box_input_xywh = _tracker.torch.tensor(
-                        [box_x * scale_factor, box_y * scale_factor, 
-                         box_w * scale_factor, box_h * scale_factor]).view(-1, 4)
-                    box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
-                    norm_box_cxcywh = _tracker.normalize_bbox(
-                        box_input_cxcywh, sam_w, sam_h).flatten().tolist()
+                    scaled_box_xywh = [
+                        box_x * scale_factor,
+                        box_y * scale_factor,
+                        box_w * scale_factor,
+                        box_h * scale_factor,
+                    ]
 
-                    _tracker.processor.reset_all_prompts(inference_state)
-                    text_desc = "VR controller ray" if key == "ray" else f"keyboard key {char}"
-                    # Removed set_text_prompt here to speed up servoing loop
-                    # inference_state = _tracker.processor.set_text_prompt(text_desc, inference_state)
-                    inference_state = _tracker.processor.add_geometric_prompt(
-                        state=inference_state, box=norm_box_cxcywh, label=True
-                    )
-
-                    mask = None
-                    if "masks" in inference_state and inference_state["masks"] is not None:
-                        m = inference_state["masks"].detach().cpu().numpy() > 0.5
-                        if m.ndim == 4:
-                            mask = m[0, 0]
-                        elif m.ndim == 3:
-                            mask = m[0]
+                    mask = _tracker._predict_mask(sam_frame_bgr, scaled_box_xywh)
 
                     if mask is None:
                         continue

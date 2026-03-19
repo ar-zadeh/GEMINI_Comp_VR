@@ -3,63 +3,207 @@ import json
 import logging
 import subprocess
 import sys
+import importlib
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 import numpy as np
 from PIL import Image
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 # Configure logging
 logger = logging.getLogger("VRAgent.Tracker")
 
 
 class ObjectTracker:
-    def __init__(self, log_dir: Path):
+    def __init__(
+        self,
+        log_dir: Path,
+        backend: str = "efficientvit-sam",
+        efficientvit_model_name: str = "efficientvit_sam_xl1",
+    ):
         self.log_dir = log_dir / "tracking"
         self.log_dir.mkdir(exist_ok=True, parents=True)
         self.available = False
         self.processor = None
         self.model = None
-        
-        # Check imports
-        import torch
-        import sam3
-        from sam3 import build_sam3_image_model
-        from sam3.model.box_ops import box_xywh_to_cxcywh
-        from sam3.model.sam3_image_processor import Sam3Processor
-        from sam3.visualization_utils import normalize_bbox
+        self.backend = "none"
+        self.backend_requested = (backend or "efficientvit-sam").lower()
+        self.efficientvit_model_name = (efficientvit_model_name or "efficientvit-sam-xl1").replace("_", "-")
+        self.torch = None
+
+        # Default path: EfficientViT-SAM. If unavailable, automatically fall back to SAM3.
+        if self.backend_requested in {"efficientvit-sam", "efficientvit", "efficientvit_sam", "auto"}:
+            if self._init_efficientvit_sam(self.efficientvit_model_name):
+                return
+            logger.warning("EfficientViT-SAM init failed, trying SAM3 fallback.")
+
+        if self.backend_requested in {"sam3", "sam-3", "auto", "efficientvit-sam", "efficientvit", "efficientvit_sam"}:
+            if self._init_sam3():
+                return
+
+        logger.error("No tracking backend available. Install EfficientViT-SAM or SAM3 dependencies.")
+
+    def _init_efficientvit_sam(self, model_name: str) -> bool:
         try:
-            
+            import torch
+
+            # Try normal import first; if missing, probe local workspace clone paths.
+            sam_model_zoo = None
+            sam_mod = None
+            try:
+                sam_model_zoo = importlib.import_module("efficientvit.sam_model_zoo")
+                sam_mod = importlib.import_module("efficientvit.models.efficientvit.sam")
+            except ModuleNotFoundError:
+                script_root = Path(__file__).resolve().parents[1]  # .../GEMINI_Comp_VR
+                candidate_roots = [
+                    script_root / "efficientvit",
+                    script_root / "efficientvit" / "efficientvit",
+                ]
+                for root in candidate_roots:
+                    root_str = str(root)
+                    if root.exists() and root_str not in sys.path:
+                        sys.path.insert(0, root_str)
+
+                sam_model_zoo = importlib.import_module("efficientvit.sam_model_zoo")
+                sam_mod = importlib.import_module("efficientvit.models.efficientvit.sam")
+
+            create_efficientvit_sam_model = getattr(sam_model_zoo, "create_efficientvit_sam_model")
+            EfficientViTSamPredictor = getattr(sam_mod, "EfficientViTSamPredictor")
+
+            self.torch = torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            model = create_efficientvit_sam_model(name=model_name, pretrained=True)
+            model = model.to(device).eval()
+
+            self.model = model
+            self.processor = EfficientViTSamPredictor(model)
+            self.backend = "efficientvit-sam"
+            self.available = True
+            logger.info(f"EfficientViT-SAM initialized ({model_name}) on {device}.")
+            return True
+        except Exception as e:
+            logger.warning(f"EfficientViT-SAM not available: {e}")
+            return False
+
+    def _init_sam3(self) -> bool:
+        try:
+            import torch
+            import sam3
+            from sam3 import build_sam3_image_model
+            from sam3.model.box_ops import box_xywh_to_cxcywh
+            from sam3.model.sam3_image_processor import Sam3Processor
+            from sam3.visualization_utils import normalize_bbox
+
             self.torch = torch
             self.sam3 = sam3
             self.build_sam3_image_model = build_sam3_image_model
             self.box_xywh_to_cxcywh = box_xywh_to_cxcywh
             self.Sam3Processor = Sam3Processor
             self.normalize_bbox = normalize_bbox
-            self.available = True
-        except ImportError as e:
-            logger.warning(f"SAM 3 or Torch not available: {e}")
-            self.available = False
-            return
 
-        # Initialize Model
-        if self.available:
-            try:
-                # Configure CUDA settings
+            # Configure CUDA settings when available.
+            if torch.cuda.is_available():
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True
-                
-                # Get BPE path from sam3 assets
-                sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
-                bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
-                
-                # Build model and processor
-                self.model = build_sam3_image_model(bpe_path=bpe_path)
-                # User requested higher confidence to prevent tracking swaps
-                self.processor = Sam3Processor(self.model, confidence_threshold=0.87)
-                logger.info("SAM 3 Model initialized with confidence 0.87.")
-            except Exception as e:
-                logger.error(f"Failed to init SAM 3: {e}")
-                self.available = False
+
+            sam3_root = os.path.join(os.path.dirname(sam3.__file__), "..")
+            bpe_path = os.path.join(sam3_root, "assets", "bpe_simple_vocab_16e6.txt.gz")
+
+            self.model = build_sam3_image_model(bpe_path=bpe_path)
+            self.processor = Sam3Processor(self.model, confidence_threshold=0.87)
+            self.backend = "sam3"
+            self.available = True
+            logger.info("SAM3 initialized with confidence threshold 0.87.")
+            return True
+        except Exception as e:
+            logger.warning(f"SAM3 not available: {e}")
+            return False
+
+    def _extract_mask_from_state(self, inference_state: Any) -> Optional[np.ndarray]:
+        if not isinstance(inference_state, dict):
+            return None
+        if "masks" not in inference_state or inference_state["masks"] is None:
+            return None
+
+        mask_tensor = inference_state["masks"]
+        mask = mask_tensor.detach().cpu().numpy() > 0.5
+        if mask.ndim == 4:
+            return mask[0, 0]
+        if mask.ndim == 3:
+            return mask[0]
+        return mask
+
+    def _extract_efficientvit_mask(self, prediction: Any) -> Optional[np.ndarray]:
+        masks = None
+        if isinstance(prediction, tuple) and len(prediction) > 0:
+            masks = prediction[0]
+        elif isinstance(prediction, dict):
+            masks = prediction.get("masks")
+
+        if masks is None:
+            return None
+
+        if self.torch is not None and hasattr(self.torch, "is_tensor") and self.torch.is_tensor(masks):
+            masks = masks.detach().cpu().numpy()
+        else:
+            masks = np.asarray(masks)
+
+        if masks.ndim == 4:
+            masks = masks[0, 0]
+        elif masks.ndim == 3:
+            masks = masks[0]
+
+        return masks > 0.5
+
+    def _predict_mask(self, frame_bgr: np.ndarray, box_xywh: List[float]) -> Optional[np.ndarray]:
+        if cv2 is None:
+            return None
+
+        # Some call paths may pass a PIL image; normalize to OpenCV-style BGR array.
+        if isinstance(frame_bgr, Image.Image):
+            frame_bgr = cv2.cvtColor(np.array(frame_bgr.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+        if self.backend == "sam3":
+            h, w = frame_bgr.shape[:2]
+            pil_image = Image.fromarray(frame_bgr[:, :, ::-1])
+            inference_state = self.processor.set_image(pil_image)
+
+            box_input_xywh = self.torch.tensor(box_xywh).view(-1, 4)
+            box_input_cxcywh = self.box_xywh_to_cxcywh(box_input_xywh)
+            norm_box_cxcywh = self.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
+
+            self.processor.reset_all_prompts(inference_state)
+            inference_state = self.processor.add_geometric_prompt(
+                state=inference_state,
+                box=norm_box_cxcywh,
+                label=True,
+            )
+            return self._extract_mask_from_state(inference_state)
+
+        if self.backend == "efficientvit-sam":
+            box_x, box_y, box_w, box_h = box_xywh
+            box_xyxy = np.array([box_x, box_y, box_x + box_w, box_y + box_h], dtype=np.float32)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+            self.processor.set_image(frame_rgb)
+            try:
+                prediction = self.processor.predict(
+                    box=box_xyxy[None, :],
+                    multimask_output=False,
+                )
+            except TypeError:
+                prediction = self.processor.predict(
+                    box=box_xyxy,
+                    multimask_output=False,
+                )
+            return self._extract_efficientvit_mask(prediction)
+
+        return None
 
     def track(self, video_path: str, initial_box: List[float], label: str) -> str:
         """
@@ -71,11 +215,11 @@ class ObjectTracker:
         Returns: Path to the output video with tracking visualization.
         """
         if not self.available or not self.processor:
-            return "Error: SAM 3 not available."
+            return "Error: No tracking backend available."
+        if cv2 is None:
+            return "Error: OpenCV (cv2) is not installed."
 
         try:
-            import cv2
-            
             video_dir = Path(video_path)
             if not video_dir.is_dir():
                 return f"Error: {video_path} is not a directory of frames."
@@ -100,41 +244,13 @@ class ObjectTracker:
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             out = cv2.VideoWriter(str(output_path), fourcc, 10, (w, h))
             
-            # Process each frame with SAM3
+            # Process each frame with the selected backend.
             for i, frame_file in enumerate(frame_files):
                 frame = cv2.imread(str(frame_file))
-                pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
                 
-                # Set image for SAM3
-                inference_state = self.processor.set_image(pil_image)
-                
-                # Prepare box for SAM3: convert to normalized cxcywh format
-                box_input_xywh = self.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
-                box_input_cxcywh = self.box_xywh_to_cxcywh(box_input_xywh)
-                norm_box_cxcywh = self.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
-                
-                # Add geometric prompt (box)
-                self.processor.reset_all_prompts(inference_state)
-                inference_state = self.processor.add_geometric_prompt(
-                    state=inference_state,
-                    box=norm_box_cxcywh,
-                    label=True
-                )
-                
-                # Get mask from inference state if available
                 try:
-                    # Retrieve masks (boolean tensor: [N, 1, H, W])
-                    if "masks" in inference_state and inference_state["masks"] is not None:
-                        # masks is [N, 1, H, W], we want [H, W]
-                        # Assuming batch size 1
-                        mask_tensor = inference_state["masks"]
-                        mask = mask_tensor.detach().cpu().numpy() > 0.5
-                        
-                        # Handle dimensions
-                        if mask.ndim == 4: # N, 1, H, W
-                            mask = mask[0, 0]
-                        elif mask.ndim == 3: # 1, H, W or H, W, ?
-                            mask = mask[0]
+                    mask = self._predict_mask(frame, [box_x, box_y, box_w, box_h])
+                    if mask is not None:
                         
                         # Draw mask overlay with reduced opacity to avoid gray hue
                         # Only apply if mask covers a reasonable area (not entire frame)
@@ -160,7 +276,6 @@ class ObjectTracker:
                             # Draw bounding box
                             cv2.rectangle(frame, (cmin, rmin), (cmax, rmax), (0, 255, 0), 2)
                     else:
-                        # If no mask, just draw the current box
                         cv2.rectangle(frame, 
                                     (int(box_x), int(box_y)), 
                                     (int(box_x + box_w), int(box_y + box_h)), 
@@ -304,11 +419,11 @@ class ObjectTracker:
                [{'label1': [cx, cy], 'label2': [cx, cy]}, ...]
         """
         if not self.available or not self.processor:
-            return {"error": "SAM 3 not available."}
+            return {"error": "No tracking backend available."}
+        if cv2 is None:
+            return {"error": "OpenCV (cv2) is not installed."}
 
         try:
-            import cv2
-            
             video_dir = Path(video_path)
             frame_files = sorted(list(video_dir.glob("*.jpg")))
             if not frame_files:
@@ -351,9 +466,6 @@ class ObjectTracker:
                 pil_image_raw = Image.open(frame_file)
                 pil_image = pil_image_raw.convert("RGB") # Ensure RGB for SAM
                 frame = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR) # Convert to BGR for OpenCV viz
-
-                # We need to set image ONCE per frame
-                inference_state = self.processor.set_image(pil_image)
                 
                 frame_telemetry = {}
                 
@@ -363,28 +475,12 @@ class ObjectTracker:
                 for idx, (label, box_rect) in enumerate(current_boxes.items()):
                     box_x, box_y, box_w, box_h = box_rect
                     
-                    # Prepare box
-                    box_input_xywh = self.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
-                    box_input_cxcywh = self.box_xywh_to_cxcywh(box_input_xywh)
-                    norm_box_cxcywh = self.normalize_bbox(box_input_cxcywh, w, h).flatten().tolist()
-                    
-                    # Run Inference
-                    self.processor.reset_all_prompts(inference_state)
-                    inference_state = self.processor.add_geometric_prompt(
-                        state=inference_state,
-                        box=norm_box_cxcywh,
-                        label=True
-                    )
-                    
                     # Extract result
                     cx, cy = 0.0, 0.0
                     mask_found = False
-                    
-                    if "masks" in inference_state and inference_state["masks"] is not None:
-                        mask_tensor = inference_state["masks"]
-                        mask = mask_tensor.detach().cpu().numpy() > 0.5
-                        if mask.ndim == 4: mask = mask[0, 0]
-                        elif mask.ndim == 3: mask = mask[0]
+
+                    mask = self._predict_mask(frame, [box_x, box_y, box_w, box_h])
+                    if mask is not None:
                         
                         # Update box
                         rows = np.any(mask, axis=1)

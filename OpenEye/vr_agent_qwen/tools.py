@@ -20,9 +20,11 @@ import re
 import time
 import base64
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
 from datetime import datetime
-from typing import List
+from typing import Dict, List
 
 from PIL import Image
 
@@ -37,6 +39,7 @@ import base64
 
 from .config import LOG_DIR
 from .logger import get_logger
+from .occupancy_explorer import OccupancyExploreConfig, OccupancyExplorer
 
 # ── Module-level references (set by _get_tools) ───────────────────────────────
 _executor = None
@@ -60,11 +63,24 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
     _describer = describer
     _agent_ref = agent_ref
 
+    mask_api_url = os.getenv("SAM3_MASK_API_URL", "http://127.0.0.1:8010").strip().rstrip("/")
+    segmentation_backend = os.getenv(
+        "SEGMENTATION_BACKEND", "api" if mask_api_url else "sam"
+    ).strip().lower()
+    if segmentation_backend not in {"sam", "api"}:
+        segmentation_backend = "sam"
+
+    def _using_api_backend() -> bool:
+        return segmentation_backend == "api"
+
     # ── Shared helper ─────────────────────────────────────────────────────────
 
     def _log_action(tool_name, **kwargs):
         get_logger().info(f"[TOOL] {tool_name}({kwargs})")
         print(f"Action: {tool_name} {kwargs}")
+
+    def _should_use_mss_capture() -> bool:
+        return bool(_agent_ref and getattr(_agent_ref, "use_mss_capture", False))
 
     def _capture_mss_frame():
         """Capture a frame from the desktop using MSS and return (PIL image, jpeg bytes)."""
@@ -142,6 +158,163 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
             return pil_img, out.getvalue()
         except Exception as e:
             raise RuntimeError(f"Driver frame parse failed: {e}") from e
+
+    def _decode_mask_png_base64(mask_png_base64: str):
+        raw = base64.b64decode(mask_png_base64)
+        np_buf = np.frombuffer(raw, dtype=np.uint8)
+        decoded = cv2.imdecode(np_buf, cv2.IMREAD_GRAYSCALE)
+        if decoded is None:
+            return None
+        return decoded > 127
+
+    def _build_multipart_form_data(fields: Dict[str, str], file_name: str, file_bytes: bytes):
+        boundary = f"----vragentmask{int(time.time() * 1000)}"
+        body = bytearray()
+
+        for name, value in fields.items():
+            body.extend(f"--{boundary}\r\n".encode("utf-8"))
+            body.extend(
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8")
+            )
+            body.extend(str(value).encode("utf-8"))
+            body.extend(b"\r\n")
+
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            f'Content-Disposition: form-data; name="image"; filename="{file_name}"\r\n'.encode("utf-8")
+        )
+        body.extend(b"Content-Type: image/jpeg\r\n\r\n")
+        body.extend(file_bytes)
+        body.extend(b"\r\n")
+        body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+
+        return bytes(body), boundary
+
+    def _segment_boxes_via_api(pil_img, boxes_xywh: List[List[float]], text: str = "") -> Dict[int, object]:
+        if not mask_api_url:
+            raise RuntimeError(
+                "SEGMENTATION_BACKEND=api but SAM3_MASK_API_URL is not set."
+            )
+        if not CV2_AVAILABLE:
+            raise RuntimeError("OpenCV is required for API mask decoding but is not available.")
+
+        image_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        ok, encoded = cv2.imencode(".jpg", image_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+        if not ok:
+            raise RuntimeError("Failed to encode image for segmentation API request.")
+
+        serializable_boxes = []
+        for b in boxes_xywh:
+            if len(b) != 4:
+                continue
+            x, y, bw, bh = [float(v) for v in b]
+            serializable_boxes.append([x, y, max(1.0, bw), max(1.0, bh)])
+
+        conf = os.getenv("SAM3_MASK_API_CONF", "0.35")
+        timeout_s = float(os.getenv("SAM3_MASK_API_TIMEOUT_SEC", "8.0"))
+        text_prompt = (text or "").strip()
+
+        fields = {
+            "boxes": json.dumps(serializable_boxes),
+            "text": text_prompt,
+            "conf": conf,
+            "include_individual_masks": "true",
+        }
+        body, boundary = _build_multipart_form_data(fields, "frame.jpg", encoded.tobytes())
+
+        req = urllib.request.Request(
+            f"{mask_api_url}/segment",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/json",
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                payload = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            details = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Mask API HTTP {e.code}: {details}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Mask API connection failed: {e}") from e
+
+        data = json.loads(payload)
+        masks_by_idx: Dict[int, object] = {}
+
+        for item in data.get("masks", []):
+            # New SAM3 API uses input_box_index; keep index as a backward-compatible fallback.
+            idx = item.get("input_box_index")
+            if idx is None:
+                idx = item.get("index")
+            mask_b64 = item.get("mask_png_base64")
+            if idx is None or not mask_b64:
+                continue
+            mask = _decode_mask_png_base64(mask_b64)
+            if mask is not None:
+                masks_by_idx[int(idx)] = mask
+
+        if not masks_by_idx and len(serializable_boxes) == 1 and data.get("combined_mask_png_base64"):
+            mask = _decode_mask_png_base64(data["combined_mask_png_base64"])
+            if mask is not None:
+                masks_by_idx[0] = mask
+
+        return masks_by_idx
+
+    def _segment_boxes_with_backend(
+        pil_img,
+        boxes_by_key: Dict[str, List[float]],
+        prompts_by_key: Dict[str, str],
+        frame_w: int,
+        frame_h: int,
+    ) -> Dict[str, object]:
+        if _using_api_backend():
+            keys = list(boxes_by_key.keys())
+            boxes = [boxes_by_key[k] for k in keys]
+            # Always send text context together with geometric boxes for better SAM3 disambiguation.
+            prompt_parts = []
+            for k in keys:
+                label = (prompts_by_key.get(k, "") or "").strip()
+                prompt_parts.append(f"{k}:{label}" if label else k)
+            prompt_text = "; ".join(prompt_parts)
+            masks_by_idx = _segment_boxes_via_api(pil_img, boxes, prompt_text)
+            return {key: masks_by_idx.get(i) for i, key in enumerate(keys)}
+
+        if not _tracker or not _tracker.available:
+            raise RuntimeError("SAM tracker is not available.")
+
+        inference_state = _tracker.processor.set_image(pil_img)
+        out: Dict[str, object] = {}
+
+        for key, box in boxes_by_key.items():
+            box_x, box_y, box_w, box_h = box
+            box_input_xywh = _tracker.torch.tensor([box_x, box_y, box_w, box_h]).view(-1, 4)
+            box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
+            norm_box_cxcywh = _tracker.normalize_bbox(
+                box_input_cxcywh, frame_w, frame_h
+            ).flatten().tolist()
+
+            _tracker.processor.reset_all_prompts(inference_state)
+            prompt = prompts_by_key.get(key)
+            if prompt:
+                inference_state = _tracker.processor.set_text_prompt(prompt, inference_state)
+            inference_state = _tracker.processor.add_geometric_prompt(
+                state=inference_state, box=norm_box_cxcywh, label=True
+            )
+
+            mask = None
+            if "masks" in inference_state and inference_state["masks"] is not None:
+                m = inference_state["masks"].detach().cpu().numpy() > 0.5
+                if m.ndim == 4:
+                    mask = m[0, 0]
+                elif m.ndim == 3:
+                    mask = m[0]
+
+            out[key] = mask
+
+        return out
 
     # =========================================================================
     # MOVEMENT & ORIENTATION
@@ -340,6 +513,149 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
             get_logger().error(f"Failed to auto-save video: {e}")
         return res_str
 
+    def explore_environment(
+        max_stations: int = 120,
+        map_size_m: float = 20.0,
+        grid_res_m: float = 0.10,
+        station_spacing_m: float = 1.25,
+        rotate_probability: float = 0.0,
+        forward_move_m: float = 1.0,
+        rotate_step_degrees: float = 20.0,
+        depth_baseline_move_m: float = 0.0,
+        obstacle_min_height_ratio: float = 0.30,
+        obstacle_max_height_ratio: float = 0.90,
+        treat_above_obstacle_band_as_blocking: bool = True,
+        obstacle_min_distance_m: float = 0.3,
+        require_known_free_forward_path: bool = True,
+        split_stereo_capture: bool = True,
+        stereo_eye_separation_m: float = 0.064,
+        min_moves_before_mapping: int = 0,
+        forward_depth_safety_margin_m: float = 0.35,
+        forward_depth_corridor_width_ratio: float = 0.45,
+        forward_depth_min_close_fraction: float = 0.05,
+        forward_depth_relative_close_ratio: float = 0.70,
+        depth_stride: int = 3,
+        max_rays_per_observation: int = 8000,
+        debug_output: str = "summary",
+        export_ply: bool = True,
+        save_ply_each_move: bool = True,
+        depth_engine: str = "fast_foundationstereo",
+        foundationstereo_repo: str = "",
+        foundationstereo_checkpoint: str = "",
+        foundationstereo_scale: float = 1.0,
+        foundationstereo_valid_iters: int = 8,
+        foundationstereo_max_disp: int = 192,
+        rotate_to_frontier: bool = True,
+        frontier_heading_lookahead_m: float = 2.0,
+        frontier_unknown_radius_m: float = 1.25,
+        frontier_novelty_weight: float = 0.08,
+        frontier_visited_penalty: float = 25.0,
+        avoid_visited_forward: bool = True,
+        visited_revisit_unknown_radius_m: float = 1.25,
+    ):
+        """
+        Explore the VR environment, avoid obstacles with current depth, then build a 2D occupancy map.
+
+        The first min_moves_before_mapping movement actions do not build or use
+        the 2D occupancy grid. During that warmup, every forward step is gated by
+        the current depth image; if close geometry is detected in the forward
+        corridor, the agent rotates instead. After the threshold, it starts
+        rebuilding the occupancy map and can return to start with A*.
+        """
+        _log_action(
+            "explore_environment",
+            max_stations=max_stations,
+            map_size_m=map_size_m,
+            grid_res_m=grid_res_m,
+            station_spacing_m=station_spacing_m,
+            rotate_probability=rotate_probability,
+            forward_move_m=forward_move_m,
+            rotate_step_degrees=rotate_step_degrees,
+            depth_baseline_move_m=depth_baseline_move_m,
+            obstacle_min_height_ratio=obstacle_min_height_ratio,
+            obstacle_max_height_ratio=obstacle_max_height_ratio,
+            treat_above_obstacle_band_as_blocking=treat_above_obstacle_band_as_blocking,
+            obstacle_min_distance_m=obstacle_min_distance_m,
+            require_known_free_forward_path=require_known_free_forward_path,
+            split_stereo_capture=split_stereo_capture,
+            stereo_eye_separation_m=stereo_eye_separation_m,
+            min_moves_before_mapping=min_moves_before_mapping,
+            forward_depth_safety_margin_m=forward_depth_safety_margin_m,
+            forward_depth_corridor_width_ratio=forward_depth_corridor_width_ratio,
+            forward_depth_min_close_fraction=forward_depth_min_close_fraction,
+            forward_depth_relative_close_ratio=forward_depth_relative_close_ratio,
+            depth_stride=depth_stride,
+            max_rays_per_observation=max_rays_per_observation,
+            debug_output=debug_output,
+            export_ply=export_ply,
+            save_ply_each_move=save_ply_each_move,
+            depth_engine=depth_engine,
+            foundationstereo_repo=foundationstereo_repo,
+            foundationstereo_checkpoint=foundationstereo_checkpoint,
+            foundationstereo_scale=foundationstereo_scale,
+            foundationstereo_valid_iters=foundationstereo_valid_iters,
+            foundationstereo_max_disp=foundationstereo_max_disp,
+            rotate_to_frontier=rotate_to_frontier,
+            frontier_heading_lookahead_m=frontier_heading_lookahead_m,
+            frontier_unknown_radius_m=frontier_unknown_radius_m,
+            frontier_novelty_weight=frontier_novelty_weight,
+            frontier_visited_penalty=frontier_visited_penalty,
+            avoid_visited_forward=avoid_visited_forward,
+            visited_revisit_unknown_radius_m=visited_revisit_unknown_radius_m,
+        )
+        cfg = OccupancyExploreConfig(
+            max_stations=int(max_stations),
+            map_size_m=float(map_size_m),
+            grid_res_m=float(grid_res_m),
+            station_spacing_m=float(station_spacing_m),
+            rotate_probability=min(1.0, max(0.0, float(rotate_probability))),
+            forward_move_m=max(0.0, float(forward_move_m)),
+            rotate_step_degrees=float(rotate_step_degrees),
+            depth_baseline_move_m=max(0.0, float(depth_baseline_move_m)),
+            obstacle_min_height_ratio=max(0.0, float(obstacle_min_height_ratio)),
+            obstacle_max_height_ratio=min(1.0, float(obstacle_max_height_ratio)),
+            treat_above_obstacle_band_as_blocking=bool(treat_above_obstacle_band_as_blocking),
+            obstacle_min_distance_m=max(0.0, float(obstacle_min_distance_m)),
+            require_known_free_forward_path=bool(require_known_free_forward_path),
+            split_stereo_capture=bool(split_stereo_capture),
+            stereo_eye_separation_m=max(0.0, float(stereo_eye_separation_m)),
+            min_moves_before_mapping=max(0, int(min_moves_before_mapping)),
+            forward_depth_safety_margin_m=max(0.0, float(forward_depth_safety_margin_m)),
+            forward_depth_corridor_width_ratio=max(
+                0.05,
+                min(1.0, float(forward_depth_corridor_width_ratio)),
+            ),
+            forward_depth_min_close_fraction=max(
+                0.0,
+                min(1.0, float(forward_depth_min_close_fraction)),
+            ),
+            forward_depth_relative_close_ratio=max(
+                0.05,
+                min(1.0, float(forward_depth_relative_close_ratio)),
+            ),
+            depth_stride=max(1, int(depth_stride)),
+            max_rays_per_observation=max(0, int(max_rays_per_observation)),
+            debug_output=str(debug_output).lower(),
+            export_ply=bool(export_ply),
+            save_ply_each_move=bool(save_ply_each_move),
+            depth_engine=str(depth_engine),
+            foundationstereo_repo=str(foundationstereo_repo),
+            foundationstereo_checkpoint=str(foundationstereo_checkpoint),
+            foundationstereo_scale=max(0.05, float(foundationstereo_scale)),
+            foundationstereo_valid_iters=max(1, int(foundationstereo_valid_iters)),
+            foundationstereo_max_disp=max(16, int(foundationstereo_max_disp)),
+            rotate_to_frontier=bool(rotate_to_frontier),
+            frontier_heading_lookahead_m=max(0.0, float(frontier_heading_lookahead_m)),
+            frontier_unknown_radius_m=max(0.0, float(frontier_unknown_radius_m)),
+            frontier_novelty_weight=max(0.0, float(frontier_novelty_weight)),
+            frontier_visited_penalty=max(0.0, float(frontier_visited_penalty)),
+            avoid_visited_forward=bool(avoid_visited_forward),
+            visited_revisit_unknown_radius_m=max(0.0, float(visited_revisit_unknown_radius_m)),
+        )
+        explorer = OccupancyExplorer(_executor, LOG_DIR, cfg)
+        stop_event = getattr(_agent_ref, "stop_execution", None)
+        return explorer.explore(stop_event=stop_event)
+
     # =========================================================================
     # OBJECT TRACKING
     # =========================================================================
@@ -485,9 +801,128 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         _log_action("visual_servo_to_object", description=object_description,
                     controller=controller, ray=ray_description)
         logger = get_logger()
+        servo_start_ts = time.perf_counter()
+        last_overlay_frame = None
+        last_overlay_iter = -1
+        timing_data: Dict[str, List[float]] = {}
 
-        if not _tracker or not _tracker.available:
-            return "Error: Object Tracking (SAM 3) is not available."
+        def _record_timing(step_name: str, elapsed_s: float):
+            timing_data.setdefault(step_name, []).append(max(0.0, elapsed_s))
+
+        def _format_timing_breakdown() -> str:
+            if not timing_data:
+                return ""
+
+            stage_order = [
+                "init_pose",
+                "initial_capture",
+                "grounding",
+                "initial_bbox_locate",
+                "loop_capture",
+                "loop_segmentation",
+                "loop_mask_postprocess",
+                "loop_visualization",
+                "loop_pid_compute",
+                "loop_rotate_call",
+                "loop_reground",
+            ]
+
+            lines = []
+            for stage in stage_order:
+                values = timing_data.get(stage, [])
+                if not values:
+                    continue
+                total_s = sum(values)
+                count = len(values)
+                avg_ms = (total_s / count) * 1000.0
+                lines.append(
+                    f"- {stage}: total={total_s:.3f}s avg={avg_ms:.2f}ms n={count}"
+                )
+
+            if not lines:
+                return ""
+            return "Timing breakdown:\n" + "\n".join(lines)
+
+        def _with_benchmark(message: str) -> str:
+            elapsed_s = time.perf_counter() - servo_start_ts
+            summary = f"{message} (took {elapsed_s:.2f}s)"
+            breakdown = _format_timing_breakdown()
+            if breakdown:
+                summary = f"{summary}\n{breakdown}"
+            return summary
+
+        def _save_last_overlay_snapshot(reason: str) -> str:
+            nonlocal last_overlay_frame, last_overlay_iter
+            if not CV2_AVAILABLE or last_overlay_frame is None:
+                return ""
+
+            try:
+                tracking_dir = LOG_DIR / "tracking"
+                tracking_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                safe_reason = re.sub(r"[^a-zA-Z0-9_-]+", "_", reason).strip("_").lower() or "end"
+                iter_suffix = f"_iter_{last_overlay_iter}" if last_overlay_iter >= 0 else ""
+                out_path = tracking_dir / f"servo_last_overlay_{timestamp}_{safe_reason}{iter_suffix}.jpg"
+                ok = cv2.imwrite(str(out_path), last_overlay_frame)
+                if ok:
+                    logger.info(f"Final servo overlay snapshot saved: {out_path}")
+                    return str(out_path)
+            except Exception as e:
+                logger.warning(f"Failed to save final servo overlay snapshot: {e}")
+            return ""
+
+        def _with_benchmark_and_overlay(message: str, reason: str) -> str:
+            overlay_path = _save_last_overlay_snapshot(reason)
+            if overlay_path:
+                message = f"{message} Final overlay: {overlay_path}"
+            return _with_benchmark(message)
+
+        def _expand_box_in_pid_direction(
+            box_xywh: List[float],
+            pid_dx: float,
+            pid_dy: float,
+            frame_w: int,
+            frame_h: int,
+        ) -> List[float]:
+            """
+            Expand SAM prompt box toward the PID motion direction.
+            Keeps a small symmetric margin and then extends toward movement.
+            """
+            x, y, bw, bh = [float(v) for v in box_xywh]
+            x1 = x
+            y1 = y
+            x2 = x + max(1.0, bw)
+            y2 = y + max(1.0, bh)
+
+            base_pad = max(2.0, 0.05 * max(bw, bh))
+            x1 -= base_pad
+            y1 -= base_pad
+            x2 += base_pad
+            y2 += base_pad
+
+            # PID error magnitude (pixels) determines directional expansion amount.
+            extend_x = max(4.0, min(abs(pid_dx) * 0.35, max(12.0, bw * 0.8)))
+            extend_y = max(4.0, min(abs(pid_dy) * 0.35, max(12.0, bh * 0.8)))
+
+            if pid_dx > 0:
+                x2 += extend_x
+            elif pid_dx < 0:
+                x1 -= extend_x
+
+            if pid_dy > 0:
+                y2 += extend_y
+            elif pid_dy < 0:
+                y1 -= extend_y
+
+            x1 = max(0.0, min(x1, float(frame_w - 1)))
+            y1 = max(0.0, min(y1, float(frame_h - 1)))
+            x2 = max(x1 + 1.0, min(x2, float(frame_w)))
+            y2 = max(y1 + 1.0, min(y2, float(frame_h)))
+
+            return [x1, y1, x2 - x1, y2 - y1]
+
+        if not _using_api_backend() and (not _tracker or not _tracker.available):
+            return _with_benchmark("Error: Object Tracking (SAM 3) is not available.")
 
         Kp_YAW = 0.01
         Kp_PITCH = 0.01
@@ -495,6 +930,7 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         TOLERANCE_PX = 15
 
         # 1. Get initial pose
+        pose_start_ts = time.perf_counter()
         curr_pitch = curr_yaw = curr_roll = 0.0
         status = _executor.call("get_current_pose", device=controller)
         try:
@@ -503,24 +939,40 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 rot_str = rot_str.replace("np.float64(", "").replace(")", "")
                 curr_pitch, curr_yaw, curr_roll = map(float, rot_str.split(","))
         except Exception as e:
-            return f"Failed to parse initial pose: {e}"
+            _record_timing("init_pose", time.perf_counter() - pose_start_ts)
+            return _with_benchmark(f"Failed to parse initial pose: {e}")
+        _record_timing("init_pose", time.perf_counter() - pose_start_ts)
 
-        # 2. Capture initial image from desktop (MSS)
-        try:
-            pil_img_init, img_bytes = _capture_mss_frame()
-            w, h = pil_img_init.size
-        except Exception as e:
-            get_logger().warning(f"Initial MSS capture failed, falling back to driver: {e}")
+        # 2. Capture initial image.
+        initial_capture_start_ts = time.perf_counter()
+        if _should_use_mss_capture():
+            try:
+                pil_img_init, img_bytes = _capture_mss_frame()
+                w, h = pil_img_init.size
+            except Exception as e:
+                get_logger().warning(f"Initial MSS capture failed, falling back to driver: {e}")
+                try:
+                    pil_img_init, img_bytes = _capture_driver_frame()
+                    w, h = pil_img_init.size
+                except Exception as e2:
+                    _record_timing("initial_capture", time.perf_counter() - initial_capture_start_ts)
+                    return _with_benchmark(f"Initial capture failed (MSS + driver): {e2}")
+        else:
             try:
                 pil_img_init, img_bytes = _capture_driver_frame()
                 w, h = pil_img_init.size
-            except Exception as e2:
-                return f"Initial capture failed (MSS + driver): {e2}"
+            except Exception as e:
+                _record_timing("initial_capture", time.perf_counter() - initial_capture_start_ts)
+                return _with_benchmark(f"Initial capture failed (driver): {e}")
+        _record_timing("initial_capture", time.perf_counter() - initial_capture_start_ts)
 
         # 3. Ground targets
         targets = {"ray": ray_description, "logo": object_description}
+        grounding_start_ts = time.perf_counter()
         grounding_results = _grounder.ground_multiple_objects(img_bytes, list(targets.values()))
+        _record_timing("grounding", time.perf_counter() - grounding_start_ts)
 
+        bbox_locate_start_ts = time.perf_counter()
         current_boxes = {}
         all_found = True
         for key, desc in targets.items():
@@ -531,9 +983,10 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
             else:
                 print(f"[{key}] '{desc}' NOT found by Gemini.")
                 all_found = False
+        _record_timing("initial_bbox_locate", time.perf_counter() - bbox_locate_start_ts)
 
         if not all_found:
-            return (
+            return _with_benchmark(
                 f"Failed to find both the controller ray and '{object_description}'. "
                 "CAUTION: The ray might be occluding the object if they are already aligned. "
                 "Verify alignment manually or try a different viewing angle."
@@ -548,52 +1001,62 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
 
         for i in range(MAX_ITER):
             if _agent_ref and _agent_ref.stop_execution.is_set():
-                return "Visual Servoing Stopped by User."
+                return _with_benchmark_and_overlay("Visual Servoing Stopped by User.", "stopped")
 
-            # Capture from desktop (MSS)
-            try:
-                pil_img_loop, img_bytes_loop = _capture_mss_frame()
-                img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
-            except Exception as e:
-                print(f"MSS capture error in loop: {e}. Falling back to driver frame.")
+            # Capture frame.
+            loop_capture_start_ts = time.perf_counter()
+            if _should_use_mss_capture():
+                try:
+                    pil_img_loop, img_bytes_loop = _capture_mss_frame()
+                    img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
+                except Exception as e:
+                    print(f"MSS capture error in loop: {e}. Falling back to driver frame.")
+                    try:
+                        pil_img_loop, img_bytes_loop = _capture_driver_frame()
+                        img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
+                    except Exception as e2:
+                        print(f"Driver capture fallback failed in loop: {e2}")
+                        _record_timing("loop_capture", time.perf_counter() - loop_capture_start_ts)
+                        break
+            else:
                 try:
                     pil_img_loop, img_bytes_loop = _capture_driver_frame()
                     img_cv = cv2.cvtColor(np.array(pil_img_loop), cv2.COLOR_RGB2BGR)
-                except Exception as e2:
-                    print(f"Driver capture fallback failed in loop: {e2}")
+                except Exception as e:
+                    print(f"Driver capture failed in loop: {e}")
+                    _record_timing("loop_capture", time.perf_counter() - loop_capture_start_ts)
                     break
+            _record_timing("loop_capture", time.perf_counter() - loop_capture_start_ts)
 
-            # SAM tracking
-            inference_state = _tracker.processor.set_image(pil_img_loop)
             points = {}
             masks_for_viz = {}
+            boxes_to_track = {
+                key: current_boxes[key] for key in targets.keys() if key in current_boxes
+            }
 
-            for key, desc in targets.items():
-                if key not in current_boxes:
-                    continue
-                box_x, box_y, box_w, box_h = current_boxes[key]
-                box_input_xywh = _tracker.torch.tensor(
-                    [box_x, box_y, box_w, box_h]).view(-1, 4)
-                box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
-                norm_box_cxcywh = _tracker.normalize_bbox(
-                    box_input_cxcywh, w, h).flatten().tolist()
-
-                _tracker.processor.reset_all_prompts(inference_state)
-                inference_state = _tracker.processor.set_text_prompt(desc, inference_state)
-                inference_state = _tracker.processor.add_geometric_prompt(
-                    state=inference_state, box=norm_box_cxcywh, label=True
+            segmentation_start_ts = time.perf_counter()
+            try:
+                predicted_masks = _segment_boxes_with_backend(
+                    pil_img=pil_img_loop,
+                    boxes_by_key=boxes_to_track,
+                    prompts_by_key=targets,
+                    frame_w=w,
+                    frame_h=h,
                 )
+            except Exception as e:
+                print(f"Segmentation backend error: {e}")
+                predicted_masks = {}
+            _record_timing("loop_segmentation", time.perf_counter() - segmentation_start_ts)
 
-                mask = None
-                if "masks" in inference_state and inference_state["masks"] is not None:
-                    m = inference_state["masks"].detach().cpu().numpy() > 0.5
-                    if m.ndim == 4:
-                        mask = m[0, 0]
-                    elif m.ndim == 3:
-                        mask = m[0]
+            postprocess_start_ts = time.perf_counter()
+            for key, desc in targets.items():
+                if key not in boxes_to_track:
+                    continue
+                mask = predicted_masks.get(key)
 
                 if mask is None:
                     print(f"[{key}] Lost tracking. Attempting reground...")
+                    reground_start_ts = time.perf_counter()
                     try:
                         reground_res = _grounder.ground_multiple_objects(img_bytes_loop, [desc])
                         if desc in reground_res:
@@ -606,6 +1069,7 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                     except Exception as e:
                         print(f"[{key}] Reground Error: {e}")
                         del current_boxes[key]
+                    _record_timing("loop_reground", time.perf_counter() - reground_start_ts)
                     continue
 
                 masks_for_viz[key] = mask
@@ -625,17 +1089,25 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                         if M["m00"] != 0:
                             points[key] = (int(M["m10"] / M["m00"]),
                                            int(M["m01"] / M["m00"]))
+            _record_timing("loop_mask_postprocess", time.perf_counter() - postprocess_start_ts)
 
             # Visualize masks
+            viz_start_ts = time.perf_counter()
             for key, mask in masks_for_viz.items():
                 color = (np.array([255, 100, 0] if key == "ray" else [0, 255, 100],
                                   dtype=np.uint8))
                 overlay = img_cv.copy()
                 overlay[mask] = color
                 cv2.addWeighted(overlay, 0.35, img_cv, 0.65, 0, img_cv)
+            _record_timing("loop_visualization", time.perf_counter() - viz_start_ts)
+
+            if CV2_AVAILABLE:
+                last_overlay_frame = img_cv.copy()
+                last_overlay_iter = i
 
             # PID control
             if "ray" in points and "logo" in points:
+                pid_compute_start_ts = time.perf_counter()
                 rx, ry = points["ray"]
                 lx, ly = points["logo"]
                 dx = lx - rx
@@ -649,32 +1121,64 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
                 prev_dist = dist
 
                 if divergence_count >= 3:
-                    return "Visual Servoing Aborted: Divergence detected."
+                    _record_timing("loop_pid_compute", time.perf_counter() - pid_compute_start_ts)
+                    return _with_benchmark_and_overlay(
+                        "Visual Servoing Aborted: Divergence detected.",
+                        "divergence",
+                    )
 
                 # Save debug image
                 cv2.line(img_cv, (rx, ry), (lx, ly), (0, 255, 255), 2)
+                last_overlay_frame = img_cv.copy()
+                last_overlay_iter = i
                 timestamp = datetime.now().strftime("%H%M%S")
                 debug_path = LOG_DIR / "tracking" / f"servo_{timestamp}_iter_{i}.jpg"
                 if CV2_AVAILABLE:
                     cv2.imwrite(str(debug_path), img_cv)
 
                 if dist < TOLERANCE_PX:
-                    msg = f"Visual Servoing Complete. Aligned with {object_description} (Error: {dist:.2f}px)."
+                    _record_timing("loop_pid_compute", time.perf_counter() - pid_compute_start_ts)
+                    msg = _with_benchmark_and_overlay(
+                        f"Visual Servoing Complete. Aligned with {object_description} (Error: {dist:.2f}px).",
+                        "aligned",
+                    )
                     logger.info(msg)
                     return msg
 
                 curr_yaw += -Kp_YAW * dx
                 curr_pitch += -Kp_PITCH * dy
+                _record_timing("loop_pid_compute", time.perf_counter() - pid_compute_start_ts)
+                rotate_start_ts = time.perf_counter()
                 _executor.call("rotate_device", device=controller,
                                pitch=curr_pitch, yaw=curr_yaw, roll=curr_roll)
+                _record_timing("loop_rotate_call", time.perf_counter() - rotate_start_ts)
+
+                # After each PID move, expand SAM's target box in the commanded direction.
+                if "logo" in current_boxes:
+                    current_boxes["logo"] = _expand_box_in_pid_direction(
+                        current_boxes["logo"],
+                        pid_dx=dx,
+                        pid_dy=dy,
+                        frame_w=w,
+                        frame_h=h,
+                    )
             else:
                 if "ray" in current_boxes and "logo" in current_boxes:
                     continue
-                return "Lost tracking of one or both objects during loop. Stopping."
+                return _with_benchmark_and_overlay(
+                    "Lost tracking of one or both objects during loop. Stopping.",
+                    "lost_tracking",
+                )
 
         if dist < 50.0:
-            return f"Visual Servoing finished. Aligned within {dist:.1f}px (acceptable)."
-        return f"Visual servoing finished max iterations ({MAX_ITER}). Final error: {dist:.1f}."
+            return _with_benchmark_and_overlay(
+                f"Visual Servoing finished. Aligned within {dist:.1f}px (acceptable).",
+                "acceptable",
+            )
+        return _with_benchmark_and_overlay(
+            f"Visual servoing finished max iterations ({MAX_ITER}). Final error: {dist:.1f}.",
+            "max_iterations",
+        )
 
     # =========================================================================
     # VIRTUAL KEYBOARD TYPING
@@ -688,7 +1192,7 @@ def _get_tools(executor, grounder, tracker, white_cane, describer, agent_ref):
         _log_action("type_text", text=text, controller=controller)
         logger = get_logger()
 
-        if not _tracker or not _tracker.available:
+        if not _using_api_backend() and (not _tracker or not _tracker.available):
             return "Error: Object Tracking (SAM 3) is not available."
         if not text:
             return "Error: No text provided to type."
@@ -843,34 +1347,29 @@ Rules:
                     print(f"Image parse error: {e}")
                     break
 
-                inference_state = _tracker.processor.set_image(pil_img_loop)
                 points = {}
                 boxes_to_track = {"ray": current_ray_box, "key": target_box}
                 updated_boxes = {}
                 masks_for_viz = {}
+                prompts_by_key = {
+                    "ray": "VR controller ray",
+                    "key": f"keyboard key {char}",
+                }
+
+                try:
+                    predicted_masks = _segment_boxes_with_backend(
+                        pil_img=pil_img_loop,
+                        boxes_by_key=boxes_to_track,
+                        prompts_by_key=prompts_by_key,
+                        frame_w=w,
+                        frame_h=h,
+                    )
+                except Exception as e:
+                    print(f"Segmentation backend error: {e}")
+                    predicted_masks = {}
 
                 for key, box in boxes_to_track.items():
-                    box_x, box_y, box_w, box_h = box
-                    box_input_xywh = _tracker.torch.tensor(
-                        [box_x, box_y, box_w, box_h]).view(-1, 4)
-                    box_input_cxcywh = _tracker.box_xywh_to_cxcywh(box_input_xywh)
-                    norm_box_cxcywh = _tracker.normalize_bbox(
-                        box_input_cxcywh, w, h).flatten().tolist()
-
-                    _tracker.processor.reset_all_prompts(inference_state)
-                    text_desc = "VR controller ray" if key == "ray" else f"keyboard key {char}"
-                    inference_state = _tracker.processor.set_text_prompt(text_desc, inference_state)
-                    inference_state = _tracker.processor.add_geometric_prompt(
-                        state=inference_state, box=norm_box_cxcywh, label=True
-                    )
-
-                    mask = None
-                    if "masks" in inference_state and inference_state["masks"] is not None:
-                        m = inference_state["masks"].detach().cpu().numpy() > 0.5
-                        if m.ndim == 4:
-                            mask = m[0, 0]
-                        elif m.ndim == 3:
-                            mask = m[0]
+                    mask = predicted_masks.get(key)
 
                     if mask is None:
                         continue
@@ -1045,7 +1544,7 @@ Rules:
         # Movement & Orientation
         start_bridge, move_relative, move_absolute, teleport, rotate_device, get_current_pose,
         # Vision
-        inspect_surroundings, locate_object, capture_video,
+        inspect_surroundings, locate_object, capture_video, explore_environment,
         # Tracking
         track_object, track_multiple_items, visual_servo_to_object,
         create_tracking_video, type_text,
